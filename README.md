@@ -1,8 +1,8 @@
 # ai-sudo
 
-**Secure remote sudo approval for AI assistants**
+**Secure remote sudo approval for AI assistants — with end-to-end encrypted notifications**
 
-A self-hosted sudo approval system that sends push notifications to your phone when an AI assistant (like Clawdbot) needs elevated privileges. Approve or deny requests remotely without giving blanket sudo access.
+A self-hosted sudo approval system that sends E2E encrypted push notifications to your phone when an AI assistant (like Clawdbot) needs elevated privileges. Approve or deny requests remotely without giving blanket sudo access, with full privacy guarantees.
 
 ## What It Is
 
@@ -10,9 +10,11 @@ ai-sudo is a PAM (Pluggable Authentication Module) based system that intercepts 
 
 - The command being requested
 - Which AI/process is requesting it
-- The context/cwd of the request
+- The working directory and context
 
 You can then tap **Approve** or **Deny** from anywhere. The decision is communicated back to your machine, which either allows or blocks the command.
+
+**Security Requirement:** All notification channels must provide end-to-end encryption. We do not use Telegram or any channel without E2E encryption.
 
 ## Why It Should Be Built
 
@@ -26,20 +28,33 @@ AI assistants are becoming integral parts of our workflows, but they face a fund
 
 ai-sudo bridges this gap by adding a **human-in-the-loop** approval step. The AI can request privileges, but a human must explicitly approve each sensitive operation. This transforms AI + sudo from a security liability into a secure, auditable workflow.
 
-## Problem Statement
+## Security-First Design
 
-**The Core Problem:** AI assistants cannot handle sudo password prompts, creating a security bottleneck in AI-automated workflows.
+### End-to-End Encryption Requirement
 
-When AI tooling needs elevated access, we currently have only bad options:
-1. **Unconditional trust** - Give AI full sudo (catastrophic if compromised)
-2. **Manual intervention** - Require human at the keyboard (breaks automation)
-3. **Static allowlists** - Only work for predictable, repetitive commands
+**All notification channels must provide E2E encryption.** This is non-negotiable because:
 
-This affects not just AI assistants but any headless system where privileged commands need occasional approval. The existing enterprise solutions (Duo, Teleport) are:
+1. **Sudo requests contain sensitive information** - commands, paths, usernames
+2. **Notifications travel through external servers** - we cannot trust notification providers
+3. **Compromised notification channels = compromised system** - attackers could approve malicious commands
 
-- Over-engineered for personal use
-- Not self-hosted friendly
-- Expensive and complex
+### Approved Notification Channels
+
+| Channel | E2E Encryption | Status |
+|---------|----------------|--------|
+| Signal Bot | ✅ Native Signal E2E | Approved |
+| Clawdbot iOS Node (with encryption) | ✅ Custom E2E | To be decided |
+| Custom iOS/Android App | ✅ App-level E2E | To be decided |
+| WebRTC/Web Push | ✅ DTLS/SRTP | Researching |
+
+### Rejected Notification Channels
+
+| Channel | Reason for Rejection |
+|---------|---------------------|
+| Telegram | No native E2E encryption (MTProto is server-client, not E2E) |
+| SMS | No encryption, SIM hijacking risks |
+| Email | No E2E, prone to interception |
+| Plain webhooks | No encryption |
 
 ## Solution Overview
 
@@ -51,12 +66,11 @@ ai-sudo implements a **human-gated sudo** pattern:
 │ (terminal)  │     │ (pam_aisudo) │     │ daemon      │
 └─────────────┘     └──────────────┘     └──────┬──────┘
                                                 │
-                           Push notification    │
+                   E2E Encrypted Notification    │
                                                 ▼
                                          ┌─────────────┐
                                          │ Phone App   │
-                                         │ or Clawdbot │
-                                         │ iOS node    │
+                                         │ (E2E Enc.)  │
                                          └─────────────┘
 ```
 
@@ -64,18 +78,19 @@ ai-sudo implements a **human-gated sudo** pattern:
 
 1. **Intercept** - A user or AI runs `sudo <command>`
 2. **Pause** - The PAM module intercepts the request and notifies the daemon
-3. **Notify** - The daemon sends a push notification with command details
-4. **Approve/Deny** - Human reviews and responds via phone app or messaging bot
-5. **Execute** - PAM receives the decision and allows/blocks accordingly
+3. **Encrypt & Notify** - The daemon encrypts notification payload and sends via E2E channel
+4. **Approve/Deny** - Human reviews and responds via encrypted channel
+5. **Execute** - PAM receives the decision (with nonce validation) and allows/blocks
 
 ### Key Features
 
+- **E2E Encryption** - All notifications are encrypted end-to-end
 - **Timeout support** - Auto-deny after configurable seconds (prevents hanging)
 - **Rich context** - Shows command, user, process, working directory
 - **Audit logging** - Complete trail of all requests and decisions
 - **Optional allowlist** - Auto-approve known-safe commands (e.g., `brew upgrade`)
 - **Fallback mode** - If the service is down, fall back to local password
-- **Integration ready** - Works with Clawdbot iOS node or Telegram/Signal bots
+- **Replay attack prevention** - Cryptographic nonces ensure fresh responses
 
 ## Getting Started
 
@@ -87,6 +102,11 @@ See [agents/ARCHITECTURE.md](agents/ARCHITECTURE.md) for implementation details.
 - Nonce-based responses prevent replay attacks
 - Rate limiting prevents denial-of-service
 - All decisions are logged for audit
+- Encryption keys are never stored on notification servers
+
+## Notification Backend Decisions
+
+See [agents/E2E-NOTIFICATIONS.md](agents/E2E-NOTIFICATIONS.md) for detailed analysis of E2E encrypted notification options and the decision-making process.
 
 ## License
 

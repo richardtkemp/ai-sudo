@@ -1,14 +1,16 @@
 # PRD: ai-sudo - Secure Remote Sudo Approval
 
 ## Introduction
-ai-sudo is a self-hosted PAM-based sudo approval system that enables remote human-in-the-loop authorization for AI assistants. When an AI needs elevated privileges, users receive push notifications on their phone to approve or deny requests.
+ai-sudo is a self-hosted PAM-based sudo approval system that enables remote human-in-the-loop authorization for AI assistants. When an AI needs elevated privileges, users receive **end-to-end encrypted** push notifications on their phone to approve or deny requests.
+
+**Security Requirement:** All notification channels must provide end-to-end encryption. Telegram and other non-E2E channels are explicitly rejected.
 
 ## Goals
 - Create a secure, auditable workflow for AI assistants to request sudo access
 - Enable remote approval without physical presence or blanket sudo access
 - Provide rich context (command, user, PID, cwd) for informed decisions
-- Support multiple notification backends (Clawdbot iOS node, Telegram, Signal)
-- Implement security best practices (nonces, rate limiting, replay prevention)
+- Support only E2E encrypted notification backends (Signal, custom apps, Clawdbot iOS node with encryption)
+- Implement security best practices (E2E encryption, nonces, rate limiting, replay prevention)
 
 ## User Stories
 
@@ -42,47 +44,66 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Typecheck passes
 
 ### US-004: Notification Backend Interface
-**Description:** As the system, I need a pluggable notification backend interface so that different notification channels can be supported.
+**Description:** As the system, I need a pluggable E2E notification backend interface so that different E2E encrypted notification channels can be supported.
 
 **Acceptance Criteria:**
-- Define NotificationBackend trait in Rust
-- Interface includes send_request() and send_response() methods
-- Concrete implementations for Clawdbot iOS node, Telegram, Signal
+- Define E2ENotificationBackend trait in Rust
+- Interface includes register(), send_request(), receive_response() methods
+- Concrete implementations for Signal Bot, Clawdbot iOS node (with E2E), Custom Apps
 - Typecheck passes
 
-### US-005: Clawdbot iOS Node Notification
-**Description:** As a user, I want to receive sudo request notifications via the Clawdbot iOS node so that I can approve requests from my phone.
+### US-005: E2E Encrypted Notification via Signal
+**Description:** As a privacy-conscious user, I want to receive sudo request notifications via Signal so that my approval workflow is protected by Signal's proven end-to-end encryption.
 
 **Acceptance Criteria:**
-- Implement NotificationBackend for Clawdbot nodes API
-- Send push notification with request_id, command, user, timeout
+- Implement E2ENotificationBackend for Signal Bot API (via signald)
+- Encrypt notification payload with user's Signal public key
+- Send encrypted notification with request_id, command, user, timeout
 - Include rich context (command, user, PID, cwd)
 - Typecheck passes
 
-### US-006: Telegram Bot Backend
-**Description:** As a user, I want to receive sudo request notifications via Telegram so that I can approve requests using inline keyboards.
+**Security Requirements:**
+- Use Signal Protocol for E2E encryption
+- Generate and store encryption keys securely
+- Validate nonces to prevent replay attacks
+
+### US-006: Clawdbot iOS Node with Custom E2E
+**Description:** As a Clawdbot user, I want to receive sudo request notifications via the Clawdbot iOS node with custom end-to-end encryption so that I can approve requests using my existing infrastructure.
 
 **Acceptance Criteria:**
-- Implement NotificationBackend for Telegram Bot API
-- Format notification with Markdown escape for command
-- Include Approve/Deny inline keyboard URLs
+- Extend Clawdbot nodes API with E2E encryption layer
+- Generate Curve25519 keypair on iOS device
+- Encrypt notifications before sending via nodes API
+- Decrypt and display notifications on iOS device
 - Typecheck passes
 
-### US-007: Signal Bot Backend
-**Description:** As a privacy-conscious user, I want to receive sudo request notifications via Signal so that my approval workflow is end-to-end encrypted.
+**Security Requirements:**
+- Keys stored in iOS Keychain
+- Secure key exchange mechanism (QR code during setup)
+- Revocation mechanism for compromised devices
+
+### US-007: Custom Mobile App with App-Level E2E
+**Description:** As a security-conscious user, I want a dedicated mobile app with app-level E2E encryption for sudo approvals so that I have full control over the encryption implementation.
 
 **Acceptance Criteria:**
-- Implement NotificationBackend for Signal Bot API
-- Send notification with request details
-- Provide approval/deny URL endpoints
+- Build native iOS app with CryptoKit encryption
+- Build native Android app with libsodium encryption
+- Encrypt notifications via APNs (iOS) and FCM (Android)
+- Implement secure key generation and storage
 - Typecheck passes
+
+**Security Requirements:**
+- Private keys never leave device
+- Encryption keys stored in platform secure storage (Keychain/Keystore)
+- Forward secrecy (optional future enhancement)
 
 ### US-008: HTTP API for Approval
 **Description:** As the notification backend, I need HTTP endpoints to receive approval/deny responses so that users can interact with requests from their phone.
 
 **Acceptance Criteria:**
-- Implement /approve/<request_id> endpoint
-- Implement /deny/<request_id> endpoint
+- Implement /approve/<request_id>/<nonce> endpoint
+- Implement /deny/<request_id>/<nonce> endpoint
+- Validate nonce before processing approval/deny
 - Update request status in SQLite
 - Return confirmation response
 - Typecheck passes
@@ -103,6 +124,7 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 **Acceptance Criteria:**
 - Log all requests to audit_log table
 - Log approval/deny/timeout decisions with timestamp and decision source
+- Log encryption key registration events
 - Provide CLI command to view audit log
 - Typecheck passes
 
@@ -124,7 +146,17 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Validate nonce before processing approval/deny
 - Typecheck passes
 
-### US-013: PAM Configuration
+### US-013: Encryption Key Management
+**Description:** As the system, I need to manage E2E encryption keys for users so that notifications can be securely encrypted.
+
+**Acceptance Criteria:**
+- Generate Curve25519 keypairs for users
+- Store public keys in database (user_keys table)
+- Provide secure key exchange mechanism
+- Support key rotation (future)
+- Typecheck passes
+
+### US-014: PAM Configuration
 **Description:** As a user, I want to configure PAM to use ai-sudo so that the system can intercept sudo requests.
 
 **Acceptance Criteria:**
@@ -133,7 +165,7 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Support optional allowed_users allowlist
 - Typecheck passes
 
-### US-014: Daemon Installation and Service
+### US-015: Daemon Installation and Service
 **Description:** As a user, I want to install ai-sudo as a system service so that the daemon runs automatically on boot.
 
 **Acceptance Criteria:**
@@ -142,7 +174,7 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Support enable/disable on boot
 - Typecheck passes
 
-### US-015: macOS OpenPAM Compatibility
+### US-016: macOS OpenPAM Compatibility
 **Description:** As a macOS user, I want ai-sudo to work with OpenPAM so that the system functions correctly on my platform.
 
 **Acceptance Criteria:**
@@ -151,7 +183,7 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Test PAM module integration on macOS
 - Typecheck passes
 
-### US-016: CLI Tool for Local Testing
+### US-017: CLI Tool for Local Testing
 **Description:** As a developer, I want a CLI tool to test the approval workflow locally so that I can debug without triggering actual sudo.
 
 **Acceptance Criteria:**
@@ -160,21 +192,57 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Print notification status
 - Typecheck passes
 
+### US-018: E2E Notification Backend Decision
+**Description:** As a project stakeholder, I want to evaluate and decide on the E2E encrypted notification backend(s) to use so that we can implement a secure and practical solution.
+
+**Acceptance Criteria:**
+- Research Signal Bot API (signald)
+- Research Custom iOS/Android apps with E2E
+- Research Clawdbot iOS node with E2E
+- Research WebRTC-based notifications
+- Document pros/cons of each option
+- Make and document decision for MVP
+- Typecheck passes (documentation only)
+
 ## Non-Goals
-- Native mobile apps (iOS/Android) - future enhancement
 - Biometric authentication - future enhancement
 - YubiKey/FIDO2 integration - future enhancement
 - Multi-user approval workflows - future enhancement
+- Non-E2E notification channels (Telegram, SMS, email) - explicitly rejected
 
 ## Technical Considerations
 - PAM module must be written in C due to OpenPAM API requirements
 - Daemon written in Rust for memory safety and async performance
+- Use libsodium/sodiumoxide for E2E encryption (Curve25519, XSalsa20)
 - Use sqlx or rusqlite for SQLite database
-- Notification backends are pluggable via trait
+- Notification backends are pluggable via E2ENotificationBackend trait
 - Unix socket for fast local IPC with PAM module
 - HTTP API for receiving responses from notification backends
+- All notification channels must provide E2E encryption (non-negotiable)
 
 ## Out of Scope
 - Command preview/dry-run feature
 - Batch approval for multiple commands
 - Integration with enterprise SSO providers
+- Non-E2E notification channels
+
+## E2E Notification Backend Decision
+
+See [agents/ARCHITECTURE.md](agents/ARCHITECTURE.md) for detailed analysis of E2E encrypted notification options.
+
+### Current Recommendation for MVP
+
+| Backend | Status | Rationale |
+|---------|--------|-----------|
+| Signal Bot | ✅ Approved | Proven E2E encryption, moderate effort |
+| Custom Apps | 🔬 Researching | High effort, best UX (future v2) |
+| Clawdbot iOS | 🔬 Researching | Leverages existing infrastructure |
+
+### Rejected Options
+
+| Backend | Reason for Rejection |
+|---------|---------------------|
+| Telegram | No native E2E encryption |
+| SMS | No encryption, SIM hijacking risks |
+| Email | No E2E, prone to interception |
+| Plain webhooks | No encryption |

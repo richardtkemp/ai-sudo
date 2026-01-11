@@ -42,16 +42,15 @@ ai-sudo bridges this gap by adding a **human-in-the-loop** approval step. The AI
 
 | Channel | E2E Encryption | Status |
 |---------|----------------|--------|
-| Signal Bot | ✅ Native Signal E2E | Approved |
-| Clawdbot iOS Node (with encryption) | ✅ Custom E2E | To be decided |
-| Custom iOS/Android App | ✅ App-level E2E | To be decided |
-| WebRTC/Web Push | ✅ DTLS/SRTP | Researching |
+| Signal Bot | ✅ Native Signal E2E | ✅ MVP - Approved |
+| Custom iOS/Android App | ✅ App-level E2E | 🔬 Future v2 |
 
 ### Rejected Notification Channels
 
 | Channel | Reason for Rejection |
 |---------|---------------------|
 | Telegram | No native E2E encryption (MTProto is server-client, not E2E) |
+| Clawdbot iOS Node | Not publicly available (closed infrastructure) |
 | SMS | No encryption, SIM hijacking risks |
 | Email | No E2E, prone to interception |
 | Plain webhooks | No encryption |
@@ -106,7 +105,11 @@ See [agents/ARCHITECTURE.md](agents/ARCHITECTURE.md) for implementation details.
 
 ## Notification Backend Decisions
 
-See [agents/E2E-NOTIFICATIONS.md](agents/E2E-NOTIFICATIONS.md) for detailed analysis of E2E encrypted notification options and the decision-making process.
+See [agents/ARCHITECTURE.md](agents/ARCHITECTURE.md) for detailed analysis of E2E encrypted notification options.
+
+**Current Strategy:**
+- **MVP (v1):** Signal Bot API (proven E2E, available now)
+- **Future (v2):** Custom iOS/Android apps with app-level E2E
 
 ## License
 

@@ -68,10 +68,10 @@ The central service that manages approval workflow.
 │                                                      └─────────────┘  │
 │  ┌─────────────────────────────────────────────────────────────────┐  │
 │  │ E2E Encrypted Notification Backends (Pluggable)                 │  │
-│  │ ┌─────────────┐ ┌─────────────┐ ┌─────────────────────────┐    │  │
-│  │ │ Signal Bot  │ │ Clawdbot    │ │ Custom App (TBD)        │    │  │
-│  │ │ (Approved)  │ │ iOS Node    │ │ iOS/Android with E2E    │    │  │
-│  │ └─────────────┘ │ (TBD)       │ └─────────────────────────┘    │  │
+│  │ ┌─────────────┐ ┌─────────────────────────┐                    │  │
+│  │ │ Signal Bot  │ │ Custom App (Future v2)  │                    │  │
+│  │ │ (Approved)  │ │ iOS/Android with E2E    │                    │  │
+│  │ └─────────────┘ └─────────────────────────┘                    │  │
 │  └─────────────────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -124,8 +124,7 @@ trait E2ENotificationBackend {
 1. **Signal Bot** - Native E2E encryption via Signal protocol
 
 **Backends Under Evaluation:**
-2. **Clawdbot iOS Node** - Custom E2E encryption layer
-3. **Custom Mobile Apps** - App-level E2E with APNs/FCM
+2. **Custom Mobile Apps** - App-level E2E with APNs/FCM (Future v2)
 
 ---
 
@@ -280,120 +279,12 @@ Build native iOS and Android apps that implement custom E2E encryption and commu
 
 ---
 
-### Option C: Clawdbot iOS Node with E2E 🔬 Researching
-
-**Status:** Researching - Leverages existing infrastructure
-
-**Description:**
-Extend the existing Clawdbot iOS node infrastructure with custom E2E encryption for sudo notifications.
-
-**Architecture:**
-```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
-│ aisudo      │────▶│ Clawdbot Gateway │────▶│ Clawdbot    │
-│ daemon      │     │ (encrypted)      │     │ iOS Node    │
-└─────────────┘     └──────────────────┘     └─────────────┘
-```
-
-**Implementation Strategy:**
-1. Use existing nodes API for notification delivery
-2. Add encryption layer using libsodium
-3. Generate keypair on iOS device
-4. Store public key in daemon's trusted store
-5. Encrypt all notifications before sending
-
-**Encryption Flow:**
-```rust
-// Daemon side
-let shared_secret = x25519_dh(
-    daemon_private_key,
-    device_public_key
-);
-let encrypted = encrypt_xsalsa20(
-    &shared_secret,
-    nonce,
-    plaintext.as_bytes()
-);
-
-// iOS side
-let shared_secret = x25519_dh(
-    device_private_key,
-    daemon_public_key
-);
-let plaintext = decrypt_xsalsa20(
-    &shared_secret,
-    nonce,
-    encrypted.as_bytes()
-);
-```
-
-**Security Considerations:**
-- Keys must be stored securely (iOS Keychain)
-- Need secure key exchange mechanism (QR code? initial setup?)
-- Revocation mechanism if device is compromised
-
-**Pros:**
-- ✅ Leverages existing Clawdbot infrastructure
-- ✅ Single codebase to maintain
-- ✅ Direct device notification
-- ✅ Can use Clawdbot's existing auth
-
-**Cons:**
-- ⚠️ Need to implement encryption layer
-- ⚠️ iOS node dependency
-- ⚠️ Limited to Clawdbot users
-
----
-
-### Option D: WebRTC for Signaling 🔬 Researching
-
-**Status:** Researching - Most complex but most secure
-
-**Description:**
-Use WebRTC for direct peer-to-peer communication with E2E encryption via DTLS/SRTP.
-
-**Architecture:**
-```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
-│ aisudo      │────▶│ STUN/TURN Server │────▶│ Browser/    │
-│ daemon      │     │ (relay)          │     │ PWA         │
-└─────────────┘     └──────────────────┘     └─────────────┘
-                            │
-                            ▼ WebRTC Data Channel (DTLS/SRTP)
-                     ┌──────────────────┐
-                     │ Direct P2P       │
-                     │ (encrypted)      │
-                     └──────────────────┘
-```
-
-**How It Works:**
-1. Open WebRTC data channel between daemon and browser/PWA
-2. DTLS provides E2E encryption (certificate-based)
-3. SRTP for media (if voice/video added later)
-4. Use Web Push API for waking sleeping devices
-
-**Pros:**
-- ✅ Native E2E encryption via DTLS
-- ✅ No push notification service dependency
-- ✅ Can work offline (once established)
-- ✅ Cross-platform (web-based)
-
-**Cons:**
-- ⚠️ Complex implementation
-- ⚠️ Requires TURN server for NAT traversal
-- ⚠️ Browser must be open (or use Web Push)
-- ⚠️ Limited mobile support for data channels
-
----
-
 ### Recommendation Summary
 
 | Option | Security | Effort | Maturity | Recommendation |
 |--------|----------|--------|----------|----------------|
 | Signal Bot | ⭐⭐⭐⭐⭐ | Medium | High | **MVP Choice** |
-| Custom Apps | ⭐⭐⭐⭐⭐ | High | Low | Future v2 |
-| Clawdbot iOS | ⭐⭐⭐⭐ | Medium | Medium | Alternative |
-| WebRTC | ⭐⭐⭐⭐⭐ | Very High | Low | Research only |
+| Custom Apps | ⭐⭐⭐⭐⭐ | High | Low | **Future v2** |
 
 **MVP Recommendation:** Start with **Signal Bot** (signald) as it provides proven E2E encryption with moderate implementation effort.
 

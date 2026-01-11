@@ -9,7 +9,7 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Create a secure, auditable workflow for AI assistants to request sudo access
 - Enable remote approval without physical presence or blanket sudo access
 - Provide rich context (command, user, PID, cwd) for informed decisions
-- Support only E2E encrypted notification backends (Signal, custom apps, Clawdbot iOS node with encryption)
+- Support only E2E encrypted notification backends (Signal, custom apps)
 - Implement security best practices (E2E encryption, nonces, rate limiting, replay prevention)
 
 ## User Stories
@@ -49,7 +49,7 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 **Acceptance Criteria:**
 - Define E2ENotificationBackend trait in Rust
 - Interface includes register(), send_request(), receive_response() methods
-- Concrete implementations for Signal Bot, Clawdbot iOS node (with E2E), Custom Apps
+- Concrete implementations for Signal Bot, Custom Apps
 - Typecheck passes
 
 ### US-005: E2E Encrypted Notification via Signal
@@ -67,22 +67,7 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Generate and store encryption keys securely
 - Validate nonces to prevent replay attacks
 
-### US-006: Clawdbot iOS Node with Custom E2E
-**Description:** As a Clawdbot user, I want to receive sudo request notifications via the Clawdbot iOS node with custom end-to-end encryption so that I can approve requests using my existing infrastructure.
-
-**Acceptance Criteria:**
-- Extend Clawdbot nodes API with E2E encryption layer
-- Generate Curve25519 keypair on iOS device
-- Encrypt notifications before sending via nodes API
-- Decrypt and display notifications on iOS device
-- Typecheck passes
-
-**Security Requirements:**
-- Keys stored in iOS Keychain
-- Secure key exchange mechanism (QR code during setup)
-- Revocation mechanism for compromised devices
-
-### US-007: Custom Mobile App with App-Level E2E
+### US-006: Custom Mobile App with App-Level E2E
 **Description:** As a security-conscious user, I want a dedicated mobile app with app-level E2E encryption for sudo approvals so that I have full control over the encryption implementation.
 
 **Acceptance Criteria:**
@@ -196,10 +181,8 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 **Description:** As a project stakeholder, I want to evaluate and decide on the E2E encrypted notification backend(s) to use so that we can implement a secure and practical solution.
 
 **Acceptance Criteria:**
-- Research Signal Bot API (signald)
-- Research Custom iOS/Android apps with E2E
-- Research Clawdbot iOS node with E2E
-- Research WebRTC-based notifications
+- Research Signal Bot API (signald) - Approved for MVP
+- Research Custom iOS/Android apps with E2E - Future v2
 - Document pros/cons of each option
 - Make and document decision for MVP
 - Typecheck passes (documentation only)
@@ -236,13 +219,13 @@ See [agents/ARCHITECTURE.md](agents/ARCHITECTURE.md) for detailed analysis of E2
 |---------|--------|-----------|
 | Signal Bot | ✅ Approved | Proven E2E encryption, moderate effort |
 | Custom Apps | 🔬 Researching | High effort, best UX (future v2) |
-| Clawdbot iOS | 🔬 Researching | Leverages existing infrastructure |
 
 ### Rejected Options
 
 | Backend | Reason for Rejection |
 |---------|---------------------|
 | Telegram | No native E2E encryption |
+| Clawdbot iOS Node | Not publicly available (closed infrastructure) |
 | SMS | No encryption, SIM hijacking risks |
 | Email | No E2E, prone to interception |
 | Plain webhooks | No encryption |

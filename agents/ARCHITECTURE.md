@@ -121,7 +121,7 @@ trait E2ENotificationBackend {
 ```
 
 **Approved Backends:**
-1. **Signal Bot** - Native E2E encryption via Signal protocol
+1. **signal-cli (JSON-RPC)** - Active, E2E secure, requires Java runtime
 
 **Backends Under Evaluation:**
 2. **Custom Mobile Apps** - App-level E2E with APNs/FCM (Future v2)
@@ -130,42 +130,110 @@ trait E2ENotificationBackend {
 
 ## E2E Encrypted Notification Options
 
-### Status: To Be Decided
+### Status: Research Complete - Decision Made
 
-We are evaluating the following E2E encrypted notification channels. Each option is being researched for security, usability, and implementation effort.
+**Critical Finding:** Signal does NOT provide an official Bot API. All approaches require puppeting a real user account.
 
-### Option A: Signal Bot API ✅ Approved
+### Option A: signal-cli (JSON-RPC) ✅ MVP Choice
 
-**Status:** Approved - Recommended for MVP
+**Status:** ✅ Approved - Only Viable Option
 
 **Description:**
-Use Signal's bot API to send encrypted notifications. Signal provides native E2E encryption using the Signal Protocol.
+signal-cli is a command-line interface for Signal that provides a JSON-RPC server. It runs as a local daemon and communicates with Signal servers as a registered user.
 
-**Implementation Options:**
+**Implementation:**
+```rust
+struct SignalCliBackend {
+    socket_path: PathBuf,
+    phone_number: String,
+}
 
-| Option | Pros | Cons | Effort |
-|--------|------|------|--------|
-| signal-cli (Java) | Mature, well-documented | Requires Java runtime | Medium |
-| signald (Go) | Fast, socket-based | Requires running signald | Medium |
-| signal-web-api | No local server | Weaker security model | Low |
-
-**Recommended: signald**
-
-signald runs as a local daemon and communicates with Signal servers. It provides a socket-based API that ai-sudo can use.
-
-**Architecture with signald:**
+impl E2ENotificationBackend for SignalCliBackend {
+    async fn send_request(&self, encrypted: &[u8], metadata: &RequestMetadata) -> Result<()> {
+        let message = hex::encode(encrypted);
+        signal_cli_send(&self.socket_path, &self.phone_number, &message).await?;
+        Ok(())
+    }
+}
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────────┐
-│ aisudo      │────▶│ signald     │────▶│ Signal Server   │
-│ daemon      │     │ (local)     │     │ (relay only)    │
-└─────────────┘     └─────────────┘     └────────┬────────┘
-                                                  │
-                                                  ▼
-                                           ┌─────────────┐
-                                           │ Signal App  │
-                                           │ (decrypts)  │
-                                           └─────────────┘
+
+**Architecture with signal-cli:**
 ```
+┌─────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│ aisudo      │────▶│ signal-cli      │────▶│ Signal Server   │
+│ daemon      │     │ (JSON-RPC)      │     │ (relay only)    │
+└─────────────┘     └─────────────────┘     └────────┬────────┘
+                                                      │
+                                                      ▼
+                                               ┌─────────────┐
+                                               │ Signal App  │
+                                               │ (decrypts)  │
+                                               └─────────────┘
+```
+
+**Repository:** https://github.com/AsamK/signal-cli (~2.5k stars, active 2024)
+
+**Pros:**
+- ✅ Actively maintained
+- ✅ E2E secure (Signal Protocol correctly implemented)
+- ✅ JSON-RPC interface for easy integration
+- ✅ Mature, well-tested
+
+**Cons:**
+- ⚠️ Requires Java runtime
+- ⚠️ Needs dedicated phone number (puppet account)
+- ⚠️ Signal ToS compliance risk
+
+---
+
+### Option B: signald (Go) ❌ DO NOT USE
+
+**Status:** ❌ Rejected - Abandoned with Security Concerns
+
+**Description:**
+signald is a daemon that exposes Signal via Unix socket.
+
+**Critical Issues:**
+- Project is **no longer actively maintained**
+- Official README states: "not nearly as secure as the real Signal clients"
+- Security concerns documented in project issues
+
+**Recommendation:** ❌ DO NOT USE for security-critical applications
+
+**Repository:** https://gitlab.com/signald/signald (archived)
+
+---
+
+### Option C: Custom Mobile App (Future v2) 🔬 Researching
+
+**Status:** Future Enhancement
+
+Build a proper Signal client as a native mobile app using libsignal.
+
+**Effort:** 6+ months
+
+**Pros:**
+- ✅ Best user experience
+- ✅ Proper E2E with libsignal
+- ✅ No puppet account needed
+
+**Cons:**
+- ⚠️ Highest effort
+- ⚠️ Full Signal client implementation required
+
+---
+
+### Recommendation Summary
+
+| Option | Security | Effort | Status | Decision |
+|--------|----------|--------|--------|----------|
+| signal-cli | ⭐⭐⭐⭐⭐ | Medium | Active | ✅ **MVP Choice** |
+| Custom App | ⭐⭐⭐⭐⭐ | Very High | Future | 🔬 Future v2 |
+| signald | ⭐⭐⭐ | Low | Abandoned | ❌ Rejected |
+
+**MVP Recommendation:** Start with **signal-cli (JSON-RPC)** as it's the only actively maintained, E2E secure option available.
+
+**Future Enhancement:** Build custom mobile app with libsignal for proper Signal client experience without puppet account.
 
 **Security Properties:**
 - Signal Protocol provides forward secrecy
@@ -361,24 +429,29 @@ cd aisudo-daemon
 cargo add tokio rusqlite sqlx uuid serde serde_json sodiumoxide
 ```
 
-#### Step 1.2: Create PAM Module Skeleton
-```c
-// pam_aisudo.c
-#include <security/pam_modules.h>
-#include <security/pam_ext.h>
-#include <stdio.h>
-#include <stdlib.h>
+#### Step 1.2: Create PAM Module Skeleton (Rust/nonstick)
 
-PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
-    // Extract command and user info
-    // Send to daemon socket
-    // Wait for response
-    return PAM_SUCCESS; // or PAM_AUTH_ERR
-}
+```rust
+// src/main.rs using nonstick crate
+use nonstick::PamModule;
 
-PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
-    return PAM_SUCCESS;
+pam_export! {
+    struct AisudoPamModule;
+
+    impl PamModule for AisudoPamModule {
+        fn authenticate(&mut self, _args: &[&str], _data: Option<&mut std::ffi::c_void>) -> Result<bool, nonstick::Error> {
+            // Intercept sudo request
+            // Communicate with daemon via Unix socket
+            // Return true to allow, false to deny
+            Ok(true)
+        }
+
+        fn setcred(&mut self, _cred: nonstick::Credential) -> Result<(), nonstick::Error> {
+            Ok(())
+        }
+    }
 }
+```
 ```
 
 #### Step 1.3: Implement Unix Socket Communication
@@ -560,12 +633,15 @@ gcc -Wall -Wextra -o pam_aisudo_test pam_aisudo.c -lcunit
 
 ### Installation
 ```bash
+# Build PAM module
+cargo build --release -p aisudo-pam
+
 # Install PAM module
-sudo cp pam_aisudo.so /usr/lib/pam/
-sudo chmod 755 /usr/lib/pam/pam_aisudo.so
+sudo cp target/release/libaisudo_pam.so /usr/lib/pam/
+sudo chmod 755 /usr/lib/pam/libaisudo_pam.so
 
 # Configure PAM
-echo "auth sufficient pam_aisudo.so timeout=30" | sudo tee /etc/pam.d/sudo
+echo "auth sufficient libaisudo_pam.so timeout=30" | sudo tee /etc/pam.d/sudo
 
 # Install daemon
 cargo install --path aisudo-daemon
@@ -582,10 +658,9 @@ sudo systemctl start aisudo-daemon
 
 ## Future Enhancements
 
-- [ ] Native iOS/Android apps (Option B)
+- [ ] Native iOS/Android apps with libsignal (replaces signal-cli puppet account)
 - [ ] Biometric authentication on mobile
 - [ ] Command preview (dry run before execution)
 - [ ] Batch approval for multiple similar commands
 - [ ] Integration with YubiKey/FIDO2
 - [ ] Multi-user approval workflows
-- [ ] WebRTC-based notifications (Option D)

@@ -42,8 +42,24 @@ ai-sudo bridges this gap by adding a **human-in-the-loop** approval step. The AI
 
 | Channel | E2E Encryption | Status |
 |---------|----------------|--------|
-| Signal Bot | ✅ Native Signal E2E | ✅ MVP - Approved |
+| signal-cli (JSON-RPC) | ✅ Native Signal E2E | ✅ MVP - Approved |
 | Custom iOS/Android App | ✅ App-level E2E | 🔬 Future v2 |
+
+### Important: Signal API Reality
+
+**Signal does NOT provide an official Bot API.** All Signal notification approaches require puppeting a real user account.
+
+| Option | Status | Notes |
+|--------|--------|-------|
+| signal-cli | ✅ Active | **MVP Choice** - Java-based, JSON-RPC interface |
+| signald | ❌ Abandoned | "Not nearly as secure" - DO NOT USE |
+| Custom Mobile App | 🔬 Future v2 | Build proper Signal client |
+
+**Puppet Account Requirements:**
+- Dedicated phone number (VoIP acceptable)
+- Recovery phrase stored securely
+- Rate limiting enforced
+- Signal ToS compliance is an unquantized risk
 
 ### Rejected Notification Channels
 
@@ -51,6 +67,7 @@ ai-sudo bridges this gap by adding a **human-in-the-loop** approval step. The AI
 |---------|---------------------|
 | Telegram | No native E2E encryption (MTProto is server-client, not E2E) |
 | Clawdbot iOS Node | Not publicly available (closed infrastructure) |
+| signald | Abandoned project, security concerns documented |
 | SMS | No encryption, SIM hijacking risks |
 | Email | No E2E, prone to interception |
 | Plain webhooks | No encryption |

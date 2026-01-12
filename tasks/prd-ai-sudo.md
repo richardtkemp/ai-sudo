@@ -177,15 +177,103 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Print notification status
 - Typecheck passes
 
-### US-018: E2E Notification Backend Decision
-**Description:** As a project stakeholder, I want to evaluate and decide on the E2E encrypted notification backend(s) to use so that we can implement a secure and practical solution.
+### US-018: Signal Communication Channel Research
+**Description:** As a security-conscious developer, I need to understand Signal's communication options so that we can make an informed decision about notification delivery.
 
 **Acceptance Criteria:**
-- Research Signal Bot API (signald) - Approved for MVP
-- Research Custom iOS/Android apps with E2E - Future v2
-- Document pros/cons of each option
+- Research whether Signal has an official Bot API
+- Research signald status (maintenance, security)
+- Research signal-cli approach (puppet account)
+- Document puppet account security concerns
 - Make and document decision for MVP
 - Typecheck passes (documentation only)
+
+#### Signal API Reality Check
+
+**Critical Finding:** Signal does NOT offer an official Bot API. All approaches require "puppeting" a real user account.
+
+> **From signald README (archived):**
+> "Signal does not offer any sort of official API. Unlike traditional messaging applications, the Signal server expects the client software to perform encryption and key management."
+
+#### Communication Channel Options
+
+| Option | Status | E2E Secure | Effort | Risk |
+|--------|--------|------------|--------|------|
+| **signal-cli (Java)** | ✅ Active | ✅ Yes | Medium | Low |
+| **signal-cli (JSON-RPC)** | ✅ Active | ✅ Yes | Medium | Low |
+| **signald (Go)** | ❌ Abandoned | ⚠️ "Not nearly as secure" | Low | **High** |
+| **libsignal + custom** | ⚠️ Complex | ✅ Yes | Very High | Medium |
+| **Custom Mobile App** | 🔬 Future | ✅ Yes | Very High | Low |
+
+**Option A: signal-cli (Java/Python)**
+- **What:** Command-line interface for Signal, provides JSON-RPC server
+- **Status:** Active (2024), maintained by AsamK
+- **Repo:** https://github.com/AsamK/signal-cli
+- **How it works:** Runs as a local daemon, connects to Signal servers as a registered user
+- **E2E:** ✅ Yes - uses Signal Protocol correctly
+- **Effort:** 2-3 weeks to integrate
+- **Pros:** Mature, well-tested, E2E secure
+- **Cons:** Requires Java runtime, needs dedicated phone number
+
+**Option B: signald (Go)**
+- **What:** Daemon that exposes Signal via Unix socket
+- **Status:** ❌ **ABANDONED** - README says "no longer actively maintained"
+- **Security Warning:** Official README states "not nearly as secure as the real Signal clients"
+- **Recommendation:** ❌ DO NOT USE for security-critical applications
+- **Repo:** https://gitlab.com/signald/signald
+
+**Option C: libsignal + Custom Rust Client**
+- **What:** Build our own Signal client using libsignal protocol library
+- **Status:** Signal publishes libsignal (Rust, Java, Swift)
+- **Repo:** https://github.com/signalapp/libsignal
+- **Effort:** 3-6 months (full Signal client implementation)
+- **Pros:** Maximum control, Rust-native
+- **Cons:** Massive effort, reimplementing Signal's key management
+
+**Option D: Custom Mobile App (Future v2)**
+- **What:** Build a proper Signal client as a mobile app
+- **Uses:** libsignal for iOS/Android
+- **Effort:** 6+ months
+- **Pros:** Best user experience, proper E2E
+- **Cons:** Highest effort
+
+#### Puppet Account Concerns
+
+All Signal API approaches require a **puppet account** - a real Signal phone number that acts as the sender.
+
+| Concern | Impact | Mitigation |
+|---------|--------|------------|
+| **Account ownership** | Need dedicated phone number | Use VoIP number (Google Voice, etc.) |
+| **Rate limiting** | Signal may block high-volume sending | Limit request frequency, respect quotas |
+| **Session management** | Need to link device to Signal | Initial QR code or PIN setup |
+| **Security of credentials** | Recovery phrases must be stored | Encrypt at rest, use hardware key |
+| **Account recovery** | Losing recovery phrase = losing access | Backup recovery phrase securely |
+| **ToS compliance** | Signal ToS prohibits automated messaging | ⚠️ **Potential risk** |
+
+**ToS Concern:** Signal's Terms of Service may prohibit automated messaging. This is an unquantified risk.
+
+#### Recommendation for MVP
+
+**Signal-cli (JSON-RPC) is the only viable option for MVP.**
+
+Despite the puppet account concerns, signal-cli is:
+- ✅ Actively maintained
+- ✅ E2E secure (uses Signal Protocol correctly)
+- ✅ Provides JSON-RPC interface for integration
+- ✅ Better security posture than abandoned signald
+
+**Risk Acceptance:**
+- We accept puppet account risk for MVP
+- Recovery phrase stored encrypted on server
+- Rate limiting enforced by ai-sudo daemon
+- Clear ToS risk documented
+
+**Future (v2):** Build custom mobile app with libsignal for proper Signal client experience.
+
+#### References
+- signal-cli: https://github.com/AsamK/signal-cli (⭐ ~2.5k stars, active)
+- libsignal: https://github.com/signalapp/libsignal (official Signal repo)
+- signald: https://gitlab.com/signald/signald (abandoned, security concerns)
 
 ### US-019: Rust PAM Module Technology Decision
 **Description:** As a senior developer, I want to evaluate Rust PAM crate options so that we can choose the best approach for ai-sudo's PAM module.
@@ -261,8 +349,26 @@ See [agents/ARCHITECTURE.md](agents/ARCHITECTURE.md) for detailed analysis of E2
 
 | Backend | Status | Rationale |
 |---------|--------|-----------|
-| Signal Bot | ✅ Approved | Proven E2E encryption, moderate effort |
-| Custom Apps | 🔬 Researching | High effort, best UX (future v2) |
+| signal-cli (JSON-RPC) | ✅ Approved | Only viable option, E2E secure |
+| Custom Apps | 🔬 Future v2 | Best UX, but highest effort |
+
+### Communication Channel Research Summary
+
+**Critical Finding:** Signal does NOT provide an official Bot API. All approaches require puppeting a real user account.
+
+| Option | Status | Security | Notes |
+|--------|--------|----------|-------|
+| signal-cli | ✅ Active | ✅ Secure | **MVP Choice** - Java-based, JSON-RPC |
+| signald | ❌ Abandoned | ⚠️ Risky | "Not nearly as secure" - DO NOT USE |
+| libsignal + custom | 🔬 Complex | ✅ Secure | Future v2 - massive effort |
+| Custom Mobile App | 🔬 Future | ✅ Secure | Best UX, requires full client |
+
+### Puppet Account Requirements
+
+- Dedicated phone number (VoIP acceptable)
+- Recovery phrase must be stored securely
+- Rate limiting must be enforced
+- Signal ToS compliance is an unquantified risk
 
 ### Rejected Options
 
@@ -270,6 +376,7 @@ See [agents/ARCHITECTURE.md](agents/ARCHITECTURE.md) for detailed analysis of E2
 |---------|---------------------|
 | Telegram | No native E2E encryption |
 | Clawdbot iOS Node | Not publicly available (closed infrastructure) |
+| signald | Abandoned project, security concerns |
 | SMS | No encryption, SIM hijacking risks |
 | Email | No E2E, prone to interception |
 | Plain webhooks | No encryption |

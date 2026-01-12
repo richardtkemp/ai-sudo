@@ -187,6 +187,50 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Make and document decision for MVP
 - Typecheck passes (documentation only)
 
+### US-019: Rust PAM Module Technology Decision
+**Description:** As a senior developer, I want to evaluate Rust PAM crate options so that we can choose the best approach for ai-sudo's PAM module.
+
+**Acceptance Criteria:**
+- Research nonstick crate (modern, trait-based, OpenPAM support)
+- Research pamsm crate (lightweight, focused on Service Modules)
+- Research pam-sys / libpam-sys crate (raw FFI, Tailscale approach)
+- Create comparison table with effort estimates
+- Make and document decision for MVP
+- Typecheck passes (documentation only)
+
+#### Rust PAM Crate Comparison
+
+| Crate | Approach | macOS/OpenPAM | Maintenance | Effort | Risk |
+|-------|----------|---------------|-------------|--------|------|
+| **nonstick** | Trait-based wrapper | ✅ Explicit support | Active (2024) | Low | Low |
+| **pamsm** | Service Module focus | ✅ Should work | Stable (older) | Low | Low |
+| **pam-sys** | Raw FFI bindings | ⚠️ Linux-focused | Active | High | Medium |
+
+**Option 1: nonstick** (⭐ Recommended)
+- Modern, trait-based approach (PamModule trait)
+- Handles extern "C" boilerplate with `pam_export!` macro
+- Cross-platform: Linux-PAM + OpenPAM/macOS
+- Type-safe wrapper reduces PAM memory safety issues
+- ~1-2 weeks for MVP module
+
+**Option 2: pamsm**
+- Lightweight, specifically for Service Modules
+- Older but stable, minimal overhead
+- Macro for module entry points
+- ~1-2 weeks for MVP module
+
+**Option 3: pam-sys + manual**
+- Raw FFI bindings for maximum control
+- Used by Tailscale's pam_tailscale
+- More boilerplate, less abstraction
+- ~3-4 weeks for MVP module
+
+**Recommendation:** **nonstick** for MVP
+- Best balance of ease-of-use and type safety
+- Explicit macOS/OpenPAM support
+- Modern Rust patterns (traits, macros)
+- Reduces boilerplate while maintaining safety
+
 ## Non-Goals
 - Biometric authentication - future enhancement
 - YubiKey/FIDO2 integration - future enhancement
@@ -194,7 +238,7 @@ ai-sudo is a self-hosted PAM-based sudo approval system that enables remote huma
 - Non-E2E notification channels (Telegram, SMS, email) - explicitly rejected
 
 ## Technical Considerations
-- PAM module must be written in C due to OpenPAM API requirements
+- PAM module written in Rust using nonstick crate (cross-platform: Linux-PAM + OpenPAM/macOS)
 - Daemon written in Rust for memory safety and async performance
 - Use libsodium/sodiumoxide for E2E encryption (Curve25519, XSalsa20)
 - Use sqlx or rusqlite for SQLite database

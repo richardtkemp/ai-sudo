@@ -1,0 +1,30 @@
+# ai-sudo daemon configuration
+
+# Path to the Unix socket for PAM module communication
+socket_path = "/var/run/aisudo/aisudo.sock"
+
+# Path to the SQLite database
+db_path = "/var/lib/aisudo/aisudo.db"
+
+# HTTP API bind address (for status queries)
+http_bind = "127.0.0.1:7654"
+
+# Default timeout for approval requests (seconds)
+timeout_seconds = 60
+
+# Commands that are auto-approved without notification.
+# Matching is prefix-based: "apt list" matches "apt list --installed".
+allowlist = [
+    # "systemctl status",
+    # "apt list",
+]
+
+[telegram]
+# Create a bot via @BotFather on Telegram and paste the token here.
+bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+
+# Your Telegram chat ID. Send /start to @userinfobot to find yours.
+chat_id = 123456789
+
+# Long-poll timeout for Telegram getUpdates (seconds)
+poll_timeout_seconds = 30

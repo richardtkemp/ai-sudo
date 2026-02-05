@@ -1,0 +1,23 @@
+[Unit]
+Description=ai-sudo approval daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/aisudo-daemon /etc/aisudo/aisudo.toml
+Restart=on-failure
+RestartSec=5
+
+# Runs as root so it can execute approved commands (exec mode)
+# The socket is restricted to group "aisudo" for access control
+
+# Create runtime directory for socket
+RuntimeDirectory=aisudo
+RuntimeDirectoryMode=0755
+
+# Create state directory for database
+StateDirectory=aisudo
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

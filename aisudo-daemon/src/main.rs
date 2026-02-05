@@ -1,0 +1,90 @@
+mod config;
+mod db;
+mod http_api;
+mod notification;
+mod socket;
+
+use anyhow::Result;
+use notification::telegram::TelegramBackend;
+use std::sync::Arc;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("aisudo=info".parse()?))
+        .init();
+
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/etc/aisudo/aisudo.toml".to_string());
+
+    info!("Loading config from: {config_path}");
+    let config = config::Config::load(&config_path)?;
+
+    info!("Opening database: {}", config.db_path.display());
+    let db = Arc::new(db::Database::open(&config.db_path)?);
+
+    // Set up notification backend
+    let backend: Arc<dyn notification::NotificationBackend> =
+        if let Some(ref tg_config) = config.telegram {
+            if tg_config.chat_id == 0 {
+                warn!("Telegram chat_id is 0 — this is almost certainly wrong. Set chat_id in config.");
+            }
+            let telegram = Arc::new(TelegramBackend::new(
+                tg_config.bot_token.clone(),
+                tg_config.chat_id,
+                config.timeout_seconds,
+            ));
+            telegram.validate_bot_token().await;
+            telegram.start_polling();
+            info!("Telegram notification backend enabled (chat_id: {})", tg_config.chat_id);
+            telegram
+        } else {
+            warn!("No [telegram] config found — approval via HTTP API only");
+            Arc::new(notification::HttpOnlyBackend::new(
+                config.timeout_seconds,
+                Arc::clone(&db),
+            ))
+        };
+
+    // Spawn timeout expiry task
+    let db_timeout = Arc::clone(&db);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            match db_timeout.expire_timed_out_requests() {
+                Ok(expired) => {
+                    for id in expired {
+                        info!("Request {id} expired (timeout)");
+                    }
+                }
+                Err(e) => error!("Timeout check error: {e}"),
+            }
+        }
+    });
+
+    // Start HTTP API
+    let http_bind = config.http_bind.clone();
+    let db_http = Arc::clone(&db);
+    tokio::spawn(async move {
+        let app = http_api::router(db_http);
+        let listener = match tokio::net::TcpListener::bind(&http_bind).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Failed to bind HTTP on {http_bind}: {e}");
+                return;
+            }
+        };
+        info!("HTTP API listening on {http_bind}");
+        if let Err(e) = axum::serve(listener, app).await {
+            error!("HTTP server error: {e}");
+        }
+    });
+
+    // Run socket listener (blocks)
+    socket::run_socket_listener(&config, db, backend).await?;
+
+    Ok(())
+}

@@ -1,0 +1,13 @@
+[package]
+name = "aisudo-pam"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pam_aisudo"
+crate-type = ["cdylib"]
+
+[dependencies]
+aisudo-common = { path = "../aisudo-common" }
+serde_json = "1"
+libc = "0.2"

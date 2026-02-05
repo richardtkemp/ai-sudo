@@ -8,17 +8,10 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
+use chrono::Local;
 use tracing::{debug, error, info, warn};
 
 const STDIN_PREVIEW_BYTES: usize = 2048;
-
-/// Tracks a pending approval request with the info needed to edit the message later.
-struct PendingRequest {
-    sender: oneshot::Sender<Decision>,
-    message_id: i64,
-    user: String,
-    command: String,
-}
 
 pub struct TelegramBackend {
     bot_token: String,
@@ -30,6 +23,8 @@ pub struct TelegramBackend {
     update_offset: Arc<Mutex<i64>>,
     /// How long to wait for a response before giving up.
     request_timeout: Duration,
+    /// Message ID and original text for the main message with buttons.
+    main_message: Arc<Mutex<Option<(i64, String)>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +61,7 @@ impl TelegramBackend {
             pending: pending.clone(),
             update_offset: Arc::new(Mutex::new(0)),
             request_timeout: Duration::from_secs(timeout_seconds as u64),
+            main_message: Arc::new(Mutex::new(None)),
         };
         backend
     }
@@ -152,7 +148,8 @@ impl TelegramBackend {
         let approve_data = format!("approve:{}", record.id);
         let deny_data = format!("deny:{}", record.id);
 
-        let body = serde_json::json!({
+        // Send main message with inline buttons (for when user opens chat)
+        let main_body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "Markdown",
@@ -167,7 +164,7 @@ impl TelegramBackend {
         let resp = self
             .client
             .post(self.api_url("sendMessage"))
-            .json(&body)
+            .json(&main_body)
             .send()
             .await
             .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
@@ -176,7 +173,9 @@ impl TelegramBackend {
         let result: TelegramResponse<Message> = resp.json().await
             .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
         if !result.ok {
-            let desc = result.description.unwrap_or_else(|| "no description".to_string());
+            let desc = result
+                .description
+                .unwrap_or_else(|| "no description".to_string());
             error!("Telegram sendMessage API error (HTTP {}): {}", http_status, desc);
             return Err(anyhow!(
                 "Telegram sendMessage failed (HTTP {}): {}",
@@ -184,9 +183,56 @@ impl TelegramBackend {
             ));
         }
 
-        let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
-        info!("Telegram sendMessage succeeded: message_id={}, chat_id={}", message_id, self.chat_id);
-        Ok(message_id)
+        let main_message_id = result.result.map(|m| m.message_id).unwrap_or(0);
+        self.main_message
+            .lock()
+            .await
+            .replace((main_message_id, text));
+        info!(
+            "Telegram main message sent: message_id={}, chat_id={}",
+            main_message_id, self.chat_id
+        );
+
+        Ok(main_message_id)
+    }
+
+    async fn edit_message_status(&self, message_id: i64, original_text: &str, status_line: &str) -> Result<()> {
+        info!("Editing Telegram message {} to show: {}", message_id, status_line);
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "text": format!("{}\n\n{}", original_text, status_line),
+            "parse_mode": "Markdown"
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("editMessageText"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Telegram editMessageText HTTP request failed: {e}"))?;
+
+        let http_status = resp.status();
+        let result: TelegramResponse<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("Telegram editMessageText: failed to parse response (HTTP {}): {e}", http_status))?;
+
+        if !result.ok {
+            let desc = result
+                .description
+                .unwrap_or_else(|| "no description".to_string());
+            warn!(
+                "Telegram editMessageText API error (HTTP {}): {}",
+                http_status, desc
+            );
+        } else {
+            info!("✅ Telegram message edited successfully");
+        }
+
+        Ok(())
     }
 
     async fn poll_updates(&self) -> Result<()> {
@@ -267,6 +313,20 @@ impl TelegramBackend {
             .send()
             .await;
 
+        // Edit the main message to replace buttons with status
+        let time = Local::now().format("%H:%M:%S");
+        let status_line = match decision {
+            Decision::Approved => format!("✅ Approved at {time}"),
+            Decision::Denied => format!("❌ Denied at {time}"),
+            _ => format!("{decision:?} at {time}"),
+        };
+        let main_msg = self.main_message.lock().await.clone();
+        if let Some((msg_id, original_text)) = main_msg {
+            let _ = self
+                .edit_message_status(msg_id, &original_text, &status_line)
+                .await;
+        }
+
         // Deliver the decision to the waiting request
         if let Some((_, sender)) = self.pending.remove(request_id) {
             info!("Delivering {decision:?} for request {request_id}");
@@ -308,9 +368,19 @@ impl NotificationBackend for TelegramBackend {
                 Err(anyhow!("Response channel dropped"))
             }
             Err(_) => {
-                // Timeout
+                // Timeout - edit messages to show timeout status
                 self.pending.remove(&record.id);
                 info!("Request {} timed out", record.id);
+
+                let time = Local::now().format("%H:%M:%S");
+                let status_line = format!("⏱️ Timed out at {time}");
+                let main_msg = self.main_message.lock().await.clone();
+                if let Some((msg_id, original_text)) = main_msg {
+                    let _ = self
+                        .edit_message_status(msg_id, &original_text, &status_line)
+                        .await;
+                }
+
                 Ok(Decision::Timeout)
             }
         }

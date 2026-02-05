@@ -45,7 +45,13 @@ struct Update {
 #[derive(Debug, Deserialize)]
 struct CallbackQuery {
     id: String,
+    from: CallbackUser,
     data: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CallbackUser {
+    id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,6 +363,16 @@ impl TelegramBackend {
     }
 
     async fn handle_callback(&self, cb: CallbackQuery) {
+        // Verify the callback comes from the authorized user (matching chat_id).
+        // This prevents unauthorized users in group chats from approving/denying.
+        if cb.from.id != self.chat_id {
+            warn!(
+                "Ignoring callback from unauthorized user {} (expected {})",
+                cb.from.id, self.chat_id
+            );
+            return;
+        }
+
         let data = match cb.data {
             Some(d) => d,
             None => return,

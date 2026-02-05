@@ -688,9 +688,20 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
 }
 
 fn get_current_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    // Use the real UID from the kernel, not the spoofable $USER env var.
+    // The daemon also verifies this via SO_PEERCRED, so this is for display only.
+    let uid = unsafe { libc::getuid() };
+    // Try to resolve UID to username via passwd database
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if !pw.is_null() {
+            let name = std::ffi::CStr::from_ptr((*pw).pw_name);
+            if let Ok(s) = name.to_str() {
+                return s.to_string();
+            }
+        }
+    }
+    format!("uid:{uid}")
 }
 
 /// Check if stdin has data or EOF available without blocking.

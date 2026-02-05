@@ -12,9 +12,6 @@ pub struct Config {
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
 
-    #[serde(default = "default_http_bind")]
-    pub http_bind: String,
-
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u32,
 
@@ -29,11 +26,6 @@ pub struct Config {
     #[serde(default)]
     pub hot_reload: bool,
 
-    /// Enable the unauthenticated HTTP API. Disabled by default because it has
-    /// no authentication — any local process can list pending requests and
-    /// approve/deny them if it knows the nonce.
-    #[serde(default)]
-    pub http_enable_not_recommended: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,10 +43,6 @@ fn default_socket_path() -> PathBuf {
 
 fn default_db_path() -> PathBuf {
     PathBuf::from("/var/lib/aisudo/aisudo.db")
-}
-
-fn default_http_bind() -> String {
-    "127.0.0.1:7654".to_string()
 }
 
 fn default_timeout() -> u32 {
@@ -307,7 +295,6 @@ mod tests {
     const BASE_CONFIG: &str = r#"
 socket_path = "/tmp/test.sock"
 db_path = "/tmp/test.db"
-http_bind = "127.0.0.1:9999"
 timeout_seconds = 30
 allowlist = ["apt list", "systemctl status"]
 
@@ -348,7 +335,7 @@ max_stdin_bytes = 1024
         let config = Config::load(&path).unwrap();
         assert_eq!(config.timeout_seconds, 120);
         // Other fields unchanged
-        assert_eq!(config.http_bind, "127.0.0.1:9999");
+        assert_eq!(config.allowlist, vec!["apt list", "systemctl status"]);
     }
 
     #[test]
@@ -487,7 +474,6 @@ max_stdin_bytes = 1024
     const HOT_RELOAD_CONFIG: &str = r#"
 socket_path = "/tmp/test.sock"
 db_path = "/tmp/test.db"
-http_bind = "127.0.0.1:9999"
 timeout_seconds = 30
 allowlist = ["apt list", "systemctl status"]
 hot_reload = true
@@ -543,6 +529,65 @@ max_stdin_bytes = 1024
         let path = write_main_config(tmp.path(), BASE_CONFIG);
         let config = Config::load(&path).unwrap();
         assert_eq!(config.limits.max_temp_rule_duration_seconds, 86400);
+    }
+
+    #[test]
+    fn minimal_config_uses_all_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), "");
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.socket_path.to_str().unwrap(), "/var/run/aisudo/aisudo.sock");
+        assert_eq!(config.db_path.to_str().unwrap(), "/var/lib/aisudo/aisudo.db");
+        assert_eq!(config.timeout_seconds, 60);
+        assert!(config.allowlist.is_empty());
+        assert!(config.telegram.is_none());
+        assert!(!config.hot_reload);
+        assert_eq!(config.limits.max_stdin_bytes, 10 * 1024 * 1024);
+        assert_eq!(config.limits.stdin_preview_bytes, 2048);
+        assert_eq!(config.limits.max_temp_rule_duration_seconds, 86400);
+    }
+
+    #[test]
+    fn merge_allowlist_non_array_overlay() {
+        let base = Value::Array(vec!["a".into()]);
+        let overlay = Value::String("replaced".into());
+        let result = merge_allowlist(base, overlay);
+        assert_eq!(result, Value::String("replaced".into()));
+    }
+
+    #[test]
+    fn collect_config_mtimes_with_conf_d() {
+        let tmp = TempDir::new().unwrap();
+        let conf_d = tmp.path().join("conf.d");
+        fs::create_dir(&conf_d).unwrap();
+        fs::write(conf_d.join("test.toml"), "timeout_seconds = 1\n").unwrap();
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+
+        let mtimes = collect_config_mtimes(Path::new(&path));
+        assert_eq!(mtimes.len(), 2);
+    }
+
+    #[test]
+    fn collect_config_mtimes_skips_hidden_and_non_toml() {
+        let tmp = TempDir::new().unwrap();
+        let conf_d = tmp.path().join("conf.d");
+        fs::create_dir(&conf_d).unwrap();
+        fs::write(conf_d.join(".hidden.toml"), "").unwrap();
+        fs::write(conf_d.join("readme.txt"), "").unwrap();
+        fs::write(conf_d.join("valid.toml"), "timeout_seconds = 1\n").unwrap();
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+
+        let mtimes = collect_config_mtimes(Path::new(&path));
+        assert_eq!(mtimes.len(), 2);
+    }
+
+    #[test]
+    fn collect_config_mtimes_no_conf_d() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+
+        let mtimes = collect_config_mtimes(Path::new(&path));
+        assert_eq!(mtimes.len(), 1);
     }
 
     #[test]

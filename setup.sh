@@ -3,16 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/aisudo.toml"
-INSTALL_PAM=false
-
-# Parse flags
-for arg in "$@"; do
-    case "$arg" in
-        --pam) INSTALL_PAM=true ;;
-        *) echo "Unknown option: $arg"; echo "Usage: $0 [--pam]"; exit 1 ;;
-    esac
-done
-
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -112,50 +102,6 @@ info "Installing systemd service..."
 cp "$SCRIPT_DIR/aisudo-daemon.service" /etc/systemd/system/aisudo-daemon.service
 systemctl daemon-reload
 
-# ── Optionally install PAM module ─────────────────────────────────────
-
-if [[ "$INSTALL_PAM" == true ]]; then
-    PAM_LIB="$SCRIPT_DIR/target/release/libpam_aisudo.so"
-
-    if [[ ! -f "$PAM_LIB" ]]; then
-        error "PAM module not found at $PAM_LIB — build failed?"
-        exit 1
-    fi
-
-    PAM_DIR="/usr/lib/security"
-    if [[ ! -d "$PAM_DIR" ]]; then
-        for candidate in /lib/x86_64-linux-gnu/security /lib/security /usr/lib/x86_64-linux-gnu/security; do
-            if [[ -d "$candidate" ]]; then
-                PAM_DIR="$candidate"
-                break
-            fi
-        done
-        mkdir -p "$PAM_DIR"
-    fi
-
-    info "Installing PAM module to $PAM_DIR/pam_aisudo.so..."
-    cp "$PAM_LIB" "$PAM_DIR/pam_aisudo.so"
-    chmod 755 "$PAM_DIR/pam_aisudo.so"
-
-    # Configure PAM
-    PAM_SUDO="/etc/pam.d/sudo"
-    PAM_LINE="auth    sufficient    pam_aisudo.so"
-
-    if [[ -f "$PAM_SUDO" ]]; then
-        if grep -q "pam_aisudo" "$PAM_SUDO"; then
-            info "PAM already configured for ai-sudo"
-        else
-            info "Adding ai-sudo to PAM sudo config..."
-            cp "$PAM_SUDO" "$PAM_SUDO.bak.$(date +%s)"
-            sed -i "0,/^auth/s/^auth/$PAM_LINE\nauth/" "$PAM_SUDO"
-            info "PAM configured. Backup saved as $PAM_SUDO.bak.*"
-        fi
-    else
-        warn "/etc/pam.d/sudo not found — you'll need to configure PAM manually"
-        warn "Add this line to your PAM sudo config: $PAM_LINE"
-    fi
-fi
-
 # ── Start service ─────────────────────────────────────────────────────
 
 info "Enabling and starting aisudo-daemon..."
@@ -188,13 +134,4 @@ echo "  Socket:    /var/run/aisudo/aisudo.sock"
 echo "  Logs:      journalctl -u aisudo-daemon -f"
 echo ""
 echo "  Test it:   aisudo whoami"
-if [[ "$INSTALL_PAM" == true ]]; then
-    echo "  PAM test:  sudo echo hello"
-    echo ""
-    warn "If sudo breaks, recover with: pkexec sed -i '/pam_aisudo/d' /etc/pam.d/sudo"
-else
-    echo ""
-    echo "  To also install PAM mode (intercepts all sudo):"
-    echo "    sudo $0 --pam"
-fi
 echo ""

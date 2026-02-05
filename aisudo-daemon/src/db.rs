@@ -20,6 +20,17 @@ pub struct TempRuleRow {
     pub reason: Option<String>,
 }
 
+/// Parse a datetime string that may be RFC3339 or SQLite's `datetime('now')` format.
+fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(naive.and_utc());
+    }
+    None
+}
+
 pub struct Database {
     conn: Mutex<Connection>,
 }
@@ -152,17 +163,11 @@ impl Database {
                 command: row.get(2)?,
                 cwd: row.get(3)?,
                 pid: row.get(4)?,
-                timestamp: chrono::DateTime::parse_from_rfc3339(&ts_str)
-                    .unwrap_or_default()
-                    .with_timezone(&chrono::Utc),
+                timestamp: parse_datetime(&ts_str).unwrap_or_default(),
                 status: Decision::from_str(&status_str).unwrap_or(Decision::Pending),
                 timeout_seconds: row.get(7)?,
                 nonce: row.get(8)?,
-                decided_at: decided_at_str.and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|d| d.with_timezone(&chrono::Utc))
-                }),
+                decided_at: decided_at_str.and_then(|s| parse_datetime(&s)),
                 decided_by: row.get(10)?,
                 reason: None,
                 stdin: None, // Not stored in DB
@@ -190,17 +195,11 @@ impl Database {
                 command: row.get(2)?,
                 cwd: row.get(3)?,
                 pid: row.get(4)?,
-                timestamp: chrono::DateTime::parse_from_rfc3339(&ts_str)
-                    .unwrap_or_default()
-                    .with_timezone(&chrono::Utc),
+                timestamp: parse_datetime(&ts_str).unwrap_or_default(),
                 status: Decision::from_str(&status_str).unwrap_or(Decision::Pending),
                 timeout_seconds: row.get(7)?,
                 nonce: row.get(8)?,
-                decided_at: decided_at_str.and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|d| d.with_timezone(&chrono::Utc))
-                }),
+                decided_at: decided_at_str.and_then(|s| parse_datetime(&s)),
                 decided_by: row.get(10)?,
                 reason: None,
                 stdin: None, // Not stored in DB
@@ -498,6 +497,198 @@ mod tests {
 
         let rule = db.get_temp_rule("r1").unwrap().unwrap();
         assert_eq!(rule.status, "approved");
+    }
+
+    #[test]
+    fn insert_and_get_request() {
+        let (_dir, db) = test_db();
+        let req = aisudo_common::SudoRequest {
+            user: "alice".to_string(),
+            command: "ls -la".to_string(),
+            cwd: "/home/alice".to_string(),
+            pid: 1234,
+            mode: aisudo_common::RequestMode::Exec,
+            reason: Some("testing".to_string()),
+            stdin: Some("aGVsbG8=".to_string()),
+            skip_nopasswd: false,
+        };
+        let record = aisudo_common::SudoRequestRecord::new(req, 60);
+        let id = record.id.clone();
+
+        db.insert_request(&record).unwrap();
+
+        let fetched = db.get_request(&id).unwrap().unwrap();
+        assert_eq!(fetched.user, "alice");
+        assert_eq!(fetched.command, "ls -la");
+        assert_eq!(fetched.cwd, "/home/alice");
+        assert_eq!(fetched.pid, 1234);
+        assert_eq!(fetched.status, Decision::Pending);
+        assert_eq!(fetched.timeout_seconds, 60);
+        assert_eq!(fetched.stdin_bytes, Some(6));
+        assert!(fetched.decided_at.is_none());
+        assert!(fetched.decided_by.is_none());
+    }
+
+    #[test]
+    fn insert_request_without_stdin() {
+        let (_dir, db) = test_db();
+        let req = aisudo_common::SudoRequest {
+            user: "alice".to_string(),
+            command: "ls".to_string(),
+            cwd: "/".to_string(),
+            pid: 1,
+            mode: aisudo_common::RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+        };
+        let record = aisudo_common::SudoRequestRecord::new(req, 60);
+        let id = record.id.clone();
+        db.insert_request(&record).unwrap();
+
+        let fetched = db.get_request(&id).unwrap().unwrap();
+        assert!(fetched.stdin_bytes.is_none());
+    }
+
+    #[test]
+    fn get_request_not_found() {
+        let (_dir, db) = test_db();
+        assert!(db.get_request("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_decision_and_get() {
+        let (_dir, db) = test_db();
+        let req = aisudo_common::SudoRequest {
+            user: "alice".to_string(),
+            command: "ls".to_string(),
+            cwd: "/".to_string(),
+            pid: 1,
+            mode: aisudo_common::RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+        };
+        let record = aisudo_common::SudoRequestRecord::new(req, 60);
+        let id = record.id.clone();
+        db.insert_request(&record).unwrap();
+
+        assert!(db.update_decision(&id, Decision::Approved, "tester").unwrap());
+
+        let fetched = db.get_request(&id).unwrap().unwrap();
+        assert_eq!(fetched.status, Decision::Approved);
+        assert!(fetched.decided_at.is_some());
+        assert_eq!(fetched.decided_by.as_deref(), Some("tester"));
+    }
+
+    #[test]
+    fn update_decision_only_updates_pending() {
+        let (_dir, db) = test_db();
+        let req = aisudo_common::SudoRequest {
+            user: "alice".to_string(),
+            command: "ls".to_string(),
+            cwd: "/".to_string(),
+            pid: 1,
+            mode: aisudo_common::RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+        };
+        let record = aisudo_common::SudoRequestRecord::new(req, 60);
+        let id = record.id.clone();
+        db.insert_request(&record).unwrap();
+
+        assert!(db.update_decision(&id, Decision::Approved, "first").unwrap());
+        assert!(!db.update_decision(&id, Decision::Denied, "second").unwrap());
+
+        let fetched = db.get_request(&id).unwrap().unwrap();
+        assert_eq!(fetched.status, Decision::Approved);
+    }
+
+    #[test]
+    fn get_pending_requests_filters_correctly() {
+        let (_dir, db) = test_db();
+        for i in 0..3 {
+            let req = aisudo_common::SudoRequest {
+                user: "alice".to_string(),
+                command: format!("cmd-{i}"),
+                cwd: "/".to_string(),
+                pid: i as u32,
+                mode: aisudo_common::RequestMode::Pam,
+                reason: None,
+                stdin: None,
+                skip_nopasswd: false,
+            };
+            let record = aisudo_common::SudoRequestRecord::new(req, 60);
+            let id = record.id.clone();
+            db.insert_request(&record).unwrap();
+            if i == 2 {
+                db.update_decision(&id, Decision::Approved, "test").unwrap();
+            }
+        }
+
+        let pending = db.get_pending_requests().unwrap();
+        assert_eq!(pending.len(), 2);
+        for r in &pending {
+            assert_eq!(r.status, Decision::Pending);
+        }
+    }
+
+    #[test]
+    fn get_all_temp_rules_returns_all() {
+        let (_dir, db) = test_db();
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["apt install"]).unwrap();
+
+        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.insert_temp_rule("r2", "bob", &patterns, 7200, &now.to_rfc3339(), &future, "n2", Some("testing")).unwrap();
+
+        let all = db.get_all_temp_rules().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn get_active_temp_rules_detailed_returns_patterns_and_expiry() {
+        let (_dir, db) = test_db();
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["apt install", "apt list"]).unwrap();
+
+        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+
+        let detailed = db.get_active_temp_rules_detailed("alice").unwrap();
+        assert_eq!(detailed.len(), 1);
+        assert_eq!(detailed[0].0, patterns);
+    }
+
+    #[test]
+    fn check_rate_limit_under_limit() {
+        let (_dir, db) = test_db();
+        assert!(db.check_rate_limit("alice", 5).unwrap());
+    }
+
+    #[test]
+    fn check_rate_limit_at_limit() {
+        let (_dir, db) = test_db();
+        for i in 0..5 {
+            let req = aisudo_common::SudoRequest {
+                user: "alice".to_string(),
+                command: format!("cmd-{i}"),
+                cwd: "/".to_string(),
+                pid: i as u32,
+                mode: aisudo_common::RequestMode::Pam,
+                reason: None,
+                stdin: None,
+                skip_nopasswd: false,
+            };
+            let record = aisudo_common::SudoRequestRecord::new(req, 60);
+            db.insert_request(&record).unwrap();
+        }
+        assert!(!db.check_rate_limit("alice", 5).unwrap());
+        // Different user still under limit
+        assert!(db.check_rate_limit("bob", 5).unwrap());
     }
 
     #[test]

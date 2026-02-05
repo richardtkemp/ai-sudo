@@ -268,4 +268,56 @@ mod tests {
     fn test_resolve_absolute_path() {
         assert_eq!(resolve_binary_path("/usr/bin/apt"), "/usr/bin/apt");
     }
+
+    #[test]
+    fn test_matches_empty_args_rule() {
+        // Rule with "" args means no args allowed
+        assert!(matches_nopasswd_rule("/usr/bin/apt ", "/usr/bin/apt"));
+        assert!(!matches_nopasswd_rule("/usr/bin/apt ", "/usr/bin/apt install vim"));
+    }
+
+    #[test]
+    fn test_matches_wildcard_suffix() {
+        assert!(matches_nopasswd_rule(
+            "/usr/bin/apt install *",
+            "/usr/bin/apt install vim"
+        ));
+        assert!(matches_nopasswd_rule(
+            "/usr/bin/apt install *",
+            "/usr/bin/apt install"
+        ));
+    }
+
+    #[test]
+    fn test_no_match_different_binary() {
+        assert!(!matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/dpkg -l"));
+    }
+
+    #[test]
+    fn test_strip_tags_no_tags() {
+        assert_eq!(strip_tags(" /usr/bin/apt install"), " /usr/bin/apt install");
+    }
+
+    #[test]
+    fn test_strip_tags_multiple() {
+        assert_eq!(
+            strip_tags(" SETENV: NOEXEC: NOPASSWD: /usr/bin/apt"),
+            " /usr/bin/apt"
+        );
+    }
+
+    #[test]
+    fn test_is_allowed() {
+        // This tests the socket module's is_allowed logic indirectly
+        // through matches_nopasswd_rule with ALL
+        assert!(matches_nopasswd_rule("ALL", "anything goes"));
+        assert!(matches_nopasswd_rule("ALL", ""));
+    }
+
+    #[test]
+    fn test_bare_binary_allows_any_args() {
+        assert!(matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/apt"));
+        assert!(matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/apt install vim"));
+        assert!(matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/apt remove --purge"));
+    }
 }

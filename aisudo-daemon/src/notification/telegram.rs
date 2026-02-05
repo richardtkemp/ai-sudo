@@ -591,4 +591,56 @@ mod tests {
     fn test_is_likely_binary_empty() {
         assert!(!is_likely_binary(b""));
     }
+
+    #[test]
+    fn test_api_url() {
+        let backend = TelegramBackend::new("TOKEN123".to_string(), 42, 60, 2048, 30);
+        assert_eq!(
+            backend.api_url("getMe"),
+            "https://api.telegram.org/botTOKEN123/getMe"
+        );
+        assert_eq!(
+            backend.api_url("sendMessage"),
+            "https://api.telegram.org/botTOKEN123/sendMessage"
+        );
+    }
+
+    #[test]
+    fn test_backend_creation() {
+        let backend = TelegramBackend::new("TOK".to_string(), 99, 120, 4096, 45);
+        assert_eq!(backend.request_timeout, Duration::from_secs(120));
+        assert_eq!(backend.stdin_preview_bytes, 4096);
+        assert_eq!(backend.poll_timeout_seconds, 45);
+        assert_eq!(backend.chat_id, 99);
+    }
+
+    #[test]
+    fn test_telegram_name() {
+        let backend = TelegramBackend::new("TOK".to_string(), 1, 60, 2048, 30);
+        assert_eq!(<TelegramBackend as super::NotificationBackend>::name(&backend), "telegram");
+    }
+
+    #[test]
+    fn test_format_stdin_preview_exactly_at_limit() {
+        let data = "x".repeat(2048);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
+        let preview = format_stdin_preview(&b64, 2048);
+        // Exactly at the limit — should NOT be truncated
+        assert!(!preview.contains("truncated"));
+        assert_eq!(preview.len(), 2048);
+    }
+
+    #[test]
+    fn test_format_stdin_preview_one_over_limit() {
+        let data = "x".repeat(2049);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
+        let preview = format_stdin_preview(&b64, 2048);
+        assert!(preview.contains("truncated"));
+    }
+
+    #[test]
+    fn test_is_likely_binary_newlines_and_tabs_are_not_binary() {
+        let data = b"line1\nline2\ttab\rcarriage";
+        assert!(!is_likely_binary(data));
+    }
 }

@@ -1,3 +1,3 @@
 [workspace]
-members = ["aisudo-common", "aisudo-daemon", "aisudo-pam", "aisudo-cli"]
+members = ["aisudo-common", "aisudo-daemon", "aisudo-cli"]
 resolver = "2"

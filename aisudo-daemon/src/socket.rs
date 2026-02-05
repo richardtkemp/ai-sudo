@@ -98,9 +98,12 @@ async fn handle_connection(
         }
     } else {
         // Backward compat: try bare SudoRequest
-        let request: SudoRequest = serde_json::from_str(&line)
-            .map_err(|e| anyhow::anyhow!("invalid request JSON: {e}"))?;
-        handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, max_stdin_bytes).await
+        match serde_json::from_str::<SudoRequest>(&line) {
+            Ok(request) => {
+                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, max_stdin_bytes).await
+            }
+            Err(e) => Err(anyhow::anyhow!("invalid request JSON: {e}")),
+        }
     };
 
     if let Err(ref e) = result {
@@ -682,6 +685,383 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    struct MockApproveBackend;
+
+    #[async_trait::async_trait]
+    impl crate::notification::NotificationBackend for MockApproveBackend {
+        async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
+            Ok(Decision::Approved)
+        }
+        async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
+            Ok(Decision::Approved)
+        }
+        fn name(&self) -> &'static str {
+            "mock_approve"
+        }
+    }
+
+    struct MockDenyBackend;
+
+    #[async_trait::async_trait]
+    impl crate::notification::NotificationBackend for MockDenyBackend {
+        async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
+            Ok(Decision::Denied)
+        }
+        async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
+            Ok(Decision::Denied)
+        }
+        fn name(&self) -> &'static str {
+            "mock_deny"
+        }
+    }
+
+    struct MockErrorBackend;
+
+    #[async_trait::async_trait]
+    impl crate::notification::NotificationBackend for MockErrorBackend {
+        async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
+            Err(anyhow::anyhow!("notification service down"))
+        }
+        async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
+            Err(anyhow::anyhow!("notification service down"))
+        }
+        fn name(&self) -> &'static str {
+            "mock_error"
+        }
+    }
+
+    /// Helper: send a JSON message through the socket handler and return the first response line.
+    async fn send_and_receive(
+        db: Arc<crate::db::Database>,
+        backend: Arc<dyn crate::notification::NotificationBackend>,
+        request_json: &str,
+        allowlist: &[String],
+        max_stdin_bytes: usize,
+        max_temp_rule_duration: u32,
+    ) -> String {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let sudoers = Arc::new(SudoersCache::new(0)); // 0 TTL so cache is always stale
+
+        let db2 = Arc::clone(&db);
+        let backend2 = Arc::clone(&backend);
+        let allowlist = allowlist.to_vec();
+        let handler = tokio::spawn(async move {
+            handle_connection(server, db2, backend2, sudoers, 60, &allowlist, max_stdin_bytes, max_temp_rule_duration).await
+        });
+
+        let (reader, mut writer) = client.into_split();
+        writer.write_all(request_json.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+        drop(writer); // close write end so handler knows there's no more data
+
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            buf_reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out waiting for response")
+        .unwrap();
+
+        let _ = handler.await;
+        line.trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn allowlist_auto_approves_command() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "apt list --installed".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let resp_line = send_and_receive(
+            db, backend, &json,
+            &["apt list".to_string()], 10_000_000, 86400,
+        ).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+    }
+
+    #[tokio::test]
+    async fn notification_approval_flow() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "rm -rf /important".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+    }
+
+    #[tokio::test]
+    async fn notification_denial_flow() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockDenyBackend);
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "rm -rf /".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+    }
+
+    #[tokio::test]
+    async fn notification_error_results_in_denial() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockErrorBackend);
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "some-command".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        assert!(response.error.unwrap().contains("notification"));
+    }
+
+    #[tokio::test]
+    async fn stdin_too_large_is_denied() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+
+        // Create a base64 payload that decodes to more than 100 bytes (our small limit)
+        let large_data = vec![b'A'; 200];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&large_data);
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "cat".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: Some(b64),
+            skip_nopasswd: true,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        // max_stdin_bytes = 100, so 200-byte stdin should be rejected
+        let resp_line = send_and_receive(db, backend, &json, &[], 100, 86400).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        assert!(response.error.unwrap().contains("stdin exceeds size limit"));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_returns_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+
+        let resp_line = send_and_receive(
+            db, backend, "this is not json", &[], 10_000_000, 86400,
+        ).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        assert!(response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn temp_rule_request_duration_exceeds_max() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+
+        let msg = aisudo_common::SocketMessage::TempRuleRequest(aisudo_common::TempRuleRequest {
+            user: "testuser".to_string(),
+            patterns: vec!["apt install".to_string()],
+            duration_seconds: 99999,
+            reason: None,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+
+        // max_temp_rule_duration = 3600
+        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 3600).await;
+
+        let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        assert!(response.error.unwrap().contains("exceeds maximum"));
+    }
+
+    #[tokio::test]
+    async fn temp_rule_request_empty_patterns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+
+        let msg = aisudo_common::SocketMessage::TempRuleRequest(aisudo_common::TempRuleRequest {
+            user: "testuser".to_string(),
+            patterns: vec![],
+            duration_seconds: 3600,
+            reason: None,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+
+        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+
+        let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        assert!(response.error.unwrap().contains("no patterns"));
+    }
+
+    #[tokio::test]
+    async fn temp_rule_request_approved_flow() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+
+        let msg = aisudo_common::SocketMessage::TempRuleRequest(aisudo_common::TempRuleRequest {
+            user: "testuser".to_string(),
+            patterns: vec!["apt install".to_string(), "apt list".to_string()],
+            duration_seconds: 3600,
+            reason: Some("need to install deps".to_string()),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+
+        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+
+        let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+        assert!(response.expires_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_rules_returns_allowlist_and_temp_rules() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+
+        // Add an active temp rule
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["docker ps"]).unwrap();
+        db.insert_temp_rule("r1", "testuser", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+
+        let msg = aisudo_common::SocketMessage::ListRules(aisudo_common::ListRulesRequest {
+            user: "testuser".to_string(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+
+        let resp_line = send_and_receive(
+            db, backend, &json,
+            &["apt list".to_string()], 10_000_000, 86400,
+        ).await;
+
+        let response: aisudo_common::ListRulesResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.allowlist, vec!["apt list"]);
+        assert_eq!(response.temp_rules.len(), 1);
+        assert_eq!(response.temp_rules[0].patterns, vec!["docker ps"]);
+    }
+
+    #[tokio::test]
+    async fn temp_rule_auto_approves_matching_command() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+
+        // Create an active temp rule
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["apt install"]).unwrap();
+        db.insert_temp_rule("r1", "testuser", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "apt install vim".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+    }
+
+    #[test]
+    fn is_allowed_matches_prefix() {
+        assert!(is_allowed("apt list --installed", &["apt list".to_string()]));
+        assert!(is_allowed("apt list", &["apt list".to_string()]));
+        assert!(!is_allowed("apt remove vim", &["apt list".to_string()]));
+        assert!(!is_allowed("rm -rf /", &["apt list".to_string()]));
+    }
+
+    #[test]
+    fn is_allowed_empty_allowlist() {
+        assert!(!is_allowed("anything", &[]));
+    }
+
+    #[test]
+    fn is_allowed_multiple_patterns() {
+        let allowlist = vec![
+            "apt list".to_string(),
+            "systemctl status".to_string(),
+        ];
+        assert!(is_allowed("apt list", &allowlist));
+        assert!(is_allowed("systemctl status nginx", &allowlist));
+        assert!(!is_allowed("systemctl restart nginx", &allowlist));
     }
 
     #[test]

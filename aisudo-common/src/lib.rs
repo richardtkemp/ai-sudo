@@ -19,6 +19,8 @@ pub struct SudoRequest {
     pub pid: u32,
     #[serde(default = "default_mode")]
     pub mode: RequestMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 fn default_mode() -> RequestMode {
@@ -51,6 +53,7 @@ pub struct SudoRequestRecord {
     pub nonce: String,
     pub decided_at: Option<DateTime<Utc>>,
     pub decided_by: Option<String>,
+    pub reason: Option<String>,
 }
 
 impl SudoRequestRecord {
@@ -67,6 +70,7 @@ impl SudoRequestRecord {
             nonce: Uuid::new_v4().to_string(),
             decided_at: None,
             decided_by: None,
+            reason: req.reason,
         }
     }
 }

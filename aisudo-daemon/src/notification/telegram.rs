@@ -116,6 +116,10 @@ impl TelegramBackend {
 
     async fn send_message(&self, record: &SudoRequestRecord) -> Result<i64> {
         info!("Attempting to send Telegram message for request {}", record.id);
+        let reason_line = match &record.reason {
+            Some(r) => format!("\n*Reason:* {}", r),
+            None => String::new(),
+        };
         let text = format!(
             "🔐 *Sudo Request*\n\n\
              *User:* `{}`\n\
@@ -123,8 +127,8 @@ impl TelegramBackend {
              *CWD:* `{}`\n\
              *PID:* `{}`\n\
              *Request ID:* `{}`\n\
-             *Timeout:* {}s",
-            record.user, record.command, record.cwd, record.pid, record.id, record.timeout_seconds
+             *Timeout:* {}s{}",
+            record.user, record.command, record.cwd, record.pid, record.id, record.timeout_seconds, reason_line
         );
 
         let approve_data = format!("approve:{}", record.id);

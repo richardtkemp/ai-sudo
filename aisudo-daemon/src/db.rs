@@ -125,6 +125,7 @@ impl Database {
                         .map(|d| d.with_timezone(&chrono::Utc))
                 }),
                 decided_by: row.get(10)?,
+                reason: None,
             }))
         } else {
             Ok(None)
@@ -159,6 +160,7 @@ impl Database {
                         .map(|d| d.with_timezone(&chrono::Utc))
                 }),
                 decided_by: row.get(10)?,
+                reason: None,
             })
         })?;
         let mut result = Vec::new();

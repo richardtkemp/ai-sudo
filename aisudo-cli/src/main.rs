@@ -10,12 +10,24 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: aisudo <command> [args...]");
-        eprintln!("Example: aisudo apt update");
+        eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
+        eprintln!("Example: aisudo -r \"need to check disk health\" smartctl -a /dev/sda");
         return ExitCode::from(1);
     }
 
-    let command = args[1..].join(" ");
+    // Parse optional -r/--reason flag before the command
+    let (reason, cmd_start) = if (args[1] == "-r" || args[1] == "--reason") && args.len() >= 4 {
+        (Some(args[2].clone()), 3)
+    } else {
+        (None, 1)
+    };
+
+    if cmd_start >= args.len() {
+        eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
+        return ExitCode::from(1);
+    }
+
+    let command = args[cmd_start..].join(" ");
     let user = get_current_user();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -31,6 +43,7 @@ fn main() -> ExitCode {
         cwd,
         pid,
         mode: RequestMode::Exec,
+        reason,
     };
 
     eprintln!("aisudo: requesting approval for: {command}");

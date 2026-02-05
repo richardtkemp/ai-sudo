@@ -66,6 +66,9 @@ pub struct LimitsConfig {
 
     #[serde(default = "default_stdin_preview")]
     pub stdin_preview_bytes: usize,
+
+    #[serde(default = "default_max_temp_rule_duration")]
+    pub max_temp_rule_duration_seconds: u32,
 }
 
 fn default_max_stdin() -> usize {
@@ -76,10 +79,15 @@ fn default_stdin_preview() -> usize {
     2048
 }
 
+fn default_max_temp_rule_duration() -> u32 {
+    86400 // 24 hours
+}
+
 fn default_limits() -> LimitsConfig {
     LimitsConfig {
         max_stdin_bytes: default_max_stdin(),
         stdin_preview_bytes: default_stdin_preview(),
+        max_temp_rule_duration_seconds: default_max_temp_rule_duration(),
     }
 }
 
@@ -521,5 +529,30 @@ max_stdin_bytes = 1024
         // Should return the old config without panicking
         let config = holder.config();
         assert_eq!(config.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn max_temp_rule_duration_default() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.limits.max_temp_rule_duration_seconds, 86400);
+    }
+
+    #[test]
+    fn max_temp_rule_duration_override() {
+        let tmp = TempDir::new().unwrap();
+        let conf_d = tmp.path().join("conf.d");
+        fs::create_dir(&conf_d).unwrap();
+        fs::write(
+            conf_d.join("limits.toml"),
+            "[limits]\nmax_temp_rule_duration_seconds = 7200\n",
+        )
+        .unwrap();
+
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.limits.max_temp_rule_duration_seconds, 7200);
+        assert_eq!(config.limits.max_stdin_bytes, 1024); // unchanged from base
     }
 }

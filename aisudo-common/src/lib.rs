@@ -97,6 +97,35 @@ pub struct SudoResponse {
     pub error: Option<String>,
 }
 
+/// Request for temporary allowlist rules sent from the CLI to the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TempRuleRequest {
+    pub user: String,
+    pub patterns: Vec<String>,
+    pub duration_seconds: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Response to a temporary rule request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TempRuleResponse {
+    pub request_id: String,
+    pub decision: Decision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+/// Wire-level message wrapper for the Unix socket protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SocketMessage {
+    SudoRequest(SudoRequest),
+    TempRuleRequest(TempRuleRequest),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {

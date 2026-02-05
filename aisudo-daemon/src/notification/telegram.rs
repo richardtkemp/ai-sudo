@@ -1,4 +1,4 @@
-use super::NotificationBackend;
+use super::{NotificationBackend, TempRuleRecord};
 use aisudo_common::{Decision, SudoRequestRecord};
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
@@ -15,14 +15,14 @@ pub struct TelegramBackend {
     bot_token: String,
     chat_id: i64,
     client: Client,
-    /// Maps request_id -> oneshot sender for delivering callback responses.
+    /// Maps pending key -> oneshot sender for delivering callback responses.
     pending: Arc<DashMap<String, oneshot::Sender<Decision>>>,
     /// Offset for Telegram getUpdates long polling.
     update_offset: Arc<Mutex<i64>>,
     /// How long to wait for a response before giving up.
     request_timeout: Duration,
-    /// Message ID and original text for the main message with buttons.
-    main_message: Arc<Mutex<Option<(i64, String)>>>,
+    /// Maps pending key -> (message_id, original_text) for editing messages after decision.
+    message_map: Arc<DashMap<String, (i64, String)>>,
     /// Max bytes of stdin to show in notification preview.
     stdin_preview_bytes: usize,
     /// Timeout in seconds for Telegram long-polling requests.
@@ -55,19 +55,17 @@ struct Message {
 
 impl TelegramBackend {
     pub fn new(bot_token: String, chat_id: i64, timeout_seconds: u32, stdin_preview_bytes: usize, poll_timeout_seconds: u32) -> Self {
-        let pending = Arc::new(DashMap::new());
-        let backend = Self {
+        Self {
             bot_token,
             chat_id,
             client: Client::new(),
-            pending: pending.clone(),
+            pending: Arc::new(DashMap::new()),
             update_offset: Arc::new(Mutex::new(0)),
             request_timeout: Duration::from_secs(timeout_seconds as u64),
-            main_message: Arc::new(Mutex::new(None)),
+            message_map: Arc::new(DashMap::new()),
             stdin_preview_bytes,
             poll_timeout_seconds,
-        };
-        backend
+        }
     }
 
     /// Start the background polling loop for Telegram callback queries.
@@ -188,16 +186,88 @@ impl TelegramBackend {
         }
 
         let main_message_id = result.result.map(|m| m.message_id).unwrap_or(0);
-        self.main_message
-            .lock()
-            .await
-            .replace((main_message_id, text));
+        self.message_map
+            .insert(record.id.clone(), (main_message_id, text));
         info!(
             "Telegram main message sent: message_id={}, chat_id={}",
             main_message_id, self.chat_id
         );
 
         Ok(main_message_id)
+    }
+
+    async fn send_temp_rule_message(&self, record: &TempRuleRecord) -> Result<i64> {
+        info!("Sending Telegram temp rule message for rule {}", record.id);
+
+        let patterns_list: String = record
+            .patterns
+            .iter()
+            .map(|p| format!("  \u{2022} `{p}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let hours = record.duration_seconds as f64 / 3600.0;
+        let reason_line = match &record.reason {
+            Some(r) => format!("\n*Reason:* {r}"),
+            None => String::new(),
+        };
+
+        let text = format!(
+            "\u{23f1}\u{fe0f} *Temporary Rule Request*\n\n\
+             *User:* `{}`\n\
+             *Patterns:*\n{}\n\
+             *Duration:* {}s ({:.1} hour{})\n\
+             *Expires at:* `{}`\n\
+             *Request ID:* `{}`{}",
+            record.user,
+            patterns_list,
+            record.duration_seconds,
+            hours,
+            if hours == 1.0 { "" } else { "s" },
+            record.expires_at,
+            record.id,
+            reason_line,
+        );
+
+        let approve_data = format!("approve_rule:{}", record.id);
+        let deny_data = format!("deny_rule:{}", record.id);
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {"text": "\u{2705} Approve", "callback_data": approve_data},
+                    {"text": "\u{274c} Deny", "callback_data": deny_data}
+                ]]
+            }
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
+
+        let http_status = resp.status();
+        let result: TelegramResponse<Message> = resp.json().await
+            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
+        if !result.ok {
+            let desc = result
+                .description
+                .unwrap_or_else(|| "no description".to_string());
+            return Err(anyhow!("Telegram sendMessage failed (HTTP {}): {}", http_status, desc));
+        }
+
+        let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
+        let pending_key = format!("rule:{}", record.id);
+        self.message_map.insert(pending_key, (message_id, text));
+        info!("Telegram temp rule message sent: message_id={}", message_id);
+
+        Ok(message_id)
     }
 
     async fn edit_message_status(&self, message_id: i64, original_text: &str, status_line: &str) -> Result<()> {
@@ -299,9 +369,12 @@ impl TelegramBackend {
             None => return,
         };
 
-        let decision = match action {
-            "approve" => Decision::Approved,
-            "deny" => Decision::Denied,
+        // Determine pending key and decision based on action
+        let (pending_key, decision) = match action {
+            "approve" => (request_id.to_string(), Decision::Approved),
+            "deny" => (request_id.to_string(), Decision::Denied),
+            "approve_rule" => (format!("rule:{request_id}"), Decision::Approved),
+            "deny_rule" => (format!("rule:{request_id}"), Decision::Denied),
             _ => return,
         };
 
@@ -317,26 +390,25 @@ impl TelegramBackend {
             .send()
             .await;
 
-        // Edit the main message to replace buttons with status
+        // Edit the message to replace buttons with status
         let time = Local::now().format("%H:%M:%S");
         let status_line = match decision {
-            Decision::Approved => format!("✅ Approved at {time}"),
-            Decision::Denied => format!("❌ Denied at {time}"),
+            Decision::Approved => format!("\u{2705} Approved at {time}"),
+            Decision::Denied => format!("\u{274c} Denied at {time}"),
             _ => format!("{decision:?} at {time}"),
         };
-        let main_msg = self.main_message.lock().await.clone();
-        if let Some((msg_id, original_text)) = main_msg {
+        if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
             let _ = self
                 .edit_message_status(msg_id, &original_text, &status_line)
                 .await;
         }
 
         // Deliver the decision to the waiting request
-        if let Some((_, sender)) = self.pending.remove(request_id) {
-            info!("Delivering {decision:?} for request {request_id}");
+        if let Some((_, sender)) = self.pending.remove(&pending_key) {
+            info!("Delivering {decision:?} for {pending_key}");
             let _ = sender.send(decision);
         } else {
-            warn!("No pending request for callback: {request_id}");
+            warn!("No pending request for callback: {pending_key}");
         }
     }
 }
@@ -344,13 +416,12 @@ impl TelegramBackend {
 #[async_trait::async_trait]
 impl NotificationBackend for TelegramBackend {
     async fn send_and_wait(&self, record: &SudoRequestRecord) -> Result<Decision> {
-        // Create a channel for receiving the callback response
+        let pending_key = record.id.clone();
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(record.id.clone(), tx);
+        self.pending.insert(pending_key.clone(), tx);
 
-        // Send the Telegram message
         let msg_id = self.send_message(record).await.map_err(|e| {
-            self.pending.remove(&record.id);
+            self.pending.remove(&pending_key);
             e
         })?;
         info!(
@@ -358,7 +429,6 @@ impl NotificationBackend for TelegramBackend {
             record.id, msg_id
         );
 
-        // Wait for callback response via Telegram inline keyboard
         info!("Waiting for Telegram callback for request {} (timeout: {}s)", record.id, self.request_timeout.as_secs());
         let timeout = self.request_timeout;
         match tokio::time::timeout(timeout, rx).await {
@@ -367,19 +437,57 @@ impl NotificationBackend for TelegramBackend {
                 Ok(decision)
             }
             Ok(Err(_)) => {
-                // Channel dropped without sending
-                self.pending.remove(&record.id);
+                self.pending.remove(&pending_key);
                 Err(anyhow!("Response channel dropped"))
             }
             Err(_) => {
-                // Timeout - edit messages to show timeout status
-                self.pending.remove(&record.id);
+                self.pending.remove(&pending_key);
                 info!("Request {} timed out", record.id);
 
                 let time = Local::now().format("%H:%M:%S");
-                let status_line = format!("⏱️ Timed out at {time}");
-                let main_msg = self.main_message.lock().await.clone();
-                if let Some((msg_id, original_text)) = main_msg {
+                let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
+                if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
+                    let _ = self
+                        .edit_message_status(msg_id, &original_text, &status_line)
+                        .await;
+                }
+
+                Ok(Decision::Timeout)
+            }
+        }
+    }
+
+    async fn send_temp_rule_and_wait(&self, record: &TempRuleRecord) -> Result<Decision> {
+        let pending_key = format!("rule:{}", record.id);
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(pending_key.clone(), tx);
+
+        let msg_id = self.send_temp_rule_message(record).await.map_err(|e| {
+            self.pending.remove(&pending_key);
+            e
+        })?;
+        info!(
+            "Sent Telegram temp rule notification for {} (message_id: {})",
+            record.id, msg_id
+        );
+
+        let timeout = self.request_timeout;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(decision)) => {
+                info!("Received decision {decision:?} for temp rule {}", record.id);
+                Ok(decision)
+            }
+            Ok(Err(_)) => {
+                self.pending.remove(&pending_key);
+                Err(anyhow!("Response channel dropped"))
+            }
+            Err(_) => {
+                self.pending.remove(&pending_key);
+                info!("Temp rule {} timed out", record.id);
+
+                let time = Local::now().format("%H:%M:%S");
+                let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
+                if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
                     let _ = self
                         .edit_message_status(msg_id, &original_text, &status_line)
                         .await;

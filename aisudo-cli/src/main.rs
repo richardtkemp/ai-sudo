@@ -1,5 +1,6 @@
 use aisudo_common::{
-    Decision, ExecOutput, RequestMode, SudoRequest, SudoResponse, DEFAULT_SOCKET_PATH,
+    Decision, ExecOutput, RequestMode, SocketMessage, SudoRequest, SudoResponse,
+    TempRuleRequest, TempRuleResponse, DEFAULT_SOCKET_PATH,
 };
 use base64::Engine as _;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
@@ -15,8 +16,13 @@ fn main() -> ExitCode {
 
     if args.len() < 2 {
         eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
-        eprintln!("Example: aisudo -r \"need to check disk health\" smartctl -a /dev/sda");
+        eprintln!("       aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
         return ExitCode::from(1);
+    }
+
+    // Check for --request-rule mode
+    if args.iter().any(|a| a == "--request-rule") {
+        return handle_request_rule(&args);
     }
 
     // Parse optional -r/--reason flag before the command
@@ -191,6 +197,168 @@ fn main() -> ExitCode {
     }
 
     ExitCode::from(exit_code as u8)
+}
+
+fn handle_request_rule(args: &[String]) -> ExitCode {
+    let mut duration: Option<u32> = None;
+    let mut reason: Option<String> = None;
+    let mut patterns: Vec<String> = Vec::new();
+
+    let mut i = 1; // skip argv[0]
+    while i < args.len() {
+        match args[i].as_str() {
+            "--request-rule" => {}
+            "--duration" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("aisudo: --duration requires a value");
+                    return ExitCode::from(1);
+                }
+                match args[i].parse::<u32>() {
+                    Ok(d) => duration = Some(d),
+                    Err(_) => {
+                        eprintln!("aisudo: --duration must be a positive integer");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-r" | "--reason" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("aisudo: -r/--reason requires a value");
+                    return ExitCode::from(1);
+                }
+                reason = Some(args[i].clone());
+            }
+            other => {
+                patterns.push(other.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let duration = match duration {
+        Some(d) => d,
+        None => {
+            eprintln!("aisudo: --duration is required with --request-rule");
+            eprintln!("Usage: aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
+            return ExitCode::from(1);
+        }
+    };
+
+    if patterns.is_empty() {
+        eprintln!("aisudo: at least one pattern is required");
+        eprintln!("Usage: aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
+        return ExitCode::from(1);
+    }
+
+    let user = get_current_user();
+
+    let request = TempRuleRequest {
+        user,
+        patterns: patterns.clone(),
+        duration_seconds: duration,
+        reason,
+    };
+
+    let msg = SocketMessage::TempRuleRequest(request);
+
+    let socket_path =
+        std::env::var("AISUDO_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+
+    eprintln!(
+        "aisudo: requesting temp rule for patterns {:?} (duration: {}s)",
+        patterns, duration
+    );
+
+    let stream = match UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
+            eprintln!("aisudo: is aisudo-daemon running?");
+            return ExitCode::from(1);
+        }
+    };
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(300)))
+        .ok();
+
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("aisudo: socket error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let msg_json = match serde_json::to_string(&msg) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("aisudo: serialization error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Err(e) = writer.write_all(msg_json.as_bytes()) {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.write_all(b"\n") {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("aisudo: flush error: {e}");
+        return ExitCode::from(1);
+    }
+
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+
+    let first_line = match lines.next() {
+        Some(Ok(line)) => line,
+        Some(Err(e)) => {
+            eprintln!("aisudo: connection to daemon lost: {e}");
+            return ExitCode::from(1);
+        }
+        None => {
+            eprintln!("aisudo: daemon closed connection unexpectedly");
+            return ExitCode::from(1);
+        }
+    };
+
+    let response: TempRuleResponse = match serde_json::from_str(&first_line) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("aisudo: invalid response from daemon: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match response.decision {
+        Decision::Approved => {
+            let expires = response.expires_at.as_deref().unwrap_or("unknown");
+            eprintln!("aisudo: temp rule approved (expires: {expires})");
+            ExitCode::from(0)
+        }
+        Decision::Denied => {
+            if let Some(ref err) = response.error {
+                eprintln!("aisudo: temp rule denied: {err}");
+            } else {
+                eprintln!("aisudo: temp rule denied");
+            }
+            ExitCode::from(1)
+        }
+        Decision::Timeout => {
+            eprintln!("aisudo: temp rule request timed out");
+            ExitCode::from(1)
+        }
+        Decision::Pending => {
+            eprintln!("aisudo: unexpected pending response");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn get_current_user() -> String {

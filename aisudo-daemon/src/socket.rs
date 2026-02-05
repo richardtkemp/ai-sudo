@@ -1,5 +1,6 @@
 use aisudo_common::{
-    Decision, ExecOutput, RequestMode, SudoRequest, SudoRequestRecord, SudoResponse,
+    Decision, ExecOutput, RequestMode, SocketMessage, SudoRequest, SudoRequestRecord, SudoResponse,
+    TempRuleRequest, TempRuleResponse,
 };
 use anyhow::Result;
 use base64::Engine as _;
@@ -11,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::config::ConfigHolder;
 use crate::db::Database;
-use crate::notification::NotificationBackend;
+use crate::notification::{NotificationBackend, TempRuleRecord};
 
 pub async fn run_socket_listener(
     config_holder: Arc<ConfigHolder>,
@@ -46,10 +47,11 @@ pub async fn run_socket_listener(
                 let timeout = config.timeout_seconds;
                 let allowlist = config.allowlist.clone();
                 let max_stdin_bytes = config.limits.max_stdin_bytes;
+                let max_temp_rule_duration = config.limits.max_temp_rule_duration_seconds;
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(stream, db, backend, timeout, &allowlist, max_stdin_bytes).await
+                        handle_connection(stream, db, backend, timeout, &allowlist, max_stdin_bytes, max_temp_rule_duration).await
                     {
                         error!("Connection handler error: {e:#}");
                     }
@@ -69,11 +71,32 @@ async fn handle_connection(
     timeout_seconds: u32,
     allowlist: &[String],
     max_stdin_bytes: usize,
+    max_temp_rule_duration: u32,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let result = handle_request(reader, &mut writer, db, backend, timeout_seconds, allowlist, max_stdin_bytes).await;
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await?;
+    let line = line.trim().to_string();
+
+    // Try SocketMessage envelope first, fall back to bare SudoRequest
+    let result = if let Ok(msg) = serde_json::from_str::<SocketMessage>(&line) {
+        match msg {
+            SocketMessage::SudoRequest(request) => {
+                handle_sudo_request(request, &mut writer, db, backend, timeout_seconds, allowlist, max_stdin_bytes).await
+            }
+            SocketMessage::TempRuleRequest(request) => {
+                handle_temp_rule_request(request, &mut writer, db, backend, max_temp_rule_duration).await
+            }
+        }
+    } else {
+        // Backward compat: try bare SudoRequest
+        let request: SudoRequest = serde_json::from_str(&line)
+            .map_err(|e| anyhow::anyhow!("invalid request JSON: {e}"))?;
+        handle_sudo_request(request, &mut writer, db, backend, timeout_seconds, allowlist, max_stdin_bytes).await
+    };
+
     if let Err(ref e) = result {
-        // Try to send the error back to the client so it doesn't just see "connection closed"
         error!("Request handling error: {e:#}");
         let response = SudoResponse {
             request_id: String::new(),
@@ -88,8 +111,8 @@ async fn handle_connection(
     result
 }
 
-async fn handle_request(
-    reader: tokio::net::unix::OwnedReadHalf,
+async fn handle_sudo_request(
+    request: SudoRequest,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     db: Arc<Database>,
     backend: Arc<dyn NotificationBackend>,
@@ -97,14 +120,6 @@ async fn handle_request(
     allowlist: &[String],
     max_stdin_bytes: usize,
 ) -> Result<()> {
-    let mut reader = BufReader::new(reader);
-
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
-    let line = line.trim();
-
-    let request: SudoRequest = serde_json::from_str(line)
-        .map_err(|e| anyhow::anyhow!("invalid request JSON: {e}"))?;
     let mode = request.mode;
     info!(
         "Received sudo request: user={} command={} mode={:?}",
@@ -166,6 +181,27 @@ async fn handle_request(
         return Ok(());
     }
 
+    // Check active temp rules - auto-approved commands skip rate limiting
+    if is_temp_rule_allowed(&db, &request.user, &command)? {
+        info!("Command auto-approved via temp rule: {}", command);
+        let record = SudoRequestRecord::new(request, timeout_seconds);
+        db.insert_request(&record)?;
+        db.update_decision(&record.id, Decision::Approved, "temp_rule")?;
+        let response = SudoResponse {
+            request_id: record.id,
+            decision: Decision::Approved,
+            error: None,
+        };
+        let resp_json = serde_json::to_string(&response)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+
+        if mode == RequestMode::Exec {
+            exec_command(&command, &cwd, stdin_bytes, writer).await?;
+        }
+        return Ok(());
+    }
+
     // Rate limiting: max 30 non-allowlisted requests per minute per user
     if !db.check_rate_limit(&request.user, 30)? {
         warn!("Rate limit exceeded for user: {}", request.user);
@@ -211,6 +247,119 @@ async fn handle_request(
     if mode == RequestMode::Exec && decision == Decision::Approved {
         exec_command(&command, &cwd, stdin_bytes, writer).await?;
     }
+
+    Ok(())
+}
+
+fn is_temp_rule_allowed(db: &Database, user: &str, command: &str) -> Result<bool> {
+    let rules = db.get_active_temp_rules(user)?;
+    for patterns_json in &rules {
+        let patterns: Vec<String> = serde_json::from_str(patterns_json)?;
+        for pattern in &patterns {
+            if command.starts_with(pattern.as_str()) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn handle_temp_rule_request(
+    request: TempRuleRequest,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    db: Arc<Database>,
+    backend: Arc<dyn NotificationBackend>,
+    max_temp_rule_duration: u32,
+) -> Result<()> {
+    info!(
+        "Received temp rule request: user={} patterns={:?} duration={}s",
+        request.user, request.patterns, request.duration_seconds
+    );
+
+    // Validate duration
+    if request.duration_seconds > max_temp_rule_duration {
+        let response = TempRuleResponse {
+            request_id: String::new(),
+            decision: Decision::Denied,
+            error: Some(format!(
+                "duration {}s exceeds maximum {}s",
+                request.duration_seconds, max_temp_rule_duration
+            )),
+            expires_at: None,
+        };
+        let resp_json = serde_json::to_string(&response)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    if request.patterns.is_empty() {
+        let response = TempRuleResponse {
+            request_id: String::new(),
+            decision: Decision::Denied,
+            error: Some("no patterns provided".to_string()),
+            expires_at: None,
+        };
+        let resp_json = serde_json::to_string(&response)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now();
+    let requested_at = now.to_rfc3339();
+    let expires_at = (now + chrono::Duration::seconds(request.duration_seconds as i64)).to_rfc3339();
+    let patterns_json = serde_json::to_string(&request.patterns)?;
+
+    db.insert_temp_rule(
+        &id,
+        &request.user,
+        &patterns_json,
+        request.duration_seconds,
+        &requested_at,
+        &expires_at,
+        &nonce,
+        request.reason.as_deref(),
+    )?;
+
+    let record = TempRuleRecord {
+        id: id.clone(),
+        user: request.user.clone(),
+        patterns: request.patterns.clone(),
+        duration_seconds: request.duration_seconds,
+        expires_at: expires_at.clone(),
+        nonce: nonce.clone(),
+        reason: request.reason.clone(),
+    };
+
+    let (decision, error_msg) = match backend.send_temp_rule_and_wait(&record).await {
+        Ok(d) => (d, None),
+        Err(e) => {
+            error!("Notification backend error for temp rule {id}: {e:#}");
+            (Decision::Denied, Some(format!("notification error: {e}")))
+        }
+    };
+
+    db.update_temp_rule_decision(&id, decision, backend.name())?;
+
+    let response = TempRuleResponse {
+        request_id: id,
+        decision,
+        error: error_msg,
+        expires_at: if decision == Decision::Approved {
+            Some(expires_at)
+        } else {
+            None
+        },
+    };
+    let resp_json = serde_json::to_string(&response)?;
+    writer.write_all(resp_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
 
     Ok(())
 }
@@ -357,6 +506,9 @@ mod tests {
         async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
             panic!("send_and_wait should not be called when rate-limited");
         }
+        async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
+            panic!("send_temp_rule_and_wait should not be called");
+        }
         fn name(&self) -> &'static str {
             "mock"
         }
@@ -393,7 +545,7 @@ mod tests {
 
         // Spawn the daemon handler
         let handler = tokio::spawn(async move {
-            handle_connection(server, db_clone, backend, 60, &[], 10 * 1024 * 1024).await
+            handle_connection(server, db_clone, backend, 60, &[], 10 * 1024 * 1024, 86400).await
         });
 
         // Client side: send a request that should be rate-limited
@@ -444,6 +596,36 @@ mod tests {
         handler.await.unwrap().unwrap();
 
         // Cleanup
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn temp_rule_prefix_matching() {
+        let dir = std::env::temp_dir().join(format!(
+            "aisudo-temp-rule-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Database::open(&dir.join("test.db")).unwrap();
+
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["apt install", "apt list"]).unwrap();
+
+        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+
+        // Exact match
+        assert!(is_temp_rule_allowed(&db, "alice", "apt install vim").unwrap());
+        assert!(is_temp_rule_allowed(&db, "alice", "apt list --installed").unwrap());
+
+        // No match
+        assert!(!is_temp_rule_allowed(&db, "alice", "apt remove vim").unwrap());
+        assert!(!is_temp_rule_allowed(&db, "alice", "rm -rf /").unwrap());
+
+        // Wrong user
+        assert!(!is_temp_rule_allowed(&db, "bob", "apt install vim").unwrap());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

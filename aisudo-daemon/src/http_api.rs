@@ -25,6 +25,9 @@ pub fn router(db: Arc<Database>) -> Router {
         .route("/requests/{id}", get(get_request))
         .route("/approve/{id}/{nonce}", get(approve_request))
         .route("/deny/{id}/{nonce}", get(deny_request))
+        .route("/temp-rules", get(list_temp_rules))
+        .route("/approve-rule/{id}/{nonce}", get(approve_temp_rule))
+        .route("/deny-rule/{id}/{nonce}", get(deny_temp_rule))
         .with_state(state)
 }
 
@@ -138,6 +141,73 @@ async fn deny_request(
                     (StatusCode::OK, "Denied").into_response()
                 }
                 Ok(false) => (StatusCode::CONFLICT, "Request already decided").into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn list_temp_rules(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.get_all_temp_rules() {
+        Ok(rules) => (StatusCode::OK, Json(rules)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn approve_temp_rule(
+    State(state): State<AppState>,
+    Path((id, nonce)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match state.db.get_temp_rule(&id) {
+        Ok(Some(rule)) => {
+            if rule.nonce != nonce {
+                return (StatusCode::FORBIDDEN, "Invalid nonce").into_response();
+            }
+            if rule.status != "pending" {
+                return (
+                    StatusCode::CONFLICT,
+                    format!("Rule already {}", rule.status),
+                )
+                    .into_response();
+            }
+            match state.db.update_temp_rule_decision(&id, Decision::Approved, "http_api") {
+                Ok(true) => {
+                    info!("Temp rule {id} approved via HTTP API");
+                    (StatusCode::OK, "Approved").into_response()
+                }
+                Ok(false) => (StatusCode::CONFLICT, "Rule already decided").into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn deny_temp_rule(
+    State(state): State<AppState>,
+    Path((id, nonce)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match state.db.get_temp_rule(&id) {
+        Ok(Some(rule)) => {
+            if rule.nonce != nonce {
+                return (StatusCode::FORBIDDEN, "Invalid nonce").into_response();
+            }
+            if rule.status != "pending" {
+                return (
+                    StatusCode::CONFLICT,
+                    format!("Rule already {}", rule.status),
+                )
+                    .into_response();
+            }
+            match state.db.update_temp_rule_decision(&id, Decision::Denied, "http_api") {
+                Ok(true) => {
+                    info!("Temp rule {id} denied via HTTP API");
+                    (StatusCode::OK, "Denied").into_response()
+                }
+                Ok(false) => (StatusCode::CONFLICT, "Rule already decided").into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
         }

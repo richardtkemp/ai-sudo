@@ -65,6 +65,14 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => error!("Timeout check error: {e}"),
             }
+            match db_timeout.expire_temp_rules() {
+                Ok(expired) => {
+                    for id in &expired {
+                        info!("Temp rule {id} expired");
+                    }
+                }
+                Err(e) => error!("Temp rule expiry error: {e}"),
+            }
         }
     });
 

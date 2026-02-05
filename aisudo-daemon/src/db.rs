@@ -175,7 +175,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id FROM requests
              WHERE status = 'pending'
-             AND datetime(timestamp, '+' || timeout_seconds || ' seconds') < datetime('now')",
+             AND datetime(replace(timestamp, 'T', ' '), '+' || timeout_seconds || ' seconds') < datetime('now')",
         )?;
         let ids: Vec<String> = stmt
             .query_map([], |row| row.get(0))?
@@ -212,7 +212,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM requests
-             WHERE user = ?1 AND timestamp > datetime('now', '-1 minute')",
+             WHERE user = ?1 AND replace(timestamp, 'T', ' ') > datetime('now', '-1 minute')",
             params![user],
             |row| row.get(0),
         )?;

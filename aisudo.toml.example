@@ -16,6 +16,12 @@ http_bind = "127.0.0.1:7654"
 # Default timeout for approval requests (seconds)
 timeout_seconds = 60
 
+# Hot-reload config on each incoming connection (checks file modification times).
+# Only per-connection values are reloaded: allowlist, timeout_seconds, max_stdin_bytes.
+# Structural values (socket_path, db_path, http_bind) and notification settings
+# are set at startup and require a restart.
+hot_reload = false
+
 # Commands that are auto-approved without notification.
 # Matching is prefix-based: "apt list" matches "apt list --installed".
 allowlist = [

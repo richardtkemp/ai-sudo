@@ -9,16 +9,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::ConfigHolder;
 use crate::db::Database;
 use crate::notification::NotificationBackend;
 
 pub async fn run_socket_listener(
-    config: &Config,
+    config_holder: Arc<ConfigHolder>,
     db: Arc<Database>,
     backend: Arc<dyn NotificationBackend>,
 ) -> Result<()> {
-    let socket_path = &config.socket_path;
+    let socket_path = config_holder.config().socket_path.clone();
 
     // Ensure parent directory exists
     if let Some(parent) = socket_path.parent() {
@@ -27,13 +27,13 @@ pub async fn run_socket_listener(
 
     // Remove stale socket file
     if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
+        std::fs::remove_file(&socket_path)?;
     }
 
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = UnixListener::bind(&socket_path)?;
 
     // Make socket accessible (the daemon runs as root)
-    set_socket_permissions(socket_path)?;
+    set_socket_permissions(&socket_path)?;
 
     info!("Listening on Unix socket: {}", socket_path.display());
 
@@ -42,6 +42,7 @@ pub async fn run_socket_listener(
             Ok((stream, _addr)) => {
                 let db = Arc::clone(&db);
                 let backend = Arc::clone(&backend);
+                let config = config_holder.config();
                 let timeout = config.timeout_seconds;
                 let allowlist = config.allowlist.clone();
                 let max_stdin_bytes = config.limits.max_stdin_bytes;

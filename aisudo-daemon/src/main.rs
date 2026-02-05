@@ -21,7 +21,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "/etc/aisudo/aisudo.toml".to_string());
 
     info!("Loading config from: {config_path}");
-    let config = config::Config::load(&config_path)?;
+    let config_holder = Arc::new(config::ConfigHolder::new(&config_path)?);
+    let config = config_holder.config();
 
     info!("Opening database: {}", config.db_path.display());
     let db = Arc::new(db::Database::open(&config.db_path)?);
@@ -86,7 +87,7 @@ async fn main() -> Result<()> {
     });
 
     // Run socket listener (blocks)
-    socket::run_socket_listener(&config, db, backend).await?;
+    socket::run_socket_listener(config_holder, db, backend).await?;
 
     Ok(())
 }

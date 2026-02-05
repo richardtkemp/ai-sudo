@@ -1,5 +1,7 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 use toml::Value;
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +25,9 @@ pub struct Config {
 
     #[serde(default = "default_limits")]
     pub limits: LimitsConfig,
+
+    #[serde(default)]
+    pub hot_reload: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +183,97 @@ impl Config {
         let config: Config = base.try_into()
             .map_err(|e| anyhow::anyhow!("invalid config after merging drop-ins: {}", e))?;
         Ok(config)
+    }
+}
+
+/// Collect modification times for the main config file and all conf.d/*.toml files.
+/// Returns sorted (path, mtime) pairs for deterministic comparison.
+fn collect_config_mtimes(config_path: &Path) -> Vec<(PathBuf, SystemTime)> {
+    let mut mtimes = Vec::new();
+
+    // Main config file
+    if let Ok(meta) = std::fs::metadata(config_path) {
+        if let Ok(mtime) = meta.modified() {
+            mtimes.push((config_path.to_path_buf(), mtime));
+        }
+    }
+
+    // conf.d/*.toml (same filtering as load_conf_d)
+    let conf_d = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("conf.d");
+
+    if let Ok(entries) = std::fs::read_dir(&conf_d) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || !name.ends_with(".toml") {
+                continue;
+            }
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if let Ok(mtime) = meta.modified() {
+                    mtimes.push((path, mtime));
+                }
+            }
+        }
+    }
+
+    mtimes.sort_by(|a, b| a.0.cmp(&b.0));
+    mtimes
+}
+
+/// Holds the current config and supports optional hot-reload on mtime changes.
+pub struct ConfigHolder {
+    path: String,
+    config: std::sync::RwLock<Arc<Config>>,
+    mtimes: std::sync::RwLock<Vec<(PathBuf, SystemTime)>>,
+}
+
+impl ConfigHolder {
+    pub fn new(path: &str) -> anyhow::Result<Self> {
+        let config = Config::load(path)?;
+        let config_path = Path::new(path);
+        let mtimes = collect_config_mtimes(config_path);
+        Ok(Self {
+            path: path.to_string(),
+            config: std::sync::RwLock::new(Arc::new(config)),
+            mtimes: std::sync::RwLock::new(mtimes),
+        })
+    }
+
+    pub fn config(&self) -> Arc<Config> {
+        let current = self.config.read().unwrap().clone();
+        if !current.hot_reload {
+            return current;
+        }
+
+        let new_mtimes = collect_config_mtimes(Path::new(&self.path));
+        let old_mtimes = self.mtimes.read().unwrap();
+        if *old_mtimes == new_mtimes {
+            return current;
+        }
+        drop(old_mtimes);
+
+        match Config::load(&self.path) {
+            Ok(new_config) => {
+                let new_config = Arc::new(new_config);
+                tracing::info!("Config hot-reloaded from {}", self.path);
+                *self.mtimes.write().unwrap() = new_mtimes;
+                let ret = new_config.clone();
+                *self.config.write().unwrap() = new_config;
+                ret
+            }
+            Err(e) => {
+                tracing::warn!("Config hot-reload failed, keeping old config: {e:#}");
+                // Update mtimes so we don't retry every call until file changes again
+                *self.mtimes.write().unwrap() = new_mtimes;
+                current
+            }
+        }
     }
 }
 
@@ -344,5 +440,86 @@ max_stdin_bytes = 1024
         let config = Config::load(&path).unwrap();
         assert_eq!(config.limits.max_stdin_bytes, 1024); // from base
         assert_eq!(config.limits.stdin_preview_bytes, 4096); // from drop-in
+    }
+
+    #[test]
+    fn config_holder_returns_config() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+        let holder = ConfigHolder::new(&path).unwrap();
+        let config = holder.config();
+        assert_eq!(config.timeout_seconds, 30);
+        assert_eq!(config.allowlist, vec!["apt list", "systemctl status"]);
+    }
+
+    #[test]
+    fn config_holder_no_reload_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+        let holder = ConfigHolder::new(&path).unwrap();
+        assert!(!holder.config().hot_reload);
+
+        // Modify the file
+        fs::write(
+            tmp.path().join("aisudo.toml"),
+            BASE_CONFIG.to_string() + "\ntimeout_seconds = 999\n",
+        )
+        .unwrap();
+
+        // Should still return old config since hot_reload is false
+        assert_eq!(holder.config().timeout_seconds, 30);
+    }
+
+    const HOT_RELOAD_CONFIG: &str = r#"
+socket_path = "/tmp/test.sock"
+db_path = "/tmp/test.db"
+http_bind = "127.0.0.1:9999"
+timeout_seconds = 30
+allowlist = ["apt list", "systemctl status"]
+hot_reload = true
+
+[telegram]
+bot_token = "token123"
+chat_id = 42
+
+[limits]
+max_stdin_bytes = 1024
+"#;
+
+    #[test]
+    fn config_holder_reloads_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), HOT_RELOAD_CONFIG);
+        let holder = ConfigHolder::new(&path).unwrap();
+        assert!(holder.config().hot_reload);
+        assert_eq!(holder.config().timeout_seconds, 30);
+
+        // Sleep briefly so mtime changes (filesystem granularity)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Modify the file with a new timeout
+        let updated = HOT_RELOAD_CONFIG.replace("timeout_seconds = 30", "timeout_seconds = 999");
+        fs::write(tmp.path().join("aisudo.toml"), &updated).unwrap();
+
+        // Should pick up the new value
+        assert_eq!(holder.config().timeout_seconds, 999);
+    }
+
+    #[test]
+    fn config_holder_survives_bad_reload() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), HOT_RELOAD_CONFIG);
+        let holder = ConfigHolder::new(&path).unwrap();
+        assert_eq!(holder.config().timeout_seconds, 30);
+
+        // Sleep briefly so mtime changes
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Write invalid TOML
+        fs::write(tmp.path().join("aisudo.toml"), "this is not valid {{{").unwrap();
+
+        // Should return the old config without panicking
+        let config = holder.config();
+        assert_eq!(config.timeout_seconds, 30);
     }
 }

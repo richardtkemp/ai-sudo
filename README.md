@@ -104,6 +104,35 @@ aisudo journalctl -n 50
 
 The daemon runs as a systemd service (`aisudo-daemon.service`) and communicates with the CLI over a Unix socket (`/var/run/aisudo/aisudo.sock`). Users must be in the `aisudo` group to connect.
 
+## OpenClaw Integration
+
+If you're using [OpenClaw](https://github.com/openclaw/openclaw), add this to your `TOOLS.md` so your agent knows to use `aisudo` instead of `sudo`:
+
+    ## aisudo — Remote Sudo Approval
+
+    **NEVER use plain `sudo`. Always use `aisudo` instead.**
+
+    `aisudo` sends a Telegram notification to your human with approve/deny buttons.
+    Without approval, the command won't run. This is the only way to run privileged commands.
+
+    ```bash
+    # Basic usage
+    aisudo apt update
+
+    # With reason (shows WHY in the Telegram notification)
+    aisudo -r "need to check disk health" smartctl -a /dev/sda
+    ```
+
+    **Always include `-r "reason"` for non-obvious commands.** Your human is much more
+    likely to approve if they know why.
+
+    **Allowlisted commands** (auto-approved, no Telegram prompt):
+    systemctl status/restart, journalctl, apt search/install/list/show, du, df, lsblk,
+    ss, lsof, cat /etc/*, tail /var/log/*, dmesg, smartctl, and more.
+    See `/etc/aisudo/aisudo.toml` for the full list.
+
+    **Config:** `/etc/aisudo/aisudo.toml` | **Socket:** `/var/run/aisudo/aisudo.sock`
+
 ## Security Notes
 
 - Daemon runs as root — it executes approved commands directly

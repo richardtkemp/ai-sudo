@@ -106,21 +106,7 @@ async fn handle_request(
         request.user, request.command, mode
     );
 
-    // Rate limiting: max 10 requests per minute per user
-    if !db.check_rate_limit(&request.user, 10)? {
-        warn!("Rate limit exceeded for user: {}", request.user);
-        let response = SudoResponse {
-            request_id: String::new(),
-            decision: Decision::Denied,
-            error: Some("rate limit exceeded".to_string()),
-        };
-        let resp_json = serde_json::to_string(&response)?;
-        writer.write_all(resp_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        return Ok(());
-    }
-
-    // Check allowlist - auto-approve matching commands
+    // Check allowlist first - auto-approved commands skip rate limiting
     let command = request.command.clone();
     let cwd = request.cwd.clone();
     if is_allowed(&command, allowlist) {
@@ -140,6 +126,20 @@ async fn handle_request(
         if mode == RequestMode::Exec {
             exec_command(&command, &cwd, writer).await?;
         }
+        return Ok(());
+    }
+
+    // Rate limiting: max 10 non-allowlisted requests per minute per user
+    if !db.check_rate_limit(&request.user, 10)? {
+        warn!("Rate limit exceeded for user: {}", request.user);
+        let response = SudoResponse {
+            request_id: String::new(),
+            decision: Decision::Denied,
+            error: Some("rate limit exceeded".to_string()),
+        };
+        let resp_json = serde_json::to_string(&response)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
         return Ok(());
     }
 

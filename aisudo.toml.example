@@ -1,4 +1,8 @@
 # ai-sudo daemon configuration
+#
+# Drop-in overrides: place *.toml files in conf.d/ next to this file
+# (e.g. /etc/aisudo/conf.d/99-local.toml). They are merged alphabetically.
+# Scalar values are replaced; allowlist entries are appended and deduplicated.
 
 # Path to the Unix socket for PAM module communication
 socket_path = "/var/run/aisudo/aisudo.sock"

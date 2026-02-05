@@ -24,6 +24,9 @@ pub struct SudoRequest {
     /// Base64-encoded stdin data captured from pipe/heredoc (None if stdin was a terminal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
+    /// Skip NOPASSWD check (set on retry after sudo -n fails).
+    #[serde(default)]
+    pub skip_nopasswd: bool,
 }
 
 fn default_mode() -> RequestMode {
@@ -118,12 +121,34 @@ pub struct TempRuleResponse {
     pub expires_at: Option<String>,
 }
 
+/// Request to list all active rules for a user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListRulesRequest {
+    pub user: String,
+}
+
+/// An active temporary rule with its patterns and expiry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTempRule {
+    pub patterns: Vec<String>,
+    pub expires_at: String,
+}
+
+/// Response containing all active rules for a user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListRulesResponse {
+    pub allowlist: Vec<String>,
+    pub temp_rules: Vec<ActiveTempRule>,
+    pub nopasswd_rules: Vec<String>,
+}
+
 /// Wire-level message wrapper for the Unix socket protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SocketMessage {
     SudoRequest(SudoRequest),
     TempRuleRequest(TempRuleRequest),
+    ListRules(ListRulesRequest),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +158,8 @@ pub enum Decision {
     Approved,
     Denied,
     Timeout,
+    /// Command matches a sudo NOPASSWD rule — CLI should exec via sudo directly.
+    UseSudo,
 }
 
 impl Decision {
@@ -142,6 +169,7 @@ impl Decision {
             Decision::Approved => "approved",
             Decision::Denied => "denied",
             Decision::Timeout => "timeout",
+            Decision::UseSudo => "use_sudo",
         }
     }
 
@@ -151,6 +179,7 @@ impl Decision {
             "approved" => Some(Decision::Approved),
             "denied" => Some(Decision::Denied),
             "timeout" => Some(Decision::Timeout),
+            "use_sudo" => Some(Decision::UseSudo),
             _ => None,
         }
     }

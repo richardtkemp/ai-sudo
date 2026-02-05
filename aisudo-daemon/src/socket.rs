@@ -1,6 +1,6 @@
 use aisudo_common::{
-    Decision, ExecOutput, RequestMode, SocketMessage, SudoRequest, SudoRequestRecord, SudoResponse,
-    TempRuleRequest, TempRuleResponse,
+    ActiveTempRule, Decision, ExecOutput, ListRulesRequest, ListRulesResponse, RequestMode,
+    SocketMessage, SudoRequest, SudoRequestRecord, SudoResponse, TempRuleRequest, TempRuleResponse,
 };
 use anyhow::Result;
 use base64::Engine as _;
@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 use crate::config::ConfigHolder;
 use crate::db::Database;
 use crate::notification::{NotificationBackend, TempRuleRecord};
+use crate::sudoers::SudoersCache;
 
 pub async fn run_socket_listener(
     config_holder: Arc<ConfigHolder>,
@@ -20,6 +21,7 @@ pub async fn run_socket_listener(
     backend: Arc<dyn NotificationBackend>,
 ) -> Result<()> {
     let socket_path = config_holder.config().socket_path.clone();
+    let sudoers_cache = Arc::new(SudoersCache::new(300));
 
     // Ensure parent directory exists
     if let Some(parent) = socket_path.parent() {
@@ -43,6 +45,7 @@ pub async fn run_socket_listener(
             Ok((stream, _addr)) => {
                 let db = Arc::clone(&db);
                 let backend = Arc::clone(&backend);
+                let sudoers = Arc::clone(&sudoers_cache);
                 let config = config_holder.config();
                 let timeout = config.timeout_seconds;
                 let allowlist = config.allowlist.clone();
@@ -51,7 +54,7 @@ pub async fn run_socket_listener(
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(stream, db, backend, timeout, &allowlist, max_stdin_bytes, max_temp_rule_duration).await
+                        handle_connection(stream, db, backend, sudoers, timeout, &allowlist, max_stdin_bytes, max_temp_rule_duration).await
                     {
                         error!("Connection handler error: {e:#}");
                     }
@@ -68,6 +71,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     db: Arc<Database>,
     backend: Arc<dyn NotificationBackend>,
+    sudoers: Arc<SudoersCache>,
     timeout_seconds: u32,
     allowlist: &[String],
     max_stdin_bytes: usize,
@@ -83,17 +87,20 @@ async fn handle_connection(
     let result = if let Ok(msg) = serde_json::from_str::<SocketMessage>(&line) {
         match msg {
             SocketMessage::SudoRequest(request) => {
-                handle_sudo_request(request, &mut writer, db, backend, timeout_seconds, allowlist, max_stdin_bytes).await
+                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, max_stdin_bytes).await
             }
             SocketMessage::TempRuleRequest(request) => {
                 handle_temp_rule_request(request, &mut writer, db, backend, max_temp_rule_duration).await
+            }
+            SocketMessage::ListRules(request) => {
+                handle_list_rules(request, &mut writer, db, sudoers, allowlist).await
             }
         }
     } else {
         // Backward compat: try bare SudoRequest
         let request: SudoRequest = serde_json::from_str(&line)
             .map_err(|e| anyhow::anyhow!("invalid request JSON: {e}"))?;
-        handle_sudo_request(request, &mut writer, db, backend, timeout_seconds, allowlist, max_stdin_bytes).await
+        handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, max_stdin_bytes).await
     };
 
     if let Err(ref e) = result {
@@ -116,6 +123,7 @@ async fn handle_sudo_request(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     db: Arc<Database>,
     backend: Arc<dyn NotificationBackend>,
+    sudoers: Arc<SudoersCache>,
     timeout_seconds: u32,
     allowlist: &[String],
     max_stdin_bytes: usize,
@@ -200,6 +208,34 @@ async fn handle_sudo_request(
             exec_command(&command, &cwd, stdin_bytes, writer).await?;
         }
         return Ok(());
+    }
+
+    // Check NOPASSWD rules (unless skip_nopasswd is set, i.e. retry after sudo -n failed)
+    if !request.skip_nopasswd {
+        let user = request.user.clone();
+        let cmd = command.clone();
+        let sudoers_ref = Arc::clone(&sudoers);
+        let is_nopasswd = tokio::task::spawn_blocking(move || {
+            sudoers_ref.is_nopasswd_allowed(&user, &cmd)
+        })
+        .await?;
+
+        if is_nopasswd {
+            info!("Command matches NOPASSWD rule, telling CLI to use sudo: {}", command);
+            let record = SudoRequestRecord::new(request, timeout_seconds);
+            db.insert_request(&record)?;
+            db.update_decision(&record.id, Decision::UseSudo, "nopasswd")?;
+            let response = SudoResponse {
+                request_id: record.id,
+                decision: Decision::UseSudo,
+                error: None,
+            };
+            let resp_json = serde_json::to_string(&response)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
     }
 
     // Rate limiting: max 30 non-allowlisted requests per minute per user
@@ -356,6 +392,52 @@ async fn handle_temp_rule_request(
             None
         },
     };
+    let resp_json = serde_json::to_string(&response)?;
+    writer.write_all(resp_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    Ok(())
+}
+
+async fn handle_list_rules(
+    request: ListRulesRequest,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    db: Arc<Database>,
+    sudoers: Arc<SudoersCache>,
+    allowlist: &[String],
+) -> Result<()> {
+    info!("Received list-rules request for user={}", request.user);
+
+    let user = request.user.clone();
+
+    // Gather temp rules from DB
+    let temp_rule_rows = db.get_active_temp_rules_detailed(&user)?;
+    let temp_rules: Vec<ActiveTempRule> = temp_rule_rows
+        .into_iter()
+        .filter_map(|(patterns_json, expires_at)| {
+            let patterns: Vec<String> = serde_json::from_str(&patterns_json).ok()?;
+            Some(ActiveTempRule {
+                patterns,
+                expires_at,
+            })
+        })
+        .collect();
+
+    // Gather NOPASSWD rules via spawn_blocking
+    let sudoers_ref = Arc::clone(&sudoers);
+    let user_clone = user.clone();
+    let nopasswd_rules = tokio::task::spawn_blocking(move || {
+        sudoers_ref.get_nopasswd_rules(&user_clone)
+    })
+    .await?;
+
+    let response = ListRulesResponse {
+        allowlist: allowlist.to_vec(),
+        temp_rules,
+        nopasswd_rules,
+    };
+
     let resp_json = serde_json::to_string(&response)?;
     writer.write_all(resp_json.as_bytes()).await?;
     writer.write_all(b"\n").await?;
@@ -533,6 +615,7 @@ mod tests {
                 mode: RequestMode::Exec,
                 reason: None,
                 stdin: None,
+                skip_nopasswd: false,
             };
             let record = SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -544,8 +627,9 @@ mod tests {
         let db_clone = Arc::clone(&db);
 
         // Spawn the daemon handler
+        let sudoers = Arc::new(SudoersCache::new(300));
         let handler = tokio::spawn(async move {
-            handle_connection(server, db_clone, backend, 60, &[], 10 * 1024 * 1024, 86400).await
+            handle_connection(server, db_clone, backend, sudoers, 60, &[], 10 * 1024 * 1024, 86400).await
         });
 
         // Client side: send a request that should be rate-limited
@@ -558,6 +642,7 @@ mod tests {
             mode: RequestMode::Exec,
             reason: None,
             stdin: None,
+            skip_nopasswd: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         writer.write_all(json.as_bytes()).await.unwrap();

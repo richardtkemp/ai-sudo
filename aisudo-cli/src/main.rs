@@ -1,6 +1,6 @@
 use aisudo_common::{
-    Decision, ExecOutput, RequestMode, SocketMessage, SudoRequest, SudoResponse,
-    TempRuleRequest, TempRuleResponse, DEFAULT_SOCKET_PATH,
+    Decision, ExecOutput, ListRulesRequest, ListRulesResponse, RequestMode, SocketMessage,
+    SudoRequest, SudoResponse, TempRuleRequest, TempRuleResponse, DEFAULT_SOCKET_PATH,
 };
 use base64::Engine as _;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
@@ -17,7 +17,13 @@ fn main() -> ExitCode {
     if args.len() < 2 {
         eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
         eprintln!("       aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
+        eprintln!("       aisudo --list-rules");
         return ExitCode::from(1);
+    }
+
+    // Check for --list-rules mode
+    if args.iter().any(|a| a == "--list-rules") {
+        return handle_list_rules();
     }
 
     // Check for --request-rule mode
@@ -63,7 +69,8 @@ fn main() -> ExitCode {
         pid,
         mode: RequestMode::Exec,
         reason,
-        stdin: stdin_data,
+        stdin: stdin_data.clone(),
+        skip_nopasswd: false,
     };
 
     eprintln!("aisudo: requesting approval for: {command}");
@@ -139,6 +146,10 @@ fn main() -> ExitCode {
     match response.decision {
         Decision::Approved => {
             // In exec mode, the daemon will now stream output lines
+        }
+        Decision::UseSudo => {
+            eprintln!("aisudo: command permitted by sudo NOPASSWD rule, executing via sudo");
+            return run_via_sudo(&command, &stdin_data);
         }
         Decision::Denied => {
             if let Some(ref err) = response.error {
@@ -354,11 +365,326 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
             eprintln!("aisudo: temp rule request timed out");
             ExitCode::from(1)
         }
-        Decision::Pending => {
-            eprintln!("aisudo: unexpected pending response");
+        _ => {
+            eprintln!("aisudo: unexpected response");
             ExitCode::from(1)
         }
     }
+}
+
+fn handle_list_rules() -> ExitCode {
+    let user = get_current_user();
+
+    let request = ListRulesRequest { user: user.clone() };
+    let msg = SocketMessage::ListRules(request);
+
+    let socket_path =
+        std::env::var("AISUDO_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+
+    let stream = match UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
+            eprintln!("aisudo: is aisudo-daemon running?");
+            return ExitCode::from(1);
+        }
+    };
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok();
+
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("aisudo: socket error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let msg_json = match serde_json::to_string(&msg) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("aisudo: serialization error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Err(e) = writer.write_all(msg_json.as_bytes()) {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.write_all(b"\n") {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("aisudo: flush error: {e}");
+        return ExitCode::from(1);
+    }
+
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+
+    let first_line = match lines.next() {
+        Some(Ok(line)) => line,
+        Some(Err(e)) => {
+            eprintln!("aisudo: connection to daemon lost: {e}");
+            return ExitCode::from(1);
+        }
+        None => {
+            eprintln!("aisudo: daemon closed connection unexpectedly");
+            return ExitCode::from(1);
+        }
+    };
+
+    let response: ListRulesResponse = match serde_json::from_str(&first_line) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("aisudo: invalid response from daemon: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!("Active rules for user: {user}");
+    println!();
+
+    println!("=== Permanent Allowlist ===");
+    if response.allowlist.is_empty() {
+        println!("  (none)");
+    } else {
+        for entry in &response.allowlist {
+            println!("  {entry}");
+        }
+    }
+    println!();
+
+    println!("=== Active Temp Rules ===");
+    if response.temp_rules.is_empty() {
+        println!("  (none)");
+    } else {
+        for rule in &response.temp_rules {
+            println!("  patterns: {:?}", rule.patterns);
+            println!("  expires:  {}", rule.expires_at);
+            println!();
+        }
+    }
+
+    println!("=== Sudo NOPASSWD Rules ===");
+    if response.nopasswd_rules.is_empty() {
+        println!("  (none)");
+    } else {
+        for rule in &response.nopasswd_rules {
+            println!("  {rule}");
+        }
+    }
+
+    ExitCode::from(0)
+}
+
+/// Run a command via sudo -n. If sudo needs a password (NOPASSWD rule no longer
+/// applies), fall back to requesting normal aisudo approval.
+fn run_via_sudo(command: &str, stdin_data: &Option<String>) -> ExitCode {
+    // Try sudo -n (non-interactive: fail immediately if password required)
+    let mut child = match std::process::Command::new("sudo")
+        .args(["-n", "sh", "-c", command])
+        .stdin(if stdin_data.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::inherit()
+        })
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("aisudo: failed to exec sudo: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Write stdin if present
+    if let Some(ref b64) = stdin_data {
+        if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+        {
+            if let Some(mut stdin_pipe) = child.stdin.take() {
+                let _ = stdin_pipe.write_all(&decoded);
+                // drop closes the pipe
+            }
+        }
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("aisudo: sudo wait error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Check if sudo failed because a password was required
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && stderr.contains("a password is required") {
+        eprintln!("aisudo: sudo NOPASSWD rule no longer applies, requesting approval...");
+        return retry_with_approval(command, stdin_data);
+    }
+
+    // Print any stderr from the command itself
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+
+    ExitCode::from(output.status.code().unwrap_or(1) as u8)
+}
+
+/// Retry the command through the normal aisudo approval flow with skip_nopasswd=true.
+fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
+    let user = get_current_user();
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "/".to_string());
+    let pid = std::process::id();
+
+    let socket_path =
+        std::env::var("AISUDO_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+
+    let request = SudoRequest {
+        user,
+        command: command.to_string(),
+        cwd,
+        pid,
+        mode: RequestMode::Exec,
+        reason: None,
+        stdin: stdin_data.clone(),
+        skip_nopasswd: true,
+    };
+
+    let msg = SocketMessage::SudoRequest(request);
+
+    let stream = match UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(300)))
+        .ok();
+
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("aisudo: socket error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let msg_json = match serde_json::to_string(&msg) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("aisudo: serialization error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Err(e) = writer.write_all(msg_json.as_bytes()) {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.write_all(b"\n") {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("aisudo: flush error: {e}");
+        return ExitCode::from(1);
+    }
+
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+
+    let first_line = match lines.next() {
+        Some(Ok(line)) => line,
+        Some(Err(e)) => {
+            eprintln!("aisudo: connection to daemon lost: {e}");
+            return ExitCode::from(1);
+        }
+        None => {
+            eprintln!("aisudo: daemon closed connection unexpectedly");
+            return ExitCode::from(1);
+        }
+    };
+
+    let response: SudoResponse = match serde_json::from_str(&first_line) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("aisudo: invalid response from daemon: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match response.decision {
+        Decision::Approved => {}
+        Decision::Denied => {
+            if let Some(ref err) = response.error {
+                eprintln!("aisudo: denied: {err}");
+            } else {
+                eprintln!("aisudo: request denied by user");
+            }
+            return ExitCode::from(1);
+        }
+        Decision::Timeout => {
+            eprintln!("aisudo: request timed out");
+            return ExitCode::from(1);
+        }
+        _ => {
+            eprintln!("aisudo: unexpected response");
+            return ExitCode::from(1);
+        }
+    }
+
+    // Stream output from daemon
+    let mut exit_code: i32 = 1;
+
+    for line_result in lines {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("aisudo: read error: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let output: ExecOutput = match serde_json::from_str(&line) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+
+        match output.stream.as_str() {
+            "stdout" => {
+                print!("{}", output.data);
+                let _ = std::io::stdout().flush();
+            }
+            "stderr" => {
+                eprint!("{}", output.data);
+                let _ = std::io::stderr().flush();
+            }
+            "exit" => {
+                exit_code = output.exit_code.unwrap_or(1);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    ExitCode::from(exit_code as u8)
 }
 
 fn get_current_user() -> String {

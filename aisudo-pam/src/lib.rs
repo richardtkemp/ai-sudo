@@ -160,11 +160,12 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         mode: RequestMode::Pam,
         reason: None,
         stdin: None,
+        skip_nopasswd: false,
     };
 
     match ask_daemon(&socket_path, &request) {
         Ok(response) => match response.decision {
-            Decision::Approved => PAM_SUCCESS,
+            Decision::Approved | Decision::UseSudo => PAM_SUCCESS,
             Decision::Denied => PAM_AUTH_ERR,
             Decision::Timeout => PAM_AUTH_ERR,
             Decision::Pending => PAM_AUTH_ERR,

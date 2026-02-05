@@ -3,6 +3,7 @@ mod db;
 mod http_api;
 mod notification;
 mod socket;
+mod sudoers;
 
 use anyhow::Result;
 use notification::telegram::TelegramBackend;

@@ -328,6 +328,21 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get active temp rules with their patterns and expiry time (for --list-rules).
+    pub fn get_active_temp_rules_detailed(&self, user: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT patterns, expires_at FROM temp_rules
+             WHERE user = ?1 AND status = 'approved'
+             AND datetime(replace(substr(expires_at, 1, 19), 'T', ' ')) > datetime('now')",
+        )?;
+        let rows = stmt
+            .query_map(params![user], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     pub fn get_all_temp_rules(&self) -> Result<Vec<TempRuleRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

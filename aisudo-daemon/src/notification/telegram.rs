@@ -1,6 +1,7 @@
 use super::NotificationBackend;
 use aisudo_common::{Decision, SudoRequestRecord};
 use anyhow::{anyhow, Result};
+use base64::Engine as _;
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
@@ -8,6 +9,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, error, info, warn};
+
+const STDIN_PREVIEW_BYTES: usize = 2048;
+
+/// Tracks a pending approval request with the info needed to edit the message later.
+struct PendingRequest {
+    sender: oneshot::Sender<Decision>,
+    message_id: i64,
+    user: String,
+    command: String,
+}
 
 pub struct TelegramBackend {
     bot_token: String,
@@ -120,6 +131,13 @@ impl TelegramBackend {
             Some(r) => format!("\n*Reason:* {}", r),
             None => String::new(),
         };
+        let stdin_line = match &record.stdin {
+            Some(stdin_b64) => {
+                let preview = format_stdin_preview(stdin_b64);
+                format!("\n\n*Stdin:*\n```\n{}\n```", preview)
+            }
+            None => String::new(),
+        };
         let text = format!(
             "🔐 *Sudo Request*\n\n\
              *User:* `{}`\n\
@@ -127,8 +145,8 @@ impl TelegramBackend {
              *CWD:* `{}`\n\
              *PID:* `{}`\n\
              *Request ID:* `{}`\n\
-             *Timeout:* {}s{}",
-            record.user, record.command, record.cwd, record.pid, record.id, record.timeout_seconds, reason_line
+             *Timeout:* {}s{}{}",
+            record.user, record.command, record.cwd, record.pid, record.id, record.timeout_seconds, reason_line, stdin_line
         );
 
         let approve_data = format!("approve:{}", record.id);
@@ -300,5 +318,95 @@ impl NotificationBackend for TelegramBackend {
 
     fn name(&self) -> &'static str {
         "telegram"
+    }
+}
+
+/// Format a base64-encoded stdin payload for display in a Telegram message.
+fn format_stdin_preview(stdin_b64: &str) -> String {
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(stdin_b64) {
+        Ok(bytes) => bytes,
+        Err(_) => return "[invalid base64]".to_string(),
+    };
+
+    if is_likely_binary(&decoded) {
+        return format!("[binary data, {} bytes]", decoded.len());
+    }
+
+    let text = String::from_utf8_lossy(&decoded);
+    if text.len() <= STDIN_PREVIEW_BYTES {
+        text.to_string()
+    } else {
+        format!(
+            "{}... ({} bytes total, truncated)",
+            &text[..STDIN_PREVIEW_BYTES],
+            decoded.len()
+        )
+    }
+}
+
+/// Heuristic: if >5% of the first 512 bytes are non-printable control chars, treat as binary.
+fn is_likely_binary(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let sample_size = data.len().min(512);
+    let sample = &data[..sample_size];
+    let non_printable = sample
+        .iter()
+        .filter(|&&b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t')
+        .count();
+    (non_printable as f64 / sample_size as f64) > 0.05
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_stdin_preview_text() {
+        let data = b"hello world\nline two\n";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        let preview = format_stdin_preview(&b64);
+        assert_eq!(preview, "hello world\nline two\n");
+    }
+
+    #[test]
+    fn test_format_stdin_preview_large() {
+        let data = "x".repeat(5000);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
+        let preview = format_stdin_preview(&b64);
+        assert!(preview.contains("truncated"));
+        assert!(preview.contains("5000 bytes total"));
+    }
+
+    #[test]
+    fn test_format_stdin_preview_binary() {
+        let data: Vec<u8> = (0..256).map(|i| i as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let preview = format_stdin_preview(&b64);
+        assert_eq!(preview, "[binary data, 256 bytes]");
+    }
+
+    #[test]
+    fn test_format_stdin_preview_invalid_base64() {
+        let preview = format_stdin_preview("not-valid-base64!!!");
+        assert_eq!(preview, "[invalid base64]");
+    }
+
+    #[test]
+    fn test_is_likely_binary_text() {
+        assert!(!is_likely_binary(b"hello world\n"));
+    }
+
+    #[test]
+    fn test_is_likely_binary_with_nulls() {
+        let mut data = vec![0u8; 100];
+        data[0] = b'h';
+        assert!(is_likely_binary(&data));
+    }
+
+    #[test]
+    fn test_is_likely_binary_empty() {
+        assert!(!is_likely_binary(b""));
     }
 }

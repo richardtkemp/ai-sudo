@@ -159,6 +159,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         pid,
         mode: RequestMode::Pam,
         reason: None,
+        stdin: None,
     };
 
     match ask_daemon(&socket_path, &request) {

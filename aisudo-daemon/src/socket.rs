@@ -2,6 +2,7 @@ use aisudo_common::{
     Decision, ExecOutput, RequestMode, SudoRequest, SudoRequestRecord, SudoResponse,
 };
 use anyhow::Result;
+use base64::Engine as _;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -106,6 +107,17 @@ async fn handle_request(
         request.user, request.command, mode
     );
 
+    // Decode stdin if present
+    let stdin_bytes = if let Some(ref stdin_b64) = request.stdin {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(stdin_b64)
+            .map_err(|e| anyhow::anyhow!("invalid stdin encoding: {e}"))?;
+        info!("Request includes stdin: {} bytes", decoded.len());
+        Some(decoded)
+    } else {
+        None
+    };
+
     // Check allowlist first - auto-approved commands skip rate limiting
     let command = request.command.clone();
     let cwd = request.cwd.clone();
@@ -124,13 +136,13 @@ async fn handle_request(
         writer.write_all(b"\n").await?;
 
         if mode == RequestMode::Exec {
-            exec_command(&command, &cwd, writer).await?;
+            exec_command(&command, &cwd, stdin_bytes, writer).await?;
         }
         return Ok(());
     }
 
-    // Rate limiting: max 10 non-allowlisted requests per minute per user
-    if !db.check_rate_limit(&request.user, 10)? {
+    // Rate limiting: max 30 non-allowlisted requests per minute per user
+    if !db.check_rate_limit(&request.user, 30)? {
         warn!("Rate limit exceeded for user: {}", request.user);
         let response = SudoResponse {
             request_id: String::new(),
@@ -140,6 +152,7 @@ async fn handle_request(
         let resp_json = serde_json::to_string(&response)?;
         writer.write_all(resp_json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
+        writer.flush().await?;
         return Ok(());
     }
 
@@ -171,7 +184,7 @@ async fn handle_request(
 
     // If exec mode and approved, execute the command and stream output
     if mode == RequestMode::Exec && decision == Decision::Approved {
-        exec_command(&command, &cwd, writer).await?;
+        exec_command(&command, &cwd, stdin_bytes, writer).await?;
     }
 
     Ok(())
@@ -181,6 +194,7 @@ async fn handle_request(
 async fn exec_command(
     command: &str,
     cwd: &str,
+    stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> Result<()> {
     use tokio::process::Command;
@@ -193,7 +207,24 @@ async fn exec_command(
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .stdin(if stdin_bytes.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .spawn()?;
+
+    // Write stdin to child process if present
+    if let Some(data) = stdin_bytes {
+        if let Some(mut stdin_pipe) = child.stdin.take() {
+            tokio::spawn(async move {
+                if let Err(e) = stdin_pipe.write_all(&data).await {
+                    error!("Failed to write stdin to child: {e}");
+                }
+                // Dropping stdin_pipe closes the pipe, signaling EOF to the child
+            });
+        }
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -288,6 +319,108 @@ fn is_allowed(command: &str, allowlist: &[String]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockBackend;
+
+    #[async_trait::async_trait]
+    impl crate::notification::NotificationBackend for MockBackend {
+        async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
+            panic!("send_and_wait should not be called when rate-limited");
+        }
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_sends_denial_response() {
+        let dir = std::env::temp_dir().join(format!(
+            "aisudo-rate-limit-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.join("test.db")).unwrap());
+
+        // Insert 30 requests to exceed the rate limit
+        for i in 0..30 {
+            let req = SudoRequest {
+                user: "testuser".to_string(),
+                command: format!("cmd-{}", i),
+                cwd: "/tmp".to_string(),
+                pid: 1000 + i as u32,
+                mode: RequestMode::Exec,
+                reason: None,
+                stdin: None,
+            };
+            let record = SudoRequestRecord::new(req, 60);
+            db.insert_request(&record).unwrap();
+        }
+
+        // Create a connected socket pair
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+        let db_clone = Arc::clone(&db);
+
+        // Spawn the daemon handler
+        let handler = tokio::spawn(async move {
+            handle_connection(server, db_clone, backend, 60, &[]).await
+        });
+
+        // Client side: send a request that should be rate-limited
+        let (reader, mut writer) = client.into_split();
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "should-be-rate-limited".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 9999,
+            mode: RequestMode::Exec,
+            reason: None,
+            stdin: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        writer.write_all(json.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        // Client side: read response (with timeout to detect hangs)
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            buf_reader.read_line(&mut line),
+        )
+        .await;
+        let bytes_read = read_result
+            .expect("client timed out waiting for response — daemon did not send one")
+            .unwrap();
+        assert!(
+            bytes_read > 0,
+            "daemon closed connection without sending a response"
+        );
+
+        let response: SudoResponse = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("rate limit"),
+            "expected 'rate limit' in error, got: {:?}",
+            response.error
+        );
+
+        // Daemon handler should have returned Ok
+        handler.await.unwrap().unwrap();
+
+        // Cleanup
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 fn set_socket_permissions(path: &Path) -> Result<()> {

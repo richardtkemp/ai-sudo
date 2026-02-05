@@ -28,6 +28,8 @@ name = "aisudo-cli"
 version = "0.1.0"
 dependencies = [
  "aisudo-common",
+ "base64",
+ "libc",
  "serde_json",
 ]
 
@@ -49,6 +51,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "dashmap",
  "nix",

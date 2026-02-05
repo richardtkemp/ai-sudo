@@ -24,3 +24,4 @@ anyhow = "1"
 dashmap = "6"
 async-trait = "0.1"
 nix = { version = "0.29", features = ["user", "fs"] }
+base64 = "0.22"

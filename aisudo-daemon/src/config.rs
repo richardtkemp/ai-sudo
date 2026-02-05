@@ -19,6 +19,9 @@ pub struct Config {
     pub allowlist: Vec<String>,
 
     pub telegram: Option<TelegramConfig>,
+
+    #[serde(default = "default_limits")]
+    pub limits: LimitsConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +51,30 @@ fn default_timeout() -> u32 {
 
 fn default_poll_timeout() -> u32 {
     30
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LimitsConfig {
+    #[serde(default = "default_max_stdin")]
+    pub max_stdin_bytes: usize,
+
+    #[serde(default = "default_stdin_preview")]
+    pub stdin_preview_bytes: usize,
+}
+
+fn default_max_stdin() -> usize {
+    10 * 1024 * 1024 // 10 MB
+}
+
+fn default_stdin_preview() -> usize {
+    2048
+}
+
+fn default_limits() -> LimitsConfig {
+    LimitsConfig {
+        max_stdin_bytes: default_max_stdin(),
+        stdin_preview_bytes: default_stdin_preview(),
+    }
 }
 
 impl Config {

@@ -21,6 +21,9 @@ pub struct SudoRequest {
     pub mode: RequestMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Base64-encoded stdin data captured from pipe/heredoc (None if stdin was a terminal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
 }
 
 fn default_mode() -> RequestMode {
@@ -54,10 +57,18 @@ pub struct SudoRequestRecord {
     pub decided_at: Option<DateTime<Utc>>,
     pub decided_by: Option<String>,
     pub reason: Option<String>,
+    /// Base64-encoded stdin data (carried through for notification preview, not stored in DB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
+    /// Size of decoded stdin in bytes (logged to audit DB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_bytes: Option<usize>,
 }
 
 impl SudoRequestRecord {
     pub fn new(req: SudoRequest, timeout_seconds: u32) -> Self {
+        // Estimate decoded stdin size from base64 length (3 bytes per 4 chars)
+        let stdin_bytes = req.stdin.as_ref().map(|s| s.len() * 3 / 4);
         Self {
             id: Uuid::new_v4().to_string(),
             user: req.user,
@@ -71,6 +82,8 @@ impl SudoRequestRecord {
             decided_at: None,
             decided_by: None,
             reason: req.reason,
+            stdin: req.stdin,
+            stdin_bytes,
         }
     }
 }

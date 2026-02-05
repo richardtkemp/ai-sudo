@@ -1,10 +1,14 @@
 use aisudo_common::{
     Decision, ExecOutput, RequestMode, SudoRequest, SudoResponse, DEFAULT_SOCKET_PATH,
 };
-use std::io::{BufRead, BufReader, Write};
+use base64::Engine as _;
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::Duration;
+
+const MAX_STDIN_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -34,6 +38,15 @@ fn main() -> ExitCode {
         .unwrap_or_else(|_| "/".to_string());
     let pid = std::process::id();
 
+    // Capture stdin if piped/redirected (not a terminal)
+    let stdin_data = match capture_stdin() {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("aisudo: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
     let socket_path =
         std::env::var("AISUDO_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
 
@@ -44,6 +57,7 @@ fn main() -> ExitCode {
         pid,
         mode: RequestMode::Exec,
         reason,
+        stdin: stdin_data,
     };
 
     eprintln!("aisudo: requesting approval for: {command}");
@@ -183,4 +197,62 @@ fn get_current_user() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Check if stdin has data or EOF available without blocking.
+/// Uses poll(2) with zero timeout for a non-blocking check.
+fn stdin_has_data_or_eof() -> bool {
+    let fd = std::io::stdin().as_raw_fd();
+
+    let mut fds = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    // poll with 0ms timeout: returns immediately
+    // > 0 means POLLIN (data available) or POLLHUP (write end closed) was set
+    let result = unsafe { libc::poll(&mut fds as *mut _, 1, 0) };
+    result > 0
+}
+
+/// Read stdin if it's piped/redirected (not a terminal).
+/// Returns base64-encoded data, or None if stdin is a terminal or empty.
+/// Rejects input exceeding MAX_STDIN_SIZE.
+fn capture_stdin() -> Result<Option<String>, String> {
+    let stdin = std::io::stdin();
+
+    if stdin.is_terminal() {
+        return Ok(None);
+    }
+
+    // Check if stdin has data or EOF immediately available.
+    // Without this, read_to_end() blocks forever when stdin is redirected
+    // but the writer never sends data or closes the pipe (e.g., automation
+    // tools that set up piped stdin without writing to it).
+    if !stdin_has_data_or_eof() {
+        return Ok(None);
+    }
+
+    let mut buffer = Vec::new();
+    // Read up to MAX_STDIN_SIZE + 1 to detect oversize input
+    let bytes_read = stdin
+        .lock()
+        .take(MAX_STDIN_SIZE as u64 + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|e| format!("failed to read stdin: {e}"))?;
+
+    if bytes_read > MAX_STDIN_SIZE {
+        return Err(format!(
+            "stdin exceeds size limit ({} bytes max)",
+            MAX_STDIN_SIZE
+        ));
+    }
+
+    if buffer.is_empty() {
+        return Ok(None);
+    }
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
+    Ok(Some(encoded))
 }

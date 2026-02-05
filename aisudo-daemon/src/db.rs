@@ -36,7 +36,8 @@ impl Database {
                 timeout_seconds INTEGER DEFAULT 60,
                 decided_at TEXT,
                 decided_by TEXT,
-                nonce TEXT NOT NULL
+                nonce TEXT NOT NULL,
+                stdin_bytes INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -48,14 +49,16 @@ impl Database {
             );
             ",
         )?;
+        // Migration: add stdin_bytes column to existing databases
+        let _ = conn.execute_batch("ALTER TABLE requests ADD COLUMN stdin_bytes INTEGER;");
         Ok(())
     }
 
     pub fn insert_request(&self, record: &SudoRequestRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO requests (id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO requests (id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, stdin_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 record.id,
                 record.user,
@@ -66,10 +69,15 @@ impl Database {
                 record.status.as_str(),
                 record.timeout_seconds,
                 record.nonce,
+                record.stdin_bytes.map(|n| n as i64),
             ],
         )?;
         drop(conn); // Release mutex before audit_log (which also locks it)
-        self.audit_log(&record.id, "request_created", &format!("user={} command={}", record.user, record.command))?;
+        let stdin_info = match record.stdin_bytes {
+            Some(n) => format!(" stdin_bytes={n}"),
+            None => String::new(),
+        };
+        self.audit_log(&record.id, "request_created", &format!("user={} command={}{}", record.user, record.command, stdin_info))?;
         Ok(())
     }
 
@@ -99,7 +107,7 @@ impl Database {
     pub fn get_request(&self, request_id: &str) -> Result<Option<SudoRequestRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, decided_at, decided_by
+            "SELECT id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, decided_at, decided_by, stdin_bytes
              FROM requests WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![request_id])?;
@@ -107,6 +115,7 @@ impl Database {
             let status_str: String = row.get(6)?;
             let ts_str: String = row.get(5)?;
             let decided_at_str: Option<String> = row.get(9)?;
+            let stdin_bytes: Option<i64> = row.get(11)?;
             Ok(Some(SudoRequestRecord {
                 id: row.get(0)?,
                 user: row.get(1)?,
@@ -126,6 +135,8 @@ impl Database {
                 }),
                 decided_by: row.get(10)?,
                 reason: None,
+                stdin: None, // Not stored in DB
+                stdin_bytes: stdin_bytes.map(|n| n as usize),
             }))
         } else {
             Ok(None)
@@ -135,13 +146,14 @@ impl Database {
     pub fn get_pending_requests(&self) -> Result<Vec<SudoRequestRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, decided_at, decided_by
+            "SELECT id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, decided_at, decided_by, stdin_bytes
              FROM requests WHERE status = 'pending' ORDER BY timestamp ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             let status_str: String = row.get(6)?;
             let ts_str: String = row.get(5)?;
             let decided_at_str: Option<String> = row.get(9)?;
+            let stdin_bytes: Option<i64> = row.get(11)?;
             Ok(SudoRequestRecord {
                 id: row.get(0)?,
                 user: row.get(1)?,
@@ -161,6 +173,8 @@ impl Database {
                 }),
                 decided_by: row.get(10)?,
                 reason: None,
+                stdin: None, // Not stored in DB
+                stdin_bytes: stdin_bytes.map(|n| n as usize),
             })
         })?;
         let mut result = Vec::new();
@@ -212,7 +226,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM requests
-             WHERE user = ?1 AND replace(timestamp, 'T', ' ') > datetime('now', '-1 minute')",
+             WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 minute')",
             params![user],
             |row| row.get(0),
         )?;

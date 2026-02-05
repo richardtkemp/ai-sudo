@@ -61,6 +61,13 @@ if [[ ! -f "$CLI_BIN" ]]; then
     exit 1
 fi
 
+# ── Stop running daemon ──────────────────────────────────────────────
+
+if systemctl is-active --quiet aisudo-daemon 2>/dev/null; then
+    info "Stopping running aisudo-daemon..."
+    systemctl stop aisudo-daemon
+fi
+
 # ── Install daemon ────────────────────────────────────────────────────
 
 info "Installing daemon binary to /usr/local/bin/aisudo-daemon..."
@@ -153,7 +160,7 @@ fi
 
 info "Enabling and starting aisudo-daemon..."
 systemctl enable aisudo-daemon
-systemctl start aisudo-daemon
+systemctl restart aisudo-daemon
 
 # Give it a moment
 sleep 2

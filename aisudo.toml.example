@@ -10,8 +10,12 @@ socket_path = "/var/run/aisudo/aisudo.sock"
 # Path to the SQLite database
 db_path = "/var/lib/aisudo/aisudo.db"
 
-# HTTP API bind address (for status queries)
-http_bind = "127.0.0.1:7654"
+# HTTP API bind address (used only if http_enable_not_recommended = true)
+# http_bind = "127.0.0.1:7654"
+
+# Enable the unauthenticated HTTP API. Disabled by default because it has
+# no authentication — any local process can approve/deny requests.
+# http_enable_not_recommended = false
 
 # Default timeout for approval requests (seconds)
 timeout_seconds = 60

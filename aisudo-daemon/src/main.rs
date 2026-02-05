@@ -44,12 +44,14 @@ async fn main() -> Result<()> {
             telegram.start_polling();
             info!("Telegram notification backend enabled (chat_id: {})", tg_config.chat_id);
             telegram
-        } else {
+        } else if config.http_enable_not_recommended {
             warn!("No [telegram] config found — approval via HTTP API only");
             Arc::new(notification::HttpOnlyBackend::new(
                 config.timeout_seconds,
                 Arc::clone(&db),
             ))
+        } else {
+            anyhow::bail!("No approval mechanism configured. Set [telegram] or enable http_enable_not_recommended.");
         };
 
     // Spawn timeout expiry task
@@ -76,23 +78,26 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start HTTP API
-    let http_bind = config.http_bind.clone();
-    let db_http = Arc::clone(&db);
-    tokio::spawn(async move {
-        let app = http_api::router(db_http);
-        let listener = match tokio::net::TcpListener::bind(&http_bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!("Failed to bind HTTP on {http_bind}: {e}");
-                return;
+    // Start HTTP API (only if explicitly enabled)
+    if config.http_enable_not_recommended {
+        let http_bind = config.http_bind.clone();
+        let db_http = Arc::clone(&db);
+        warn!("HTTP API enabled (unauthenticated!) on {http_bind}");
+        tokio::spawn(async move {
+            let app = http_api::router(db_http);
+            let listener = match tokio::net::TcpListener::bind(&http_bind).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("Failed to bind HTTP on {http_bind}: {e}");
+                    return;
+                }
+            };
+            info!("HTTP API listening on {http_bind}");
+            if let Err(e) = axum::serve(listener, app).await {
+                error!("HTTP server error: {e}");
             }
-        };
-        info!("HTTP API listening on {http_bind}");
-        if let Err(e) = axum::serve(listener, app).await {
-            error!("HTTP server error: {e}");
-        }
-    });
+        });
+    }
 
     // Run socket listener (blocks)
     socket::run_socket_listener(config_holder, db, backend).await?;

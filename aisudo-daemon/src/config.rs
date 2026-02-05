@@ -28,6 +28,12 @@ pub struct Config {
 
     #[serde(default)]
     pub hot_reload: bool,
+
+    /// Enable the unauthenticated HTTP API. Disabled by default because it has
+    /// no authentication — any local process can list pending requests and
+    /// approve/deny them if it knows the nonce.
+    #[serde(default)]
+    pub http_enable_not_recommended: bool,
 }
 
 #[derive(Debug, Deserialize)]

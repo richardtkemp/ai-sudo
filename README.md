@@ -1,133 +1,121 @@
 # ai-sudo
 
-**Secure remote sudo approval for AI assistants — with end-to-end encrypted notifications**
+**Remote sudo approval for AI assistants via Telegram.**
 
-A self-hosted sudo approval system that sends E2E encrypted push notifications to your phone when an AI assistant (like Clawdbot) needs elevated privileges. Approve or deny requests remotely without giving blanket sudo access, with full privacy guarantees.
+When an AI assistant needs to run a privileged command, it sends you a Telegram notification with Approve/Deny buttons. No blanket sudo access, no passwords, full audit trail.
 
-## What It Is
-
-ai-sudo is a PAM (Pluggable Authentication Module) based system that intercepts sudo requests and routes them through a mobile approval workflow. When an AI needs to run a privileged command, you get a notification on your phone showing:
-
-- The command being requested
-- Which AI/process is requesting it
-- The working directory and context
-
-You can then tap **Approve** or **Deny** from anywhere. The decision is communicated back to your machine, which either allows or blocks the command.
-
-**Security Requirement:** All notification channels must provide end-to-end encryption. We do not use Telegram or any channel without E2E encryption.
-
-## Why It Should Be Built
-
-AI assistants are becoming integral parts of our workflows, but they face a fundamental security constraint: they often need to run administrative commands but can't type passwords. This creates a dangerous tradeoff:
-
-| Current Options | Problem |
-|-----------------|---------|
-| Grant full sudo | Complete security failure - AI can do anything |
-| Physical presence | Defeats the purpose of remote AI assistance |
-| Pre-approved commands | Inflexible - breaks when commands vary |
-
-ai-sudo bridges this gap by adding a **human-in-the-loop** approval step. The AI can request privileges, but a human must explicitly approve each sensitive operation. This transforms AI + sudo from a security liability into a secure, auditable workflow.
-
-## Security-First Design
-
-### End-to-End Encryption Requirement
-
-**All notification channels must provide E2E encryption.** This is non-negotiable because:
-
-1. **Sudo requests contain sensitive information** - commands, paths, usernames
-2. **Notifications travel through external servers** - we cannot trust notification providers
-3. **Compromised notification channels = compromised system** - attackers could approve malicious commands
-
-### Approved Notification Channels
-
-| Channel | E2E Encryption | Status |
-|---------|----------------|--------|
-| signal-cli (JSON-RPC) | ✅ Native Signal E2E | ✅ MVP - Approved |
-| Custom iOS/Android App | ✅ App-level E2E | 🔬 Future v2 |
-
-### Important: Signal API Reality
-
-**Signal does NOT provide an official Bot API.** All Signal notification approaches require puppeting a real user account.
-
-| Option | Status | Notes |
-|--------|--------|-------|
-| signal-cli | ✅ Active | **MVP Choice** - Java-based, JSON-RPC interface |
-| signald | ❌ Abandoned | "Not nearly as secure" - DO NOT USE |
-| Custom Mobile App | 🔬 Future v2 | Build proper Signal client |
-
-**Puppet Account Requirements:**
-- Dedicated phone number (VoIP acceptable)
-- Recovery phrase stored securely
-- Rate limiting enforced
-- Signal ToS compliance is an unquantized risk
-
-### Rejected Notification Channels
-
-| Channel | Reason for Rejection |
-|---------|---------------------|
-| Telegram | No native E2E encryption (MTProto is server-client, not E2E) |
-| Clawdbot iOS Node | Not publicly available (closed infrastructure) |
-| signald | Abandoned project, security concerns documented |
-| SMS | No encryption, SIM hijacking risks |
-| Email | No E2E, prone to interception |
-| Plain webhooks | No encryption |
-
-## Solution Overview
-
-ai-sudo implements a **human-gated sudo** pattern:
+## How It Works
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│ sudo cmd    │────▶│ PAM Module   │────▶│ aisudo      │
-│ (terminal)  │     │ (pam_aisudo) │     │ daemon      │
-└─────────────┘     └──────────────┘     └──────┬──────┘
-                                                │
-                   E2E Encrypted Notification    │
-                                                ▼
-                                         ┌─────────────┐
-                                         │ Phone App   │
-                                         │ (E2E Enc.)  │
-                                         └─────────────┘
+AI runs `aisudo whoami`
+        │
+        ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  aisudo CLI  │────▶│  aisudo      │────▶│  Telegram    │
+│  (wrapper)   │     │  daemon      │     │  (your phone)│
+└──────────────┘     └──────────────┘     └──────┬───────┘
+                            ▲                     │
+                            │    Approve / Deny   │
+                            └─────────────────────┘
 ```
 
-### How It Works
+1. AI runs `aisudo <command>` instead of `sudo`
+2. Daemon checks the allowlist — auto-approves safe commands (e.g. `df`, `journalctl`)
+3. For other commands, sends a Telegram notification with command details
+4. You tap **Approve** or **Deny** on your phone
+5. If approved, the daemon executes the command as root and streams output back
 
-1. **Intercept** - A user or AI runs `sudo <command>`
-2. **Pause** - The PAM module intercepts the request and notifies the daemon
-3. **Encrypt & Notify** - The daemon encrypts notification payload and sends via E2E channel
-4. **Approve/Deny** - Human reviews and responds via encrypted channel
-5. **Execute** - PAM receives the decision (with nonce validation) and allows/blocks
+## Features
 
-### Key Features
+- **CLI wrapper** — `aisudo` drop-in, no PAM configuration needed
+- **Reason flag** — `aisudo -r "why I need this" <command>` shows context in the notification
+- **Command allowlist** — auto-approve safe commands without notification
+- **Configurable timeout** — requests expire after a set time (default: 60s, configurable)
+- **Rate limiting** — 10 requests per minute per user
+- **Audit logging** — all requests and decisions stored in SQLite
+- **PAM module** — optional `--pam` install for intercepting all sudo (not default)
 
-- **E2E Encryption** - All notifications are encrypted end-to-end
-- **Timeout support** - Auto-deny after configurable seconds (prevents hanging)
-- **Rich context** - Shows command, user, process, working directory
-- **Audit logging** - Complete trail of all requests and decisions
-- **Optional allowlist** - Auto-approve known-safe commands (e.g., `brew upgrade`)
-- **Fallback mode** - If the service is down, fall back to local password
-- **Replay attack prevention** - Cryptographic nonces ensure fresh responses
+## Quick Start
 
-## Getting Started
+### Prerequisites
 
-See [agents/ARCHITECTURE.md](agents/ARCHITECTURE.md) for implementation details.
+- Rust toolchain (`cargo`)
+- A Telegram bot (create via [@BotFather](https://t.me/BotFather))
+- Your Telegram chat ID (get from [@userinfobot](https://t.me/userinfobot))
 
-## Security Considerations
+### Build & Install
 
-- Notification channel must be authenticated (prevent spoofing)
-- Nonce-based responses prevent replay attacks
-- Rate limiting prevents denial-of-service
-- All decisions are logged for audit
-- Encryption keys are never stored on notification servers
+```bash
+git clone https://github.com/richardtkemp/ai-sudo.git
+cd ai-sudo
+cargo build --release
 
-## Notification Backend Decisions
+# Install daemon + CLI (default)
+sudo bash setup.sh
 
-See [agents/ARCHITECTURE.md](agents/ARCHITECTURE.md) for detailed analysis of E2E encrypted notification options.
+# Or with PAM module too
+sudo bash setup.sh --pam
+```
 
-**Current Strategy:**
-- **MVP (v1):** Signal Bot API (proven E2E, available now)
-- **Future (v2):** Custom iOS/Android apps with app-level E2E
+### Configure
+
+Edit `/etc/aisudo/aisudo.toml`:
+
+```toml
+socket_path = "/var/run/aisudo/aisudo.sock"
+db_path = "/var/lib/aisudo/aisudo.db"
+timeout_seconds = 900  # 15 minutes
+
+# Commands that auto-approve without notification
+allowlist = [
+    "systemctl status",
+    "journalctl",
+    "df",
+    "du",
+    "apt list",
+    # ... see aisudo.toml for full list
+]
+
+[telegram]
+bot_token = "your-bot-token"
+chat_id = 123456789
+```
+
+### Usage
+
+```bash
+# Basic
+aisudo apt update
+
+# With reason (shown in Telegram notification)
+aisudo -r "checking disk health" smartctl -a /dev/sda
+
+# Allowlisted commands run immediately
+aisudo df -h          # no notification needed
+aisudo journalctl -n 50
+```
+
+## Architecture
+
+- **`aisudo-cli`** — CLI wrapper, connects to daemon via Unix socket
+- **`aisudo-daemon`** — Runs as root, handles approvals, executes commands
+- **`aisudo-common`** — Shared types and protocol
+- **`aisudo-pam`** — Optional PAM module for intercepting native `sudo`
+
+The daemon runs as a systemd service (`aisudo-daemon.service`) and communicates with the CLI over a Unix socket (`/var/run/aisudo/aisudo.sock`). Users must be in the `aisudo` group to connect.
+
+## Security Notes
+
+- Daemon runs as root — it executes approved commands directly
+- Unix socket is `root:aisudo 0660` — only group members can request
+- All requests and decisions are logged to SQLite for audit
+- Telegram notifications are not E2E encrypted — suitable for personal servers, not high-security environments
+- Rate limiting prevents abuse (10 requests/minute/user)
 
 ## License
 
 MIT
+
+## Credits
+
+Forked from [codemonument/ai-sudo](https://github.com/codemonument/ai-sudo). Substantially rewritten with CLI wrapper mode, Telegram backend, and command execution.

@@ -11,8 +11,6 @@ use tokio::sync::{oneshot, Mutex};
 use chrono::Local;
 use tracing::{debug, error, info, warn};
 
-const STDIN_PREVIEW_BYTES: usize = 2048;
-
 pub struct TelegramBackend {
     bot_token: String,
     chat_id: i64,
@@ -25,6 +23,10 @@ pub struct TelegramBackend {
     request_timeout: Duration,
     /// Message ID and original text for the main message with buttons.
     main_message: Arc<Mutex<Option<(i64, String)>>>,
+    /// Max bytes of stdin to show in notification preview.
+    stdin_preview_bytes: usize,
+    /// Timeout in seconds for Telegram long-polling requests.
+    poll_timeout_seconds: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,7 +54,7 @@ struct Message {
 }
 
 impl TelegramBackend {
-    pub fn new(bot_token: String, chat_id: i64, timeout_seconds: u32) -> Self {
+    pub fn new(bot_token: String, chat_id: i64, timeout_seconds: u32, stdin_preview_bytes: usize, poll_timeout_seconds: u32) -> Self {
         let pending = Arc::new(DashMap::new());
         let backend = Self {
             bot_token,
@@ -62,6 +64,8 @@ impl TelegramBackend {
             update_offset: Arc::new(Mutex::new(0)),
             request_timeout: Duration::from_secs(timeout_seconds as u64),
             main_message: Arc::new(Mutex::new(None)),
+            stdin_preview_bytes,
+            poll_timeout_seconds,
         };
         backend
     }
@@ -129,7 +133,7 @@ impl TelegramBackend {
         };
         let stdin_line = match &record.stdin {
             Some(stdin_b64) => {
-                let preview = format_stdin_preview(stdin_b64);
+                let preview = format_stdin_preview(stdin_b64, self.stdin_preview_bytes);
                 format!("\n\n*Stdin:*\n```\n{}\n```", preview)
             }
             None => String::new(),
@@ -243,10 +247,10 @@ impl TelegramBackend {
             .get(self.api_url("getUpdates"))
             .query(&[
                 ("offset", offset.to_string()),
-                ("timeout", "30".to_string()),
+                ("timeout", self.poll_timeout_seconds.to_string()),
                 ("allowed_updates", "[\"callback_query\"]".to_string()),
             ])
-            .timeout(Duration::from_secs(35))
+            .timeout(Duration::from_secs(self.poll_timeout_seconds as u64 + 5))
             .send()
             .await
             .map_err(|e| anyhow!("getUpdates HTTP request failed (offset={}): {e}", offset))?;
@@ -392,7 +396,7 @@ impl NotificationBackend for TelegramBackend {
 }
 
 /// Format a base64-encoded stdin payload for display in a Telegram message.
-fn format_stdin_preview(stdin_b64: &str) -> String {
+fn format_stdin_preview(stdin_b64: &str, max_preview_bytes: usize) -> String {
     let decoded = match base64::engine::general_purpose::STANDARD.decode(stdin_b64) {
         Ok(bytes) => bytes,
         Err(_) => return "[invalid base64]".to_string(),
@@ -403,12 +407,12 @@ fn format_stdin_preview(stdin_b64: &str) -> String {
     }
 
     let text = String::from_utf8_lossy(&decoded);
-    if text.len() <= STDIN_PREVIEW_BYTES {
+    if text.len() <= max_preview_bytes {
         text.to_string()
     } else {
         format!(
             "{}... ({} bytes total, truncated)",
-            &text[..STDIN_PREVIEW_BYTES],
+            &text[..max_preview_bytes],
             decoded.len()
         )
     }
@@ -436,7 +440,7 @@ mod tests {
     fn test_format_stdin_preview_text() {
         let data = b"hello world\nline two\n";
         let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-        let preview = format_stdin_preview(&b64);
+        let preview = format_stdin_preview(&b64, 2048);
         assert_eq!(preview, "hello world\nline two\n");
     }
 
@@ -444,7 +448,7 @@ mod tests {
     fn test_format_stdin_preview_large() {
         let data = "x".repeat(5000);
         let b64 = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
-        let preview = format_stdin_preview(&b64);
+        let preview = format_stdin_preview(&b64, 2048);
         assert!(preview.contains("truncated"));
         assert!(preview.contains("5000 bytes total"));
     }
@@ -453,13 +457,13 @@ mod tests {
     fn test_format_stdin_preview_binary() {
         let data: Vec<u8> = (0..256).map(|i| i as u8).collect();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-        let preview = format_stdin_preview(&b64);
+        let preview = format_stdin_preview(&b64, 2048);
         assert_eq!(preview, "[binary data, 256 bytes]");
     }
 
     #[test]
     fn test_format_stdin_preview_invalid_base64() {
-        let preview = format_stdin_preview("not-valid-base64!!!");
+        let preview = format_stdin_preview("not-valid-base64!!!", 2048);
         assert_eq!(preview, "[invalid base64]");
     }
 

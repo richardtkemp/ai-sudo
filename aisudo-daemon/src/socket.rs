@@ -44,10 +44,11 @@ pub async fn run_socket_listener(
                 let backend = Arc::clone(&backend);
                 let timeout = config.timeout_seconds;
                 let allowlist = config.allowlist.clone();
+                let max_stdin_bytes = config.limits.max_stdin_bytes;
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(stream, db, backend, timeout, &allowlist).await
+                        handle_connection(stream, db, backend, timeout, &allowlist, max_stdin_bytes).await
                     {
                         error!("Connection handler error: {e:#}");
                     }
@@ -66,9 +67,10 @@ async fn handle_connection(
     backend: Arc<dyn NotificationBackend>,
     timeout_seconds: u32,
     allowlist: &[String],
+    max_stdin_bytes: usize,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let result = handle_request(reader, &mut writer, db, backend, timeout_seconds, allowlist).await;
+    let result = handle_request(reader, &mut writer, db, backend, timeout_seconds, allowlist, max_stdin_bytes).await;
     if let Err(ref e) = result {
         // Try to send the error back to the client so it doesn't just see "connection closed"
         error!("Request handling error: {e:#}");
@@ -92,6 +94,7 @@ async fn handle_request(
     backend: Arc<dyn NotificationBackend>,
     timeout_seconds: u32,
     allowlist: &[String],
+    max_stdin_bytes: usize,
 ) -> Result<()> {
     let mut reader = BufReader::new(reader);
 
@@ -112,6 +115,27 @@ async fn handle_request(
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(stdin_b64)
             .map_err(|e| anyhow::anyhow!("invalid stdin encoding: {e}"))?;
+        if decoded.len() > max_stdin_bytes {
+            warn!(
+                "stdin too large: {} bytes (max {})",
+                decoded.len(),
+                max_stdin_bytes
+            );
+            let response = SudoResponse {
+                request_id: String::new(),
+                decision: Decision::Denied,
+                error: Some(format!(
+                    "stdin exceeds size limit ({} bytes, max {})",
+                    decoded.len(),
+                    max_stdin_bytes
+                )),
+            };
+            let resp_json = serde_json::to_string(&response)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
         info!("Request includes stdin: {} bytes", decoded.len());
         Some(decoded)
     } else {
@@ -368,7 +392,7 @@ mod tests {
 
         // Spawn the daemon handler
         let handler = tokio::spawn(async move {
-            handle_connection(server, db_clone, backend, 60, &[]).await
+            handle_connection(server, db_clone, backend, 60, &[], 10 * 1024 * 1024).await
         });
 
         // Client side: send a request that should be rate-limited

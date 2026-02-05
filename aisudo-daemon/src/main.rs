@@ -36,6 +36,8 @@ async fn main() -> Result<()> {
                 tg_config.bot_token.clone(),
                 tg_config.chat_id,
                 config.timeout_seconds,
+                config.limits.stdin_preview_bytes,
+                tg_config.poll_timeout_seconds,
             ));
             telegram.validate_bot_token().await;
             telegram.start_polling();

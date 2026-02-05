@@ -224,7 +224,7 @@ async fn handle_sudo_request(
         writer.write_all(b"\n").await?;
 
         if mode == RequestMode::Exec {
-            exec_command(&command, &cwd, stdin_bytes, writer).await?;
+            exec_command(&command, &cwd, stdin_bytes, writer, false).await?;
         }
         return Ok(());
     }
@@ -245,7 +245,7 @@ async fn handle_sudo_request(
         writer.write_all(b"\n").await?;
 
         if mode == RequestMode::Exec {
-            exec_command(&command, &cwd, stdin_bytes, writer).await?;
+            exec_command(&command, &cwd, stdin_bytes, writer, false).await?;
         }
         return Ok(());
     }
@@ -319,9 +319,9 @@ async fn handle_sudo_request(
     writer.write_all(resp_json.as_bytes()).await?;
     writer.write_all(b"\n").await?;
 
-    // If exec mode and approved, execute the command and stream output
+    // If exec mode and approved, execute via shell (human approved the exact command)
     if mode == RequestMode::Exec && decision == Decision::Approved {
-        exec_command(&command, &cwd, stdin_bytes, writer).await?;
+        exec_command(&command, &cwd, stdin_bytes, writer, true).await?;
     }
 
     Ok(())
@@ -493,20 +493,36 @@ async fn handle_list_rules(
     Ok(())
 }
 
-/// Execute a command as root and stream stdout/stderr back over the socket.
+/// Execute a command and stream stdout/stderr back over the socket.
+///
+/// When `use_shell` is true, the command is passed to `sh -c` (for human-approved commands).
+/// When `use_shell` is false, the command is split on whitespace and exec'd directly
+/// without a shell, so metacharacters like `;`, `|`, `$()` are not interpreted.
+/// This is used for auto-approved (allowlist/temp rule) commands.
 async fn exec_command(
     command: &str,
     cwd: &str,
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
+    use_shell: bool,
 ) -> Result<()> {
     use tokio::process::Command;
 
-    info!("Executing command: {command}");
+    info!("Executing command (shell={}): {command}", use_shell);
 
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    let mut cmd = if use_shell {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    } else {
+        let mut parts = command.split_whitespace();
+        let binary = parts.next().ok_or_else(|| anyhow::anyhow!("empty command"))?;
+        let mut c = Command::new(binary);
+        c.args(parts);
+        c
+    };
+
+    let mut child = cmd
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

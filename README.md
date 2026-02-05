@@ -95,6 +95,33 @@ aisudo df -h          # no notification needed
 aisudo journalctl -n 50
 ```
 
+## Shell Operators in Auto-Approved Commands
+
+Auto-approved commands (via allowlist or temp rules) support shell operators like pipes and chaining. Each sub-command is validated individually against the allowlist — all must match for the command to be auto-approved.
+
+```bash
+# Both 'apt list' and 'grep' must be in the allowlist:
+aisudo 'apt list --installed | grep vim'
+
+# Sequential execution — both must be allowed:
+aisudo 'apt list ; dpkg -l'
+
+# Conditional chains:
+aisudo 'apt list && echo ok || echo fail'
+```
+
+**Supported operators:** `;` (sequential), `&&` (and), `||` (or), `|` (pipe)
+
+**Rejected syntax** (denied immediately if found unquoted):
+- `$`, `` ` `` — variable expansion, command substitution
+- `(`, `)` — subshells
+- `>`, `<` — redirections
+- Bare `&` — background execution
+
+Quoting (single or double) suppresses operator detection, so `echo "hello; world"` is treated as a single command.
+
+Commands approved via Telegram (human-approved) continue to use `sh -c` and support all shell syntax — this restriction only applies to auto-approved commands.
+
 ## Architecture
 
 - **`aisudo-cli`** — CLI wrapper, connects to daemon via Unix socket

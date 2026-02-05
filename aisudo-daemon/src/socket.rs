@@ -4,6 +4,7 @@ use aisudo_common::{
 };
 use anyhow::Result;
 use base64::Engine as _;
+use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,6 +15,213 @@ use crate::config::ConfigHolder;
 use crate::db::Database;
 use crate::notification::{NotificationBackend, TempRuleRecord};
 use crate::sudoers::SudoersCache;
+
+/// Operator connecting two commands in a chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainOp {
+    /// First command in the chain (no preceding operator).
+    First,
+    /// `;` — sequential, ignore exit code.
+    Semi,
+    /// `&&` — run next only if previous succeeded.
+    And,
+    /// `||` — run next only if previous failed.
+    Or,
+    /// `|` — pipe stdout of previous to stdin of next.
+    Pipe,
+}
+
+/// A single command segment in a parsed chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainSegment {
+    /// The raw command string (trimmed).
+    command: String,
+    /// How this segment connects to the previous one.
+    op: ChainOp,
+}
+
+/// Parse a command string into a chain of segments split on unquoted operators.
+///
+/// Supports: `;`, `&&`, `||`, `|`
+/// Rejects (unquoted): `$`, `` ` ``, `(`, `)`, `>`, `<`, `\n`, bare `&`
+///
+/// Single and double quotes suppress operator/metacharacter detection.
+/// Backslash escapes inside double quotes.
+fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut segments: Vec<ChainSegment> = Vec::new();
+    let mut current = String::new();
+    let mut current_op = ChainOp::First;
+    let mut i = 0;
+
+    // Quote state
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while i < len {
+        let c = chars[i];
+
+        // Handle escape inside double quotes
+        if in_double_quote && c == '\\' && i + 1 < len {
+            current.push(c);
+            current.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+
+        // Toggle single quote (not inside double quotes)
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            current.push(c);
+            i += 1;
+            continue;
+        }
+
+        // Toggle double quote (not inside single quotes)
+        if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            current.push(c);
+            i += 1;
+            continue;
+        }
+
+        // Inside quotes, everything is literal
+        if in_single_quote || in_double_quote {
+            current.push(c);
+            i += 1;
+            continue;
+        }
+
+        // --- Outside quotes: check for rejected metacharacters ---
+        match c {
+            '$' => return Err("rejected: unquoted '$' (variable expansion/command substitution)".to_string()),
+            '`' => return Err("rejected: unquoted '`' (backtick command substitution)".to_string()),
+            '(' => return Err("rejected: unquoted '(' (subshell/grouping)".to_string()),
+            ')' => return Err("rejected: unquoted ')' (subshell/grouping)".to_string()),
+            '>' => return Err("rejected: unquoted '>' (redirection)".to_string()),
+            '<' => return Err("rejected: unquoted '<' (redirection)".to_string()),
+            '\n' => return Err("rejected: unquoted newline".to_string()),
+            _ => {}
+        }
+
+        // Check for operators: &&, ||, ;, |, bare &
+        if c == '&' {
+            if i + 1 < len && chars[i + 1] == '&' {
+                // && operator
+                let cmd = current.trim().to_string();
+                if cmd.is_empty() {
+                    return Err("empty command before '&&'".to_string());
+                }
+                segments.push(ChainSegment { command: cmd, op: current_op });
+                current_op = ChainOp::And;
+                current.clear();
+                i += 2;
+                continue;
+            } else {
+                // Bare & (background) — rejected
+                return Err("rejected: unquoted '&' (background execution)".to_string());
+            }
+        }
+
+        if c == '|' {
+            if i + 1 < len && chars[i + 1] == '|' {
+                // || operator
+                let cmd = current.trim().to_string();
+                if cmd.is_empty() {
+                    return Err("empty command before '||'".to_string());
+                }
+                segments.push(ChainSegment { command: cmd, op: current_op });
+                current_op = ChainOp::Or;
+                current.clear();
+                i += 2;
+                continue;
+            } else {
+                // | pipe operator
+                let cmd = current.trim().to_string();
+                if cmd.is_empty() {
+                    return Err("empty command before '|'".to_string());
+                }
+                segments.push(ChainSegment { command: cmd, op: current_op });
+                current_op = ChainOp::Pipe;
+                current.clear();
+                i += 1;
+                continue;
+            }
+        }
+
+        if c == ';' {
+            let cmd = current.trim().to_string();
+            if cmd.is_empty() {
+                return Err("empty command before ';'".to_string());
+            }
+            segments.push(ChainSegment { command: cmd, op: current_op });
+            current_op = ChainOp::Semi;
+            current.clear();
+            i += 1;
+            continue;
+        }
+
+        current.push(c);
+        i += 1;
+    }
+
+    // Check for unterminated quotes
+    if in_single_quote {
+        return Err("unterminated single quote".to_string());
+    }
+    if in_double_quote {
+        return Err("unterminated double quote".to_string());
+    }
+
+    // Push the last segment
+    let cmd = current.trim().to_string();
+    if cmd.is_empty() {
+        if segments.is_empty() {
+            return Err("empty command".to_string());
+        }
+        return Err(format!("empty command after '{}'", match current_op {
+            ChainOp::Semi => ";",
+            ChainOp::And => "&&",
+            ChainOp::Or => "||",
+            ChainOp::Pipe => "|",
+            ChainOp::First => "",
+        }));
+    }
+    segments.push(ChainSegment { command: cmd, op: current_op });
+
+    Ok(segments)
+}
+
+/// Check if a single (non-chained) command is allowed by the allowlist.
+fn is_single_command_allowed(command: &str, allowlist: &[String]) -> bool {
+    for pattern in allowlist {
+        if command == pattern {
+            return true;
+        }
+        if command.starts_with(pattern.as_str()) && command.as_bytes().get(pattern.len()) == Some(&b' ') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a single (non-chained) command is allowed by temp rules.
+fn is_single_command_temp_rule_allowed(command: &str, rules: &[Vec<String>]) -> bool {
+    for patterns in rules {
+        for pattern in patterns {
+            if command == pattern.as_str() {
+                return true;
+            }
+            if command.starts_with(pattern.as_str())
+                && command.as_bytes().get(pattern.len()) == Some(&b' ')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 pub async fn run_socket_listener(
     config_holder: Arc<ConfigHolder>,
@@ -224,7 +432,9 @@ async fn handle_sudo_request(
         writer.write_all(b"\n").await?;
 
         if mode == RequestMode::Exec {
-            exec_command(&command, &cwd, stdin_bytes, writer, false).await?;
+            let segments = parse_command_chain(&command)
+                .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+            exec_command_chain(&segments, &cwd, stdin_bytes, writer).await?;
         }
         return Ok(());
     }
@@ -245,7 +455,9 @@ async fn handle_sudo_request(
         writer.write_all(b"\n").await?;
 
         if mode == RequestMode::Exec {
-            exec_command(&command, &cwd, stdin_bytes, writer, false).await?;
+            let segments = parse_command_chain(&command)
+                .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+            exec_command_chain(&segments, &cwd, stdin_bytes, writer).await?;
         }
         return Ok(());
     }
@@ -328,23 +540,19 @@ async fn handle_sudo_request(
 }
 
 fn is_temp_rule_allowed(db: &Database, user: &str, command: &str) -> Result<bool> {
-    let rules = db.get_active_temp_rules(user)?;
-    for patterns_json in &rules {
+    // Try parsing as a command chain. If parsing fails, deny.
+    let segments = match parse_command_chain(command) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let rules_json = db.get_active_temp_rules(user)?;
+    let mut all_rules: Vec<Vec<String>> = Vec::new();
+    for patterns_json in &rules_json {
         let patterns: Vec<String> = serde_json::from_str(patterns_json)?;
-        for pattern in &patterns {
-            if command == pattern.as_str() {
-                return Ok(true);
-            }
-            // Allow the command if it starts with the pattern followed by a space.
-            // This prevents shell injection via metacharacters appended to the prefix.
-            if command.starts_with(pattern.as_str())
-                && command.as_bytes().get(pattern.len()) == Some(&b' ')
-            {
-                return Ok(true);
-            }
-        }
+        all_rules.push(patterns);
     }
-    Ok(false)
+    // Every sub-command must match at least one temp rule pattern.
+    Ok(segments.iter().all(|seg| is_single_command_temp_rule_allowed(&seg.command, &all_rules)))
 }
 
 async fn handle_temp_rule_request(
@@ -631,19 +839,384 @@ async fn exec_command(
     Ok(())
 }
 
-fn is_allowed(command: &str, allowlist: &[String]) -> bool {
-    for pattern in allowlist {
-        if command == pattern {
-            return true;
+/// Split a single command string into argv, respecting single and double quotes.
+/// This is used for direct exec (no shell) of individual commands in a chain.
+fn split_command_argv(command: &str) -> Result<Vec<String>> {
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = command.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while i < len {
+        let c = chars[i];
+
+        if in_single_quote {
+            if c == '\'' {
+                in_single_quote = false;
+            } else {
+                current.push(c);
+            }
+            i += 1;
+            continue;
         }
-        // Allow the command if it starts with the pattern followed by a space
-        // (i.e. the pattern matches the command name and the rest are arguments).
-        // This prevents shell injection like "apt list; rm -rf /" matching "apt list".
-        if command.starts_with(pattern) && command.as_bytes().get(pattern.len()) == Some(&b' ') {
-            return true;
+
+        if in_double_quote {
+            if c == '\\' && i + 1 < len {
+                let next = chars[i + 1];
+                match next {
+                    '"' | '\\' => {
+                        current.push(next);
+                        i += 2;
+                        continue;
+                    }
+                    _ => {
+                        current.push(c);
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            if c == '"' {
+                in_double_quote = false;
+            } else {
+                current.push(c);
+            }
+            i += 1;
+            continue;
+        }
+
+        match c {
+            '\'' => in_single_quote = true,
+            '"' => in_double_quote = true,
+            ' ' | '\t' => {
+                if !current.is_empty() {
+                    args.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => current.push(c),
+        }
+        i += 1;
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    if args.is_empty() {
+        return Err(anyhow::anyhow!("empty command"));
+    }
+
+    Ok(args)
+}
+
+/// Execute a parsed command chain without a shell.
+///
+/// Handles `;` (sequential), `&&` (and), `||` (or), and `|` (pipe) operators.
+/// Each individual command is exec'd directly — no shell interpretation.
+/// Output is streamed back to the client via ExecOutput JSON lines.
+async fn exec_command_chain(
+    segments: &[ChainSegment],
+    cwd: &str,
+    stdin_bytes: Option<Vec<u8>>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    info!("Executing command chain ({} segments)", segments.len());
+
+    let mut last_exit_code: i32 = 0;
+    let mut i = 0;
+
+    while i < segments.len() {
+        let seg = &segments[i];
+
+        // Check conditional operators
+        match seg.op {
+            ChainOp::And => {
+                if last_exit_code != 0 {
+                    // Skip this command (and any following pipe group)
+                    i = skip_pipe_group(segments, i);
+                    continue;
+                }
+            }
+            ChainOp::Or => {
+                if last_exit_code == 0 {
+                    i = skip_pipe_group(segments, i);
+                    continue;
+                }
+            }
+            ChainOp::First | ChainOp::Semi | ChainOp::Pipe => {}
+        }
+
+        // Collect a pipe group: consecutive segments connected by Pipe
+        let pipe_start = i;
+        let mut pipe_end = i + 1;
+        while pipe_end < segments.len() && segments[pipe_end].op == ChainOp::Pipe {
+            pipe_end += 1;
+        }
+        let pipe_group = &segments[pipe_start..pipe_end];
+
+        if pipe_group.len() == 1 {
+            // Single command — no piping needed
+            last_exit_code = exec_single_command(
+                &pipe_group[0].command,
+                cwd,
+                if i == 0 { stdin_bytes.clone() } else { None },
+                writer,
+            ).await?;
+        } else {
+            // Pipeline: connect stdout→stdin between stages
+            last_exit_code = exec_pipeline(
+                pipe_group,
+                cwd,
+                if i == 0 { stdin_bytes.clone() } else { None },
+                writer,
+            ).await?;
+        }
+
+        i = pipe_end;
+    }
+
+    // Send final exit code
+    let exit_msg = ExecOutput {
+        stream: "exit".to_string(),
+        data: String::new(),
+        exit_code: Some(last_exit_code),
+    };
+    let json = serde_json::to_string(&exit_msg)?;
+    writer.write_all(json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    Ok(())
+}
+
+/// Skip past a pipe group starting at index `start`.
+/// Returns the index of the next segment after the pipe group.
+fn skip_pipe_group(segments: &[ChainSegment], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < segments.len() && segments[i].op == ChainOp::Pipe {
+        i += 1;
+    }
+    i
+}
+
+/// Execute a single command (no piping), streaming output back to the writer.
+/// Returns the exit code.
+async fn exec_single_command(
+    command: &str,
+    cwd: &str,
+    stdin_bytes: Option<Vec<u8>>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+) -> Result<i32> {
+    use tokio::process::Command;
+
+    let argv = split_command_argv(command)?;
+    let mut cmd = Command::new(&argv[0]);
+    if argv.len() > 1 {
+        cmd.args(&argv[1..]);
+    }
+
+    let mut child = cmd
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(if stdin_bytes.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .spawn()?;
+
+    if let Some(data) = stdin_bytes {
+        if let Some(mut stdin_pipe) = child.stdin.take() {
+            tokio::spawn(async move {
+                let _ = stdin_pipe.write_all(&data).await;
+            });
         }
     }
-    false
+
+    stream_child_output(&mut child, writer).await
+}
+
+/// Execute a pipeline of commands, connecting stdout→stdin between stages.
+/// Streams the last command's stdout/stderr back to the writer.
+/// Returns the last command's exit code.
+async fn exec_pipeline(
+    segments: &[ChainSegment],
+    cwd: &str,
+    stdin_bytes: Option<Vec<u8>>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+) -> Result<i32> {
+    use std::os::unix::io::FromRawFd;
+    use tokio::process::Command;
+
+    let mut children: Vec<tokio::process::Child> = Vec::new();
+    // The read-end fd from the previous stage's pipe, to be used as stdin for the next.
+    let mut prev_read_fd: Option<std::os::unix::io::RawFd> = None;
+
+    for (idx, seg) in segments.iter().enumerate() {
+        let argv = split_command_argv(&seg.command)?;
+        let mut cmd = Command::new(&argv[0]);
+        if argv.len() > 1 {
+            cmd.args(&argv[1..]);
+        }
+
+        let is_last = idx == segments.len() - 1;
+
+        // Configure stdin
+        let stdin_cfg = if let Some(fd) = prev_read_fd.take() {
+            // Safety: fd is a valid open file descriptor from pipe() that we own.
+            unsafe { std::process::Stdio::from_raw_fd(fd) }
+        } else if idx == 0 && stdin_bytes.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        };
+
+        // Configure stdout: create an OS pipe for intermediate stages
+        let stdout_cfg = if is_last {
+            std::process::Stdio::piped()
+        } else {
+            let (read_fd, write_fd) = nix::unistd::pipe()?;
+            prev_read_fd = Some(read_fd.into_raw_fd());
+            // Safety: write_fd is a valid open file descriptor from pipe() that we own.
+            unsafe { std::process::Stdio::from_raw_fd(write_fd.into_raw_fd()) }
+        };
+
+        let mut child = cmd
+            .current_dir(cwd)
+            .stdin(stdin_cfg)
+            .stdout(stdout_cfg)
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        // Feed stdin_bytes to the first process
+        if idx == 0 {
+            if let Some(ref data) = stdin_bytes {
+                if let Some(mut stdin_pipe) = child.stdin.take() {
+                    let data = data.clone();
+                    tokio::spawn(async move {
+                        let _ = stdin_pipe.write_all(&data).await;
+                    });
+                }
+            }
+        }
+
+        // Drain intermediate stderr so pipes don't block
+        if !is_last {
+            if let Some(stderr) = child.stderr.take() {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut reader = BufReader::new(stderr);
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        }
+
+        children.push(child);
+    }
+
+    // Stream output from the last child
+    let last_idx = children.len() - 1;
+    let last_child = &mut children[last_idx];
+    let exit_code = stream_child_output(last_child, writer).await?;
+
+    // Wait for all children to finish
+    for child in children.iter_mut() {
+        let _ = child.wait().await;
+    }
+
+    Ok(exit_code)
+}
+
+/// Stream stdout/stderr from a child process to the writer, then wait for exit.
+/// Returns the exit code.
+async fn stream_child_output(
+    child: &mut tokio::process::Child,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+) -> Result<i32> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ExecOutput>(64);
+
+    if let Some(stdout) = stdout {
+        let tx_out = tx.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut reader = BufReader::new(stdout);
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let _ = tx_out.send(ExecOutput {
+                            stream: "stdout".to_string(),
+                            data,
+                            exit_code: None,
+                        }).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    if let Some(stderr) = stderr {
+        let tx_err = tx.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut reader = BufReader::new(stderr);
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let _ = tx_err.send(ExecOutput {
+                            stream: "stderr".to_string(),
+                            data,
+                            exit_code: None,
+                        }).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    drop(tx);
+
+    while let Some(output) = rx.recv().await {
+        let json = serde_json::to_string(&output)?;
+        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+    }
+
+    let status = child.wait().await?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn is_allowed(command: &str, allowlist: &[String]) -> bool {
+    // Try parsing as a command chain. If parsing fails (rejected metacharacters,
+    // unterminated quotes, etc.), deny the command.
+    let segments = match parse_command_chain(command) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // Every sub-command must match the allowlist.
+    segments.iter().all(|seg| is_single_command_allowed(&seg.command, allowlist))
 }
 
 #[cfg(test)]
@@ -1187,6 +1760,297 @@ mod tests {
         assert!(!is_temp_rule_allowed(&db, "bob", "apt install vim").unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===== parse_command_chain tests =====
+
+    #[test]
+    fn parse_single_command() {
+        let result = parse_command_chain("apt list").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].command, "apt list");
+        assert_eq!(result[0].op, ChainOp::First);
+    }
+
+    #[test]
+    fn parse_semicolon_chain() {
+        let result = parse_command_chain("apt list ; dpkg -l").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].command, "apt list");
+        assert_eq!(result[0].op, ChainOp::First);
+        assert_eq!(result[1].command, "dpkg -l");
+        assert_eq!(result[1].op, ChainOp::Semi);
+    }
+
+    #[test]
+    fn parse_pipe_chain() {
+        let result = parse_command_chain("apt list | grep vim").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].command, "apt list");
+        assert_eq!(result[0].op, ChainOp::First);
+        assert_eq!(result[1].command, "grep vim");
+        assert_eq!(result[1].op, ChainOp::Pipe);
+    }
+
+    #[test]
+    fn parse_and_or_chain() {
+        let result = parse_command_chain("apt list && echo ok || echo fail").unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].command, "apt list");
+        assert_eq!(result[0].op, ChainOp::First);
+        assert_eq!(result[1].command, "echo ok");
+        assert_eq!(result[1].op, ChainOp::And);
+        assert_eq!(result[2].command, "echo fail");
+        assert_eq!(result[2].op, ChainOp::Or);
+    }
+
+    #[test]
+    fn parse_semicolon_inside_double_quotes() {
+        let result = parse_command_chain(r#"echo "hello; world""#).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].command, r#"echo "hello; world""#);
+    }
+
+    #[test]
+    fn parse_operators_inside_single_quotes() {
+        let result = parse_command_chain("echo 'a && b'").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].command, "echo 'a && b'");
+    }
+
+    #[test]
+    fn parse_pipe_inside_double_quotes() {
+        let result = parse_command_chain(r#"echo "a | b""#).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].command, r#"echo "a | b""#);
+    }
+
+    #[test]
+    fn parse_rejects_dollar_sign() {
+        let err = parse_command_chain("apt list$(rm -rf /)").unwrap_err();
+        assert!(err.contains("$"), "error should mention $: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_redirect() {
+        let err = parse_command_chain("apt list > /tmp/out").unwrap_err();
+        assert!(err.contains(">"), "error should mention >: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_input_redirect() {
+        let err = parse_command_chain("cat < /etc/passwd").unwrap_err();
+        assert!(err.contains("<"), "error should mention <: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_bare_ampersand() {
+        let err = parse_command_chain("apt list & echo bg").unwrap_err();
+        assert!(err.contains("&"), "error should mention &: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_backtick() {
+        let err = parse_command_chain("apt list `whoami`").unwrap_err();
+        assert!(err.contains("`"), "error should mention backtick: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_subshell() {
+        let err = parse_command_chain("(apt list)").unwrap_err();
+        assert!(err.contains("("), "error should mention (: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_newline() {
+        let err = parse_command_chain("apt list\nrm -rf /").unwrap_err();
+        assert!(err.contains("newline"), "error should mention newline: {err}");
+    }
+
+    #[test]
+    fn parse_dollar_inside_single_quotes_is_ok() {
+        // Single quotes suppress metacharacter detection
+        let result = parse_command_chain("echo '$HOME'").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].command, "echo '$HOME'");
+    }
+
+    #[test]
+    fn parse_dollar_inside_double_quotes_is_ok() {
+        // $ inside double quotes is treated as literal since we exec directly
+        // without a shell — no variable expansion happens.
+        let result = parse_command_chain(r#"echo "$HOME""#).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn parse_backslash_escape_in_double_quotes() {
+        let result = parse_command_chain(r#"echo "hello\"world""#).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn parse_empty_command_error() {
+        assert!(parse_command_chain("").is_err());
+        assert!(parse_command_chain("   ").is_err());
+    }
+
+    #[test]
+    fn parse_trailing_operator_error() {
+        assert!(parse_command_chain("apt list ;").is_err());
+        assert!(parse_command_chain("apt list &&").is_err());
+        assert!(parse_command_chain("apt list |").is_err());
+    }
+
+    #[test]
+    fn parse_unterminated_quote_error() {
+        assert!(parse_command_chain("echo 'hello").is_err());
+        assert!(parse_command_chain(r#"echo "hello"#).is_err());
+    }
+
+    #[test]
+    fn parse_multi_pipe_chain() {
+        let result = parse_command_chain("cat /etc/hosts | grep local | wc -l").unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].op, ChainOp::First);
+        assert_eq!(result[1].op, ChainOp::Pipe);
+        assert_eq!(result[2].op, ChainOp::Pipe);
+    }
+
+    #[test]
+    fn parse_mixed_operators() {
+        let result = parse_command_chain("apt update ; apt list | grep vim && echo done").unwrap();
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].command, "apt update");
+        assert_eq!(result[0].op, ChainOp::First);
+        assert_eq!(result[1].command, "apt list");
+        assert_eq!(result[1].op, ChainOp::Semi);
+        assert_eq!(result[2].command, "grep vim");
+        assert_eq!(result[2].op, ChainOp::Pipe);
+        assert_eq!(result[3].command, "echo done");
+        assert_eq!(result[3].op, ChainOp::And);
+    }
+
+    // ===== is_allowed with chains =====
+
+    #[test]
+    fn is_allowed_pipe_chain_all_allowed() {
+        let allowlist = vec!["apt list".to_string(), "grep".to_string()];
+        assert!(is_allowed("apt list | grep vim", &allowlist));
+    }
+
+    #[test]
+    fn is_allowed_pipe_chain_one_denied() {
+        let allowlist = vec!["apt list".to_string()];
+        assert!(!is_allowed("apt list | rm -rf /", &allowlist));
+    }
+
+    #[test]
+    fn is_allowed_semicolon_chain_all_allowed() {
+        let allowlist = vec!["apt list".to_string(), "dpkg -l".to_string()];
+        assert!(is_allowed("apt list ; dpkg -l", &allowlist));
+    }
+
+    #[test]
+    fn is_allowed_semicolon_chain_one_denied() {
+        let allowlist = vec!["apt list".to_string()];
+        assert!(!is_allowed("apt list ; rm -rf /", &allowlist));
+    }
+
+    #[test]
+    fn is_allowed_and_chain() {
+        let allowlist = vec!["apt list".to_string(), "echo".to_string()];
+        assert!(is_allowed("apt list && echo ok", &allowlist));
+    }
+
+    #[test]
+    fn is_allowed_or_chain() {
+        let allowlist = vec!["apt list".to_string(), "echo".to_string()];
+        assert!(is_allowed("apt list || echo fail", &allowlist));
+    }
+
+    #[test]
+    fn is_allowed_rejects_dangerous_metacharacters() {
+        let allowlist = vec!["apt list".to_string()];
+        // $ is rejected by the parser
+        assert!(!is_allowed("apt list$(rm -rf /)", &allowlist));
+        // > is rejected by the parser
+        assert!(!is_allowed("apt list > /tmp/out", &allowlist));
+        // backtick is rejected
+        assert!(!is_allowed("apt list `whoami`", &allowlist));
+    }
+
+    // ===== is_temp_rule_allowed with chains =====
+
+    #[test]
+    fn temp_rule_pipe_chain_all_allowed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Database::open(&dir.path().join("test.db")).unwrap();
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["apt list", "grep"]).unwrap();
+        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+
+        assert!(is_temp_rule_allowed(&db, "alice", "apt list | grep vim").unwrap());
+    }
+
+    #[test]
+    fn temp_rule_pipe_chain_one_denied() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Database::open(&dir.path().join("test.db")).unwrap();
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["apt list"]).unwrap();
+        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+
+        assert!(!is_temp_rule_allowed(&db, "alice", "apt list | rm -rf /").unwrap());
+    }
+
+    #[test]
+    fn temp_rule_semicolon_chain_all_allowed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Database::open(&dir.path().join("test.db")).unwrap();
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["apt list", "dpkg -l"]).unwrap();
+        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+
+        assert!(is_temp_rule_allowed(&db, "alice", "apt list ; dpkg -l").unwrap());
+    }
+
+    // ===== split_command_argv tests =====
+
+    #[test]
+    fn split_argv_simple() {
+        let result = split_command_argv("apt list --installed").unwrap();
+        assert_eq!(result, vec!["apt", "list", "--installed"]);
+    }
+
+    #[test]
+    fn split_argv_single_quotes() {
+        let result = split_command_argv("echo 'hello world'").unwrap();
+        assert_eq!(result, vec!["echo", "hello world"]);
+    }
+
+    #[test]
+    fn split_argv_double_quotes() {
+        let result = split_command_argv(r#"echo "hello world""#).unwrap();
+        assert_eq!(result, vec!["echo", "hello world"]);
+    }
+
+    #[test]
+    fn split_argv_escape_in_double_quotes() {
+        let result = split_command_argv(r#"echo "hello\"world""#).unwrap();
+        assert_eq!(result, vec!["echo", r#"hello"world"#]);
+    }
+
+    #[test]
+    fn split_argv_empty() {
+        assert!(split_command_argv("").is_err());
+        assert!(split_command_argv("   ").is_err());
     }
 }
 

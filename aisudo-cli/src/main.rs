@@ -14,15 +14,16 @@ const MAX_STDIN_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 2 {
+    if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
         eprintln!("       aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
-        eprintln!("       aisudo --list-rules");
+        eprintln!("       aisudo -l | --list-rules");
+        eprintln!("       aisudo -h | --help");
         return ExitCode::from(1);
     }
 
-    // Check for --list-rules mode
-    if args.iter().any(|a| a == "--list-rules") {
+    // Check for --list-rules / -l mode
+    if args.iter().any(|a| a == "--list-rules" || a == "-l") {
         return handle_list_rules();
     }
 
@@ -40,6 +41,18 @@ fn main() -> ExitCode {
 
     if cmd_start >= args.len() {
         eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
+        eprintln!("       aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
+        eprintln!("       aisudo -l | --list-rules");
+        eprintln!("       aisudo -h | --help");
+        return ExitCode::from(1);
+    }
+
+    if args[cmd_start].starts_with('-') {
+        eprintln!("aisudo: unrecognized option '{}'", args[cmd_start]);
+        eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
+        eprintln!("       aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
+        eprintln!("       aisudo -l | --list-rules");
+        eprintln!("       aisudo -h | --help");
         return ExitCode::from(1);
     }
 

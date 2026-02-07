@@ -33,13 +33,16 @@ async fn main() -> Result<()> {
             if tg_config.chat_id == 0 {
                 warn!("Telegram chat_id is 0 — this is almost certainly wrong. Set chat_id in config.");
             }
-            let telegram = Arc::new(TelegramBackend::new(
+            let mut tg = TelegramBackend::new(
                 tg_config.bot_token.clone(),
                 tg_config.chat_id,
                 config.timeout_seconds,
                 config.limits.stdin_preview_bytes,
                 tg_config.poll_timeout_seconds,
-            ));
+                tg_config.message_template.clone(),
+            );
+            tg.validate_template();
+            let telegram = Arc::new(tg);
             telegram.validate_bot_token().await;
             telegram.start_polling();
             info!("Telegram notification backend enabled (chat_id: {})", tg_config.chat_id);

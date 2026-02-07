@@ -11,6 +11,15 @@ use tokio::sync::{oneshot, Mutex};
 use chrono::Local;
 use tracing::{debug, error, info, warn};
 
+/// Default message template matching the original hardcoded format.
+const DEFAULT_TEMPLATE: &str = "\u{1f510} *Sudo Request*\n\n\
+    *User:* `{{user}}`\n\
+    *Command:* `{{command}}`\n\
+    *CWD:* `{{directory}}`\n\
+    *PID:* `{{pid}}`\n\
+    *Request ID:* `{{request_id}}`\n\
+    *Timeout:* {{timeout}}s{{reason}}{{stdin}}";
+
 pub struct TelegramBackend {
     bot_token: String,
     chat_id: i64,
@@ -27,6 +36,8 @@ pub struct TelegramBackend {
     stdin_preview_bytes: usize,
     /// Timeout in seconds for Telegram long-polling requests.
     poll_timeout_seconds: u32,
+    /// Custom message template for sudo approval requests (None = use default).
+    message_template: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,7 +71,14 @@ struct Message {
 }
 
 impl TelegramBackend {
-    pub fn new(bot_token: String, chat_id: i64, timeout_seconds: u32, stdin_preview_bytes: usize, poll_timeout_seconds: u32) -> Self {
+    pub fn new(
+        bot_token: String,
+        chat_id: i64,
+        timeout_seconds: u32,
+        stdin_preview_bytes: usize,
+        poll_timeout_seconds: u32,
+        message_template: Option<String>,
+    ) -> Self {
         Self {
             bot_token,
             chat_id,
@@ -71,6 +89,32 @@ impl TelegramBackend {
             message_map: Arc::new(DashMap::new()),
             stdin_preview_bytes,
             poll_timeout_seconds,
+            message_template,
+        }
+    }
+
+    /// Validate the configured message template on startup.
+    /// Logs an error and resets to default if {{user}} or {{command}} are missing.
+    pub fn validate_template(&mut self) {
+        if let Some(ref tmpl) = self.message_template {
+            let missing_user = !tmpl.contains("{{user}}");
+            let missing_command = !tmpl.contains("{{command}}");
+            if missing_user || missing_command {
+                let mut missing = Vec::new();
+                if missing_user {
+                    missing.push("{{user}}");
+                }
+                if missing_command {
+                    missing.push("{{command}}");
+                }
+                error!(
+                    "message_template is missing required variable(s): {}. Using default template.",
+                    missing.join(", ")
+                );
+                self.message_template = None;
+            } else {
+                info!("Custom message template loaded");
+            }
         }
     }
 
@@ -131,26 +175,10 @@ impl TelegramBackend {
 
     async fn send_message(&self, record: &SudoRequestRecord) -> Result<i64> {
         info!("Attempting to send Telegram message for request {}", record.id);
-        let reason_line = match &record.reason {
-            Some(r) => format!("\n*Reason:* {}", r),
-            None => String::new(),
-        };
-        let stdin_line = match &record.stdin {
-            Some(stdin_b64) => {
-                let preview = format_stdin_preview(stdin_b64, self.stdin_preview_bytes);
-                format!("\n\n*Stdin:*\n```\n{}\n```", preview)
-            }
-            None => String::new(),
-        };
-        let text = format!(
-            "🔐 *Sudo Request*\n\n\
-             *User:* `{}`\n\
-             *Command:* `{}`\n\
-             *CWD:* `{}`\n\
-             *PID:* `{}`\n\
-             *Request ID:* `{}`\n\
-             *Timeout:* {}s{}{}",
-            record.user, record.command, record.cwd, record.pid, record.id, record.timeout_seconds, reason_line, stdin_line
+        let text = render_template(
+            self.message_template.as_deref().unwrap_or(DEFAULT_TEMPLATE),
+            record,
+            self.stdin_preview_bytes,
         );
 
         let approve_data = format!("approve:{}", record.id);
@@ -519,6 +547,38 @@ impl NotificationBackend for TelegramBackend {
     }
 }
 
+/// Render a message template by replacing {{variable}} placeholders with values from the record.
+fn render_template(template: &str, record: &SudoRequestRecord, stdin_preview_bytes: usize) -> String {
+    let hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .to_string();
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    let reason_val = match &record.reason {
+        Some(r) => format!("\n*Reason:* {}", r),
+        None => String::new(),
+    };
+    let stdin_val = match &record.stdin {
+        Some(stdin_b64) => {
+            let preview = format_stdin_preview(stdin_b64, stdin_preview_bytes);
+            format!("\n\n*Stdin:*\n```\n{}\n```", preview)
+        }
+        None => String::new(),
+    };
+
+    template
+        .replace("{{user}}", &record.user)
+        .replace("{{command}}", &record.command)
+        .replace("{{directory}}", &record.cwd)
+        .replace("{{hostname}}", &hostname)
+        .replace("{{timestamp}}", &timestamp)
+        .replace("{{reason}}", &reason_val)
+        .replace("{{pid}}", &record.pid.to_string())
+        .replace("{{request_id}}", &record.id)
+        .replace("{{timeout}}", &record.timeout_seconds.to_string())
+        .replace("{{stdin}}", &stdin_val)
+}
+
 /// Format a base64-encoded stdin payload for display in a Telegram message.
 fn format_stdin_preview(stdin_b64: &str, max_preview_bytes: usize) -> String {
     let decoded = match base64::engine::general_purpose::STANDARD.decode(stdin_b64) {
@@ -610,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_api_url() {
-        let backend = TelegramBackend::new("TOKEN123".to_string(), 42, 60, 2048, 30);
+        let backend = TelegramBackend::new("TOKEN123".to_string(), 42, 60, 2048, 30, None);
         assert_eq!(
             backend.api_url("getMe"),
             "https://api.telegram.org/botTOKEN123/getMe"
@@ -623,16 +683,17 @@ mod tests {
 
     #[test]
     fn test_backend_creation() {
-        let backend = TelegramBackend::new("TOK".to_string(), 99, 120, 4096, 45);
+        let backend = TelegramBackend::new("TOK".to_string(), 99, 120, 4096, 45, None);
         assert_eq!(backend.request_timeout, Duration::from_secs(120));
         assert_eq!(backend.stdin_preview_bytes, 4096);
         assert_eq!(backend.poll_timeout_seconds, 45);
         assert_eq!(backend.chat_id, 99);
+        assert!(backend.message_template.is_none());
     }
 
     #[test]
     fn test_telegram_name() {
-        let backend = TelegramBackend::new("TOK".to_string(), 1, 60, 2048, 30);
+        let backend = TelegramBackend::new("TOK".to_string(), 1, 60, 2048, 30, None);
         assert_eq!(<TelegramBackend as super::NotificationBackend>::name(&backend), "telegram");
     }
 
@@ -658,5 +719,204 @@ mod tests {
     fn test_is_likely_binary_newlines_and_tabs_are_not_binary() {
         let data = b"line1\nline2\ttab\rcarriage";
         assert!(!is_likely_binary(data));
+    }
+
+    fn make_test_record() -> SudoRequestRecord {
+        SudoRequestRecord {
+            id: "req-123".to_string(),
+            user: "alice".to_string(),
+            command: "apt install nginx".to_string(),
+            cwd: "/home/alice".to_string(),
+            pid: 4567,
+            timestamp: chrono::Utc::now(),
+            status: Decision::Pending,
+            timeout_seconds: 60,
+            nonce: "nonce".to_string(),
+            decided_at: None,
+            decided_by: None,
+            reason: Some("deploying web server".to_string()),
+            stdin: None,
+            stdin_bytes: None,
+        }
+    }
+
+    #[test]
+    fn test_render_template_basic_variables() {
+        let record = make_test_record();
+        let tmpl = "User: {{user}}, Cmd: {{command}}, Dir: {{directory}}";
+        let result = render_template(tmpl, &record, 2048);
+        assert_eq!(result, "User: alice, Cmd: apt install nginx, Dir: /home/alice");
+    }
+
+    #[test]
+    fn test_render_template_all_variables() {
+        let record = make_test_record();
+        let tmpl = "{{user}} {{command}} {{directory}} {{pid}} {{request_id}} {{timeout}} {{hostname}} {{timestamp}} {{reason}}";
+        let result = render_template(tmpl, &record, 2048);
+        assert!(result.contains("alice"));
+        assert!(result.contains("apt install nginx"));
+        assert!(result.contains("/home/alice"));
+        assert!(result.contains("4567"));
+        assert!(result.contains("req-123"));
+        assert!(result.contains("60"));
+        // hostname and timestamp are dynamic, just check they got replaced
+        assert!(!result.contains("{{hostname}}"));
+        assert!(!result.contains("{{timestamp}}"));
+        assert!(result.contains("deploying web server"));
+    }
+
+    #[test]
+    fn test_render_template_reason_empty_when_none() {
+        let mut record = make_test_record();
+        record.reason = None;
+        let tmpl = "CMD: {{command}}{{reason}}END";
+        let result = render_template(tmpl, &record, 2048);
+        assert_eq!(result, "CMD: apt install nginxEND");
+    }
+
+    #[test]
+    fn test_render_template_stdin_empty_when_none() {
+        let record = make_test_record();
+        let tmpl = "CMD: {{command}}{{stdin}}END";
+        let result = render_template(tmpl, &record, 2048);
+        assert_eq!(result, "CMD: apt install nginxEND");
+    }
+
+    #[test]
+    fn test_render_template_stdin_present() {
+        let mut record = make_test_record();
+        record.stdin = Some(base64::engine::general_purpose::STANDARD.encode(b"hello stdin"));
+        let tmpl = "CMD: {{command}}{{stdin}}";
+        let result = render_template(tmpl, &record, 2048);
+        assert!(result.contains("hello stdin"));
+    }
+
+    #[test]
+    fn test_render_template_default_matches_format() {
+        let record = make_test_record();
+        let result = render_template(DEFAULT_TEMPLATE, &record, 2048);
+        assert!(result.contains("alice"));
+        assert!(result.contains("apt install nginx"));
+        assert!(result.contains("/home/alice"));
+        assert!(result.contains("4567"));
+        assert!(result.contains("req-123"));
+        assert!(result.contains("60s"));
+        assert!(result.contains("deploying web server"));
+    }
+
+    #[test]
+    fn test_render_template_multiline() {
+        let record = make_test_record();
+        let tmpl = "Line1: {{user}}\nLine2: {{command}}\nLine3: {{directory}}";
+        let result = render_template(tmpl, &record, 2048);
+        assert_eq!(result, "Line1: alice\nLine2: apt install nginx\nLine3: /home/alice");
+    }
+
+    #[test]
+    fn test_render_template_markdown_passthrough() {
+        let record = make_test_record();
+        let tmpl = "**Bold** `{{command}}` _italic_ {{user}}";
+        let result = render_template(tmpl, &record, 2048);
+        assert_eq!(result, "**Bold** `apt install nginx` _italic_ alice");
+    }
+
+    #[test]
+    fn test_validate_template_valid() {
+        let mut backend = TelegramBackend::new(
+            "TOK".to_string(), 1, 60, 2048, 30,
+            Some("{{user}} runs {{command}}".to_string()),
+        );
+        backend.validate_template();
+        assert!(backend.message_template.is_some());
+    }
+
+    #[test]
+    fn test_validate_template_missing_user() {
+        let mut backend = TelegramBackend::new(
+            "TOK".to_string(), 1, 60, 2048, 30,
+            Some("runs {{command}}".to_string()),
+        );
+        backend.validate_template();
+        assert!(backend.message_template.is_none());
+    }
+
+    #[test]
+    fn test_validate_template_missing_command() {
+        let mut backend = TelegramBackend::new(
+            "TOK".to_string(), 1, 60, 2048, 30,
+            Some("{{user}} runs something".to_string()),
+        );
+        backend.validate_template();
+        assert!(backend.message_template.is_none());
+    }
+
+    #[test]
+    fn test_validate_template_missing_both() {
+        let mut backend = TelegramBackend::new(
+            "TOK".to_string(), 1, 60, 2048, 30,
+            Some("hello world".to_string()),
+        );
+        backend.validate_template();
+        assert!(backend.message_template.is_none());
+    }
+
+    #[test]
+    fn test_validate_template_none_stays_none() {
+        let mut backend = TelegramBackend::new(
+            "TOK".to_string(), 1, 60, 2048, 30, None,
+        );
+        backend.validate_template();
+        assert!(backend.message_template.is_none());
+    }
+
+    #[test]
+    fn test_backend_with_template() {
+        let backend = TelegramBackend::new(
+            "TOK".to_string(), 1, 60, 2048, 30,
+            Some("custom: {{user}} {{command}}".to_string()),
+        );
+        assert_eq!(backend.message_template.as_deref(), Some("custom: {{user}} {{command}}"));
+    }
+
+    #[test]
+    fn test_config_message_template_deserialization() {
+        use crate::config::Config;
+        use tempfile::TempDir;
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("aisudo.toml");
+        fs::write(&path, r#"
+[telegram]
+bot_token = "tok"
+chat_id = 1
+message_template = """
+Request: {{user}} {{command}}
+"""
+"#).unwrap();
+        let config = Config::load(path.to_str().unwrap()).unwrap();
+        let tg = config.telegram.unwrap();
+        assert!(tg.message_template.is_some());
+        let tmpl = tg.message_template.unwrap();
+        assert!(tmpl.contains("{{user}}"));
+        assert!(tmpl.contains("{{command}}"));
+    }
+
+    #[test]
+    fn test_config_message_template_default_none() {
+        use crate::config::Config;
+        use tempfile::TempDir;
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("aisudo.toml");
+        fs::write(&path, r#"
+[telegram]
+bot_token = "tok"
+chat_id = 1
+"#).unwrap();
+        let config = Config::load(path.to_str().unwrap()).unwrap();
+        let tg = config.telegram.unwrap();
+        assert!(tg.message_template.is_none());
     }
 }

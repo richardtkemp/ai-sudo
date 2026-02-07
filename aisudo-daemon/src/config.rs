@@ -35,6 +35,13 @@ pub struct TelegramConfig {
 
     #[serde(default = "default_poll_timeout")]
     pub poll_timeout_seconds: u32,
+
+    /// Custom Telegram message template for sudo approval requests.
+    /// Supports {{user}}, {{command}}, {{directory}}, {{hostname}}, {{timestamp}},
+    /// {{reason}}, {{pid}}, {{request_id}}, {{timeout}}, {{stdin}} variables.
+    /// Must include at least {{user}} and {{command}}.
+    #[serde(default)]
+    pub message_template: Option<String>,
 }
 
 fn default_socket_path() -> PathBuf {

@@ -1,4 +1,5 @@
-use super::{NotificationBackend, TempRuleRecord};
+use super::{BwConfirmRecord, BwRequestRecord, NotificationBackend, TempRuleRecord};
+use crate::config::ConfigHolder;
 use aisudo_common::{Decision, SudoRequestRecord};
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
@@ -36,8 +37,8 @@ pub struct TelegramBackend {
     stdin_preview_bytes: usize,
     /// Timeout in seconds for Telegram long-polling requests.
     poll_timeout_seconds: u32,
-    /// Custom message template for sudo approval requests (None = use default).
-    message_template: Option<String>,
+    /// Config holder for hot-reloading message_template and other settings.
+    config_holder: Arc<ConfigHolder>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,7 +78,7 @@ impl TelegramBackend {
         timeout_seconds: u32,
         stdin_preview_bytes: usize,
         poll_timeout_seconds: u32,
-        message_template: Option<String>,
+        config_holder: Arc<ConfigHolder>,
     ) -> Self {
         Self {
             bot_token,
@@ -89,32 +90,7 @@ impl TelegramBackend {
             message_map: Arc::new(DashMap::new()),
             stdin_preview_bytes,
             poll_timeout_seconds,
-            message_template,
-        }
-    }
-
-    /// Validate the configured message template on startup.
-    /// Logs an error and resets to default if {{user}} or {{command}} are missing.
-    pub fn validate_template(&mut self) {
-        if let Some(ref tmpl) = self.message_template {
-            let missing_user = !tmpl.contains("{{user}}");
-            let missing_command = !tmpl.contains("{{command}}");
-            if missing_user || missing_command {
-                let mut missing = Vec::new();
-                if missing_user {
-                    missing.push("{{user}}");
-                }
-                if missing_command {
-                    missing.push("{{command}}");
-                }
-                error!(
-                    "message_template is missing required variable(s): {}. Using default template.",
-                    missing.join(", ")
-                );
-                self.message_template = None;
-            } else {
-                info!("Custom message template loaded");
-            }
+            config_holder,
         }
     }
 
@@ -175,11 +151,19 @@ impl TelegramBackend {
 
     async fn send_message(&self, record: &SudoRequestRecord) -> Result<i64> {
         info!("Attempting to send Telegram message for request {}", record.id);
-        let text = render_template(
-            self.message_template.as_deref().unwrap_or(DEFAULT_TEMPLATE),
-            record,
-            self.stdin_preview_bytes,
-        );
+        let config = self.config_holder.config();
+        let custom_template = config.telegram.as_ref().and_then(|tg| tg.message_template.as_deref());
+        let template = match custom_template {
+            Some(tmpl) if tmpl.contains("{{user}}") && tmpl.contains("{{command}}") => tmpl,
+            Some(_) => {
+                warn!(
+                    "message_template missing required {{{{user}}}} or {{{{command}}}}; using default"
+                );
+                DEFAULT_TEMPLATE
+            }
+            None => DEFAULT_TEMPLATE,
+        };
+        let text = render_template(template, record, self.stdin_preview_bytes);
 
         let approve_data = format!("approve:{}", record.id);
         let deny_data = format!("deny:{}", record.id);
@@ -304,6 +288,146 @@ impl TelegramBackend {
         Ok(message_id)
     }
 
+    async fn send_bw_request_message(&self, record: &BwRequestRecord) -> Result<i64> {
+        info!("Sending BW request Telegram message for request {}", record.id);
+
+        let session_status = if record.session_active { "unlocked" } else { "locked" };
+        let text = format!(
+            "\u{1f511} *Bitwarden Request*\n\n\
+             *User:* `{}`\n\
+             *Item:* `{}`\n\
+             *Field:* `{}`\n\
+             *Vault:* {}\n\
+             *Request ID:* `{}`",
+            record.user, record.item_name, record.field, session_status, record.id,
+        );
+
+        let approve_data = format!("approve_bw:{}", record.id);
+        let deny_data = format!("deny_bw:{}", record.id);
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {"text": "\u{2705} Approve", "callback_data": approve_data},
+                    {"text": "\u{274c} Deny", "callback_data": deny_data}
+                ]]
+            }
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
+
+        let http_status = resp.status();
+        let result: TelegramResponse<Message> = resp.json().await
+            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
+        if !result.ok {
+            let desc = result.description.unwrap_or_else(|| "no description".to_string());
+            return Err(anyhow!("Telegram sendMessage failed (HTTP {}): {}", http_status, desc));
+        }
+
+        let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
+        let pending_key = format!("bw:{}", record.id);
+        self.message_map.insert(pending_key, (message_id, text));
+        info!("BW request Telegram message sent: message_id={}", message_id);
+
+        Ok(message_id)
+    }
+
+    async fn send_bw_confirm_message(&self, record: &BwConfirmRecord) -> Result<i64> {
+        info!("Sending BW confirm Telegram message for request {}", record.id);
+
+        let text = format!(
+            "\u{1f50d} *Bitwarden Confirmation*\n\n\
+             *User:* `{}`\n\
+             *Requested:* `{}`\n\
+             *Resolved to:* `{}`\n\
+             *Field:* `{}`\n\
+             *Request ID:* `{}`\n\n\
+             \u{26a0}\u{fe0f} Names differ \u{2014} please confirm.",
+            record.user, record.requested_item_name, record.resolved_item_name,
+            record.field, record.id,
+        );
+
+        let confirm_data = format!("confirm_bw:{}", record.id);
+        let cancel_data = format!("cancel_bw:{}", record.id);
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {"text": "\u{2705} Confirm", "callback_data": confirm_data},
+                    {"text": "\u{274c} Cancel", "callback_data": cancel_data}
+                ]]
+            }
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
+
+        let http_status = resp.status();
+        let result: TelegramResponse<Message> = resp.json().await
+            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
+        if !result.ok {
+            let desc = result.description.unwrap_or_else(|| "no description".to_string());
+            return Err(anyhow!("Telegram sendMessage failed (HTTP {}): {}", http_status, desc));
+        }
+
+        let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
+        let pending_key = format!("bw_confirm:{}", record.id);
+        self.message_map.insert(pending_key, (message_id, text));
+        info!("BW confirm Telegram message sent: message_id={}", message_id);
+
+        Ok(message_id)
+    }
+
+    async fn send_bw_scrub_complete_message(&self, request_id: &str, item_name: &str) -> Result<()> {
+        let text = format!(
+            "\u{1f9f9} *Credential Scrubbed*\n\n\
+             *Item:* `{}`\n\
+             *Request ID:* `{}`",
+            item_name, request_id,
+        );
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
+
+        let http_status = resp.status();
+        let result: TelegramResponse<Message> = resp.json().await
+            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
+        if !result.ok {
+            let desc = result.description.unwrap_or_else(|| "no description".to_string());
+            warn!("Telegram scrub notification failed (HTTP {}): {}", http_status, desc);
+        }
+
+        Ok(())
+    }
+
     async fn edit_message_status(&self, message_id: i64, original_text: &str, status_line: &str) -> Result<()> {
         info!("Editing Telegram message {} to show: {}", message_id, status_line);
 
@@ -419,6 +543,10 @@ impl TelegramBackend {
             "deny" => (request_id.to_string(), Decision::Denied),
             "approve_rule" => (format!("rule:{request_id}"), Decision::Approved),
             "deny_rule" => (format!("rule:{request_id}"), Decision::Denied),
+            "approve_bw" => (format!("bw:{request_id}"), Decision::Approved),
+            "deny_bw" => (format!("bw:{request_id}"), Decision::Denied),
+            "confirm_bw" => (format!("bw_confirm:{request_id}"), Decision::Approved),
+            "cancel_bw" => (format!("bw_confirm:{request_id}"), Decision::Denied),
             _ => return,
         };
 
@@ -542,6 +670,124 @@ impl NotificationBackend for TelegramBackend {
         }
     }
 
+    async fn send_bw_request_and_wait(&self, record: &BwRequestRecord) -> Result<Decision> {
+        let pending_key = format!("bw:{}", record.id);
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(pending_key.clone(), tx);
+
+        let msg_id = self.send_bw_request_message(record).await.map_err(|e| {
+            self.pending.remove(&pending_key);
+            e
+        })?;
+        info!(
+            "Sent BW request notification for {} (message_id: {})",
+            record.id, msg_id
+        );
+
+        let timeout = self.request_timeout;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(decision)) => {
+                info!("Received decision {decision:?} for BW request {}", record.id);
+                Ok(decision)
+            }
+            Ok(Err(_)) => {
+                self.pending.remove(&pending_key);
+                Err(anyhow!("Response channel dropped"))
+            }
+            Err(_) => {
+                self.pending.remove(&pending_key);
+                info!("BW request {} timed out", record.id);
+
+                let time = Local::now().format("%H:%M:%S");
+                let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
+                if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
+                    let _ = self
+                        .edit_message_status(msg_id, &original_text, &status_line)
+                        .await;
+                }
+
+                Ok(Decision::Timeout)
+            }
+        }
+    }
+
+    async fn send_bw_confirm_and_wait(&self, record: &BwConfirmRecord) -> Result<Decision> {
+        let pending_key = format!("bw_confirm:{}", record.id);
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(pending_key.clone(), tx);
+
+        let msg_id = self.send_bw_confirm_message(record).await.map_err(|e| {
+            self.pending.remove(&pending_key);
+            e
+        })?;
+        info!(
+            "Sent BW confirm notification for {} (message_id: {})",
+            record.id, msg_id
+        );
+
+        let timeout = self.request_timeout;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(decision)) => {
+                info!("Received decision {decision:?} for BW confirm {}", record.id);
+                Ok(decision)
+            }
+            Ok(Err(_)) => {
+                self.pending.remove(&pending_key);
+                Err(anyhow!("Response channel dropped"))
+            }
+            Err(_) => {
+                self.pending.remove(&pending_key);
+                info!("BW confirm {} timed out", record.id);
+
+                let time = Local::now().format("%H:%M:%S");
+                let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
+                if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
+                    let _ = self
+                        .edit_message_status(msg_id, &original_text, &status_line)
+                        .await;
+                }
+
+                Ok(Decision::Timeout)
+            }
+        }
+    }
+
+    async fn send_bw_locked_notification(&self, record: &BwRequestRecord) -> Result<()> {
+        let text = format!(
+            "\u{1f512} *Bitwarden Request*\n\n\
+             *User:* `{}`\n\
+             *Item:* `{}`\n\
+             *Field:* `{}`\n\
+             *Vault:* \u{1f512} locked\n\
+             *Request ID:* `{}`\n\n\
+             Unlock via dashboard to approve.",
+            record.user, record.item_name, record.field, record.id,
+        );
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        });
+
+        // Fire and forget — no buttons, no waiting
+        match self.client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(_) => info!("BW locked notification sent for request {}", record.id),
+            Err(e) => warn!("Failed to send BW locked notification: {e}"),
+        }
+
+        Ok(())
+    }
+
+    async fn send_scrub_complete(&self, request_id: &str, item_name: &str) -> Result<()> {
+        self.send_bw_scrub_complete_message(request_id, item_name).await
+    }
+
     fn name(&self) -> &'static str {
         "telegram"
     }
@@ -620,6 +866,23 @@ fn is_likely_binary(data: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// Create a minimal ConfigHolder for tests.
+    fn test_config_holder() -> Arc<ConfigHolder> {
+        use tempfile::TempDir;
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("aisudo.toml");
+        fs::write(&path, r#"
+[telegram]
+bot_token = "tok"
+chat_id = 1
+"#).unwrap();
+        // Leak TempDir so it lives long enough for all tests
+        let holder = Arc::new(ConfigHolder::new(path.to_str().unwrap()).unwrap());
+        std::mem::forget(tmp);
+        holder
+    }
+
     #[test]
     fn test_format_stdin_preview_text() {
         let data = b"hello world\nline two\n";
@@ -670,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_api_url() {
-        let backend = TelegramBackend::new("TOKEN123".to_string(), 42, 60, 2048, 30, None);
+        let backend = TelegramBackend::new("TOKEN123".to_string(), 42, 60, 2048, 30, test_config_holder());
         assert_eq!(
             backend.api_url("getMe"),
             "https://api.telegram.org/botTOKEN123/getMe"
@@ -683,17 +946,16 @@ mod tests {
 
     #[test]
     fn test_backend_creation() {
-        let backend = TelegramBackend::new("TOK".to_string(), 99, 120, 4096, 45, None);
+        let backend = TelegramBackend::new("TOK".to_string(), 99, 120, 4096, 45, test_config_holder());
         assert_eq!(backend.request_timeout, Duration::from_secs(120));
         assert_eq!(backend.stdin_preview_bytes, 4096);
         assert_eq!(backend.poll_timeout_seconds, 45);
         assert_eq!(backend.chat_id, 99);
-        assert!(backend.message_template.is_none());
     }
 
     #[test]
     fn test_telegram_name() {
-        let backend = TelegramBackend::new("TOK".to_string(), 1, 60, 2048, 30, None);
+        let backend = TelegramBackend::new("TOK".to_string(), 1, 60, 2048, 30, test_config_holder());
         assert_eq!(<TelegramBackend as super::NotificationBackend>::name(&backend), "telegram");
     }
 
@@ -820,63 +1082,6 @@ mod tests {
         assert_eq!(result, "**Bold** `apt install nginx` _italic_ alice");
     }
 
-    #[test]
-    fn test_validate_template_valid() {
-        let mut backend = TelegramBackend::new(
-            "TOK".to_string(), 1, 60, 2048, 30,
-            Some("{{user}} runs {{command}}".to_string()),
-        );
-        backend.validate_template();
-        assert!(backend.message_template.is_some());
-    }
-
-    #[test]
-    fn test_validate_template_missing_user() {
-        let mut backend = TelegramBackend::new(
-            "TOK".to_string(), 1, 60, 2048, 30,
-            Some("runs {{command}}".to_string()),
-        );
-        backend.validate_template();
-        assert!(backend.message_template.is_none());
-    }
-
-    #[test]
-    fn test_validate_template_missing_command() {
-        let mut backend = TelegramBackend::new(
-            "TOK".to_string(), 1, 60, 2048, 30,
-            Some("{{user}} runs something".to_string()),
-        );
-        backend.validate_template();
-        assert!(backend.message_template.is_none());
-    }
-
-    #[test]
-    fn test_validate_template_missing_both() {
-        let mut backend = TelegramBackend::new(
-            "TOK".to_string(), 1, 60, 2048, 30,
-            Some("hello world".to_string()),
-        );
-        backend.validate_template();
-        assert!(backend.message_template.is_none());
-    }
-
-    #[test]
-    fn test_validate_template_none_stays_none() {
-        let mut backend = TelegramBackend::new(
-            "TOK".to_string(), 1, 60, 2048, 30, None,
-        );
-        backend.validate_template();
-        assert!(backend.message_template.is_none());
-    }
-
-    #[test]
-    fn test_backend_with_template() {
-        let backend = TelegramBackend::new(
-            "TOK".to_string(), 1, 60, 2048, 30,
-            Some("custom: {{user}} {{command}}".to_string()),
-        );
-        assert_eq!(backend.message_template.as_deref(), Some("custom: {{user}} {{command}}"));
-    }
 
     #[test]
     fn test_config_message_template_deserialization() {

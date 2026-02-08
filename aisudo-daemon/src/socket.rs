@@ -1,19 +1,23 @@
 use aisudo_common::{
-    ActiveTempRule, Decision, ExecOutput, ListRulesRequest, ListRulesResponse, RequestMode,
-    SocketMessage, SudoRequest, SudoRequestRecord, SudoResponse, TempRuleRequest, TempRuleResponse,
+    ActiveTempRule, BwGetResponse, BwLockResponse, BwStatusResponse, Decision, ExecOutput,
+    ListRulesRequest, ListRulesResponse, RequestMode, SocketMessage, SudoRequest,
+    SudoRequestRecord, SudoResponse, TempRuleRequest, TempRuleResponse,
 };
 use anyhow::Result;
 use base64::Engine as _;
+use dashmap::DashMap;
 use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
+use crate::bw_session::BwSessionManager;
 use crate::config::ConfigHolder;
 use crate::db::Database;
-use crate::notification::{NotificationBackend, TempRuleRecord};
+use crate::notification::{BwConfirmRecord, BwRequestRecord, NotificationBackend, TempRuleRecord};
 use crate::sudoers::SudoersCache;
 
 /// Operator connecting two commands in a chain.
@@ -38,6 +42,18 @@ struct ChainSegment {
     command: String,
     /// How this segment connects to the previous one.
     op: ChainOp,
+}
+
+/// Context for BW credential retrieval operations.
+struct BwHandlerContext {
+    session: Arc<BwSessionManager>,
+    max_rpm: u32,
+    session_log_dir: std::path::PathBuf,
+    scrub_delay: u32,
+    /// Channels for signaling pending BW requests when vault is unlocked via web UI.
+    pending_unlocks: Arc<DashMap<String, oneshot::Sender<()>>>,
+    /// Timeout for waiting on vault unlock (seconds).
+    timeout_seconds: u32,
 }
 
 /// Parse a command string into a chain of segments split on unquoted operators.
@@ -227,6 +243,8 @@ pub async fn run_socket_listener(
     config_holder: Arc<ConfigHolder>,
     db: Arc<Database>,
     backend: Arc<dyn NotificationBackend>,
+    bw_session: Option<Arc<BwSessionManager>>,
+    pending_unlocks: Arc<DashMap<String, oneshot::Sender<()>>>,
 ) -> Result<()> {
     let socket_path = config_holder.config().socket_path.clone();
     let sudoers_cache = Arc::new(SudoersCache::new(300));
@@ -260,9 +278,22 @@ pub async fn run_socket_listener(
                 let max_stdin_bytes = config.limits.max_stdin_bytes;
                 let max_temp_rule_duration = config.limits.max_temp_rule_duration_seconds;
 
+                let bw_ctx = bw_session.as_ref().and_then(|session| {
+                    config.bitwarden.as_ref().map(|bw_config| {
+                        Arc::new(BwHandlerContext {
+                            session: Arc::clone(session),
+                            max_rpm: bw_config.max_requests_per_minute,
+                            session_log_dir: bw_config.session_log_dir.clone(),
+                            scrub_delay: bw_config.scrub_delay,
+                            pending_unlocks: Arc::clone(&pending_unlocks),
+                            timeout_seconds: config.timeout_seconds,
+                        })
+                    })
+                });
+
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(stream, db, backend, sudoers, timeout, &allowlist, max_stdin_bytes, max_temp_rule_duration).await
+                        handle_connection(stream, db, backend, sudoers, timeout, &allowlist, max_stdin_bytes, max_temp_rule_duration, bw_ctx).await
                     {
                         error!("Connection handler error: {e:#}");
                     }
@@ -292,6 +323,7 @@ async fn handle_connection(
     allowlist: &[String],
     max_stdin_bytes: usize,
     max_temp_rule_duration: u32,
+    bw_ctx: Option<Arc<BwHandlerContext>>,
 ) -> Result<()> {
     // Extract the real UID of the connecting process via SO_PEERCRED.
     // This cannot be spoofed by the client (kernel-provided).
@@ -320,6 +352,59 @@ async fn handle_connection(
             SocketMessage::ListRules(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
                 handle_list_rules(request, &mut writer, db, sudoers, allowlist).await
+            }
+            SocketMessage::BwGet(mut request) => {
+                override_user_from_peer(&mut request.user, peer_uid);
+                match &bw_ctx {
+                    Some(ctx) => handle_bw_get(request, &mut writer, db, backend, ctx).await,
+                    None => {
+                        let resp = BwGetResponse {
+                            request_id: String::new(),
+                            decision: Decision::Denied,
+                            value: None,
+                            error: Some("Bitwarden integration not configured".to_string()),
+                            resolved_item_name: None,
+                            awaiting_confirmation: false,
+                        };
+                        let resp_json = serde_json::to_string(&resp)?;
+                        writer.write_all(resp_json.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                        Ok(())
+                    }
+                }
+            }
+            SocketMessage::BwLock(mut request) => {
+                override_user_from_peer(&mut request.user, peer_uid);
+                match &bw_ctx {
+                    Some(ctx) => handle_bw_lock(request, &mut writer, &ctx.session, &db).await,
+                    None => {
+                        let resp = BwLockResponse {
+                            success: false,
+                            error: Some("Bitwarden integration not configured".to_string()),
+                        };
+                        let resp_json = serde_json::to_string(&resp)?;
+                        writer.write_all(resp_json.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                        Ok(())
+                    }
+                }
+            }
+            SocketMessage::BwStatus(mut request) => {
+                override_user_from_peer(&mut request.user, peer_uid);
+                match &bw_ctx {
+                    Some(ctx) => handle_bw_status(request, &mut writer, &ctx.session).await,
+                    None => {
+                        let resp = BwStatusResponse {
+                            session_active: false,
+                            locked_since: None,
+                            last_used: None,
+                        };
+                        let resp_json = serde_json::to_string(&resp)?;
+                        writer.write_all(resp_json.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                        Ok(())
+                    }
+                }
             }
         }
     } else {
@@ -699,6 +784,366 @@ async fn handle_list_rules(
     writer.flush().await?;
 
     Ok(())
+}
+
+// --- Bitwarden handlers ---
+
+async fn handle_bw_get(
+    request: aisudo_common::BwGetRequest,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    db: Arc<Database>,
+    backend: Arc<dyn NotificationBackend>,
+    bw_ctx: &BwHandlerContext,
+) -> Result<()> {
+    info!(
+        "Received BW get request: user={} item={} field={}",
+        request.user, request.item_name, request.field
+    );
+
+    // Validate item name (H1)
+    if let Err(e) = crate::bw_session::validate_item_name(&request.item_name) {
+        let resp = BwGetResponse {
+            request_id: String::new(),
+            decision: Decision::Denied,
+            value: None,
+            error: Some(format!("invalid item name: {e}")),
+            resolved_item_name: None,
+            awaiting_confirmation: false,
+        };
+        let resp_json = serde_json::to_string(&resp)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    // Rate limit check
+    if !db.check_bw_rate_limit(&request.user, bw_ctx.max_rpm)? {
+        let resp = BwGetResponse {
+            request_id: String::new(),
+            decision: Decision::Denied,
+            value: None,
+            error: Some("rate limit exceeded".to_string()),
+            resolved_item_name: None,
+            awaiting_confirmation: false,
+        };
+        let resp_json = serde_json::to_string(&resp)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    // Create request record
+    let id = uuid::Uuid::new_v4().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    db.insert_bw_request(&id, &request.user, &request.item_name, &request.field, &nonce)?;
+
+    // Phase 1: Get approval (different paths for locked vs unlocked vault)
+    let session_active = bw_ctx.session.is_session_active().await;
+
+    let record = BwRequestRecord {
+        id: id.clone(),
+        user: request.user.clone(),
+        item_name: request.item_name.clone(),
+        field: request.field.clone(),
+        session_active,
+    };
+
+    if !session_active {
+        // Vault locked: send notification and wait for web UI unlock
+        backend.send_bw_locked_notification(&record).await.ok();
+
+        let (tx, rx) = oneshot::channel();
+        bw_ctx.pending_unlocks.insert(id.clone(), tx);
+
+        let timeout = std::time::Duration::from_secs(bw_ctx.timeout_seconds as u64);
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(())) => {
+                // Vault unlocked and request approved via web UI
+                info!("BW request {id} approved via web UI unlock");
+                db.update_bw_request_status(&id, "approved", "web_ui")?;
+            }
+            _ => {
+                bw_ctx.pending_unlocks.remove(&id);
+                db.update_bw_request_status(&id, "timeout", "system")?;
+                let resp = BwGetResponse {
+                    request_id: id,
+                    decision: Decision::Timeout,
+                    value: None,
+                    error: Some("request timed out waiting for vault unlock".to_string()),
+                    resolved_item_name: None,
+                    awaiting_confirmation: false,
+                };
+                let resp_json = serde_json::to_string(&resp)?;
+                writer.write_all(resp_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+                return Ok(());
+            }
+        }
+    } else {
+        // Vault unlocked: send Telegram approval request and wait
+        let decision = match backend.send_bw_request_and_wait(&record).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Notification backend error for BW request {id}: {e:#}");
+                db.update_bw_request_status(&id, "denied", "system")?;
+                let resp = BwGetResponse {
+                    request_id: id,
+                    decision: Decision::Denied,
+                    value: None,
+                    error: Some("notification error".to_string()),
+                    resolved_item_name: None,
+                    awaiting_confirmation: false,
+                };
+                let resp_json = serde_json::to_string(&resp)?;
+                writer.write_all(resp_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+                return Ok(());
+            }
+        };
+
+        if decision != Decision::Approved {
+            db.update_bw_request_status(&id, decision.as_str(), backend.name())?;
+            let resp = BwGetResponse {
+                request_id: id,
+                decision,
+                value: None,
+                error: if decision == Decision::Timeout {
+                    Some("request timed out".to_string())
+                } else {
+                    None
+                },
+                resolved_item_name: None,
+                awaiting_confirmation: false,
+            };
+            let resp_json = serde_json::to_string(&resp)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+
+        db.update_bw_request_status(&id, "approved", backend.name())?;
+    }
+
+    // Phase 2: Resolve item
+    let item_json = match bw_ctx.session.get_item_raw(&request.item_name).await {
+        Ok(json) => json,
+        Err(e) => {
+            error!("BW item retrieval failed for request {id}: {e:#}");
+            let resp = BwGetResponse {
+                request_id: id,
+                decision: Decision::Denied,
+                value: None,
+                error: Some("item retrieval failed".to_string()),
+                resolved_item_name: None,
+                awaiting_confirmation: false,
+            };
+            let resp_json = serde_json::to_string(&resp)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+    };
+
+    // Extract resolved name
+    let resolved_name = BwSessionManager::extract_item_name(&item_json)
+        .unwrap_or_else(|| request.item_name.clone());
+    db.set_bw_resolved_name(&id, &resolved_name)?;
+
+    // Compare names — if they differ, require human confirmation
+    let names_match = resolved_name == request.item_name;
+
+    if !names_match {
+        // Send phase 1 response (awaiting confirmation)
+        let phase1 = BwGetResponse {
+            request_id: id.clone(),
+            decision: Decision::Approved,
+            value: None,
+            error: None,
+            resolved_item_name: Some(resolved_name.clone()),
+            awaiting_confirmation: true,
+        };
+        let resp_json = serde_json::to_string(&phase1)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+
+        // Send confirmation request via Telegram
+        let confirm_record = BwConfirmRecord {
+            id: id.clone(),
+            user: request.user.clone(),
+            requested_item_name: request.item_name.clone(),
+            resolved_item_name: resolved_name.clone(),
+            field: request.field.clone(),
+        };
+
+        let confirm_decision = match backend.send_bw_confirm_and_wait(&confirm_record).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Confirmation notification error for BW request {id}: {e:#}");
+                Decision::Denied
+            }
+        };
+
+        if confirm_decision != Decision::Approved {
+            db.update_bw_request_status(&id, "cancelled", backend.name())?;
+            let phase2 = BwGetResponse {
+                request_id: id,
+                decision: Decision::Denied,
+                value: None,
+                error: Some("request cancelled by user".to_string()),
+                resolved_item_name: Some(resolved_name),
+                awaiting_confirmation: false,
+            };
+            let resp_json = serde_json::to_string(&phase2)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+    }
+
+    // Extract field (M4)
+    let field_value = match BwSessionManager::extract_field(&item_json, &request.field) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Field extraction failed for BW request {id}: {e:#}");
+            let resp = BwGetResponse {
+                request_id: id,
+                decision: Decision::Denied,
+                value: None,
+                error: Some("field not found in item".to_string()),
+                resolved_item_name: Some(resolved_name),
+                awaiting_confirmation: false,
+            };
+            let resp_json = serde_json::to_string(&resp)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+    };
+
+    // Hash for audit
+    let hash = crate::bw_session::credential_hash(&field_value);
+    db.set_bw_credential_hash(&id, &hash)?;
+    db.update_bw_request_status(&id, "confirmed", backend.name())?;
+
+    // Send response with credential
+    let resp = BwGetResponse {
+        request_id: id.clone(),
+        decision: Decision::Approved,
+        value: Some(field_value.clone()),
+        error: None,
+        resolved_item_name: Some(resolved_name.clone()),
+        awaiting_confirmation: false,
+    };
+    let resp_json = serde_json::to_string(&resp)?;
+    writer.write_all(resp_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    // Schedule scrub
+    let scrub_at = (chrono::Utc::now()
+        + chrono::Duration::seconds(bw_ctx.scrub_delay as i64))
+    .to_rfc3339();
+
+    // Extend existing scrub timer if same credential, otherwise create new entry
+    if !db.extend_scrub_timer(&hash, &scrub_at)? {
+        let session_files = discover_session_files(&bw_ctx.session_log_dir);
+        let file_strings: Vec<String> = session_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let scrub_id = uuid::Uuid::new_v4().to_string();
+        db.insert_scrub_entry(&scrub_id, &id, &hash, &field_value, &scrub_at, &file_strings)?;
+    }
+
+    info!(
+        "BW credential delivered for request {id} (item: {resolved_name}, field: {}, hash: {hash})",
+        request.field
+    );
+
+    Ok(())
+}
+
+async fn handle_bw_lock(
+    request: aisudo_common::BwLockRequest,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    bw_session: &BwSessionManager,
+    db: &Database,
+) -> Result<()> {
+    info!("Received BW lock request from user={}", request.user);
+
+    match bw_session.lock().await {
+        Ok(()) => {
+            db.log_bw_session_event("lock", &format!("by={}", request.user))?;
+            let resp = BwLockResponse {
+                success: true,
+                error: None,
+            };
+            let resp_json = serde_json::to_string(&resp)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+        }
+        Err(e) => {
+            error!("BW lock failed: {e:#}");
+            let resp = BwLockResponse {
+                success: false,
+                error: Some("lock failed".to_string()),
+            };
+            let resp_json = serde_json::to_string(&resp)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_bw_status(
+    request: aisudo_common::BwStatusRequest,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    bw_session: &BwSessionManager,
+) -> Result<()> {
+    info!("Received BW status request from user={}", request.user);
+
+    let session_active = bw_session.is_session_active().await;
+    let locked_since = bw_session.locked_since().await.map(|dt| dt.to_rfc3339());
+    let last_used = bw_session.last_used_time().await;
+
+    let resp = BwStatusResponse {
+        session_active,
+        locked_since,
+        last_used,
+    };
+    let resp_json = serde_json::to_string(&resp)?;
+    writer.write_all(resp_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    Ok(())
+}
+
+/// Discover all .jsonl session files in the configured directory (G5).
+fn discover_session_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "jsonl") {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
 
 /// Execute a command and stream stdout/stderr back over the socket.
@@ -1233,6 +1678,18 @@ mod tests {
         async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
             panic!("send_temp_rule_and_wait should not be called");
         }
+        async fn send_bw_request_and_wait(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<Decision> {
+            panic!("send_bw_request_and_wait should not be called");
+        }
+        async fn send_bw_confirm_and_wait(&self, _record: &crate::notification::BwConfirmRecord) -> anyhow::Result<Decision> {
+            panic!("send_bw_confirm_and_wait should not be called");
+        }
+        async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn name(&self) -> &'static str {
             "mock"
         }
@@ -1274,7 +1731,7 @@ mod tests {
         // Spawn the daemon handler
         let sudoers = Arc::new(SudoersCache::new(300));
         let handler = tokio::spawn(async move {
-            handle_connection(server, db_clone, backend, sudoers, 60, &[], 10 * 1024 * 1024, 86400).await
+            handle_connection(server, db_clone, backend, sudoers, 60, &[], 10 * 1024 * 1024, 86400, None).await
         });
 
         // Client side: send a request that should be rate-limited
@@ -1339,6 +1796,18 @@ mod tests {
         async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
             Ok(Decision::Approved)
         }
+        async fn send_bw_request_and_wait(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<Decision> {
+            Ok(Decision::Approved)
+        }
+        async fn send_bw_confirm_and_wait(&self, _record: &crate::notification::BwConfirmRecord) -> anyhow::Result<Decision> {
+            Ok(Decision::Approved)
+        }
+        async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn name(&self) -> &'static str {
             "mock_approve"
         }
@@ -1354,6 +1823,18 @@ mod tests {
         async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
             Ok(Decision::Denied)
         }
+        async fn send_bw_request_and_wait(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<Decision> {
+            Ok(Decision::Denied)
+        }
+        async fn send_bw_confirm_and_wait(&self, _record: &crate::notification::BwConfirmRecord) -> anyhow::Result<Decision> {
+            Ok(Decision::Denied)
+        }
+        async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn name(&self) -> &'static str {
             "mock_deny"
         }
@@ -1368,6 +1849,18 @@ mod tests {
         }
         async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
             Err(anyhow::anyhow!("notification service down"))
+        }
+        async fn send_bw_request_and_wait(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<Decision> {
+            Err(anyhow::anyhow!("notification service down"))
+        }
+        async fn send_bw_confirm_and_wait(&self, _record: &crate::notification::BwConfirmRecord) -> anyhow::Result<Decision> {
+            Err(anyhow::anyhow!("notification service down"))
+        }
+        async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
+            Ok(())
         }
         fn name(&self) -> &'static str {
             "mock_error"
@@ -1396,7 +1889,7 @@ mod tests {
         let backend2 = Arc::clone(&backend);
         let allowlist = allowlist.to_vec();
         let handler = tokio::spawn(async move {
-            handle_connection(server, db2, backend2, sudoers, 60, &allowlist, max_stdin_bytes, max_temp_rule_duration).await
+            handle_connection(server, db2, backend2, sudoers, 60, &allowlist, max_stdin_bytes, max_temp_rule_duration, None).await
         });
 
         let (reader, mut writer) = client.into_split();

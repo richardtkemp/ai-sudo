@@ -122,6 +122,14 @@ Quoting (single or double) suppresses operator detection, so `echo "hello; world
 
 Commands approved via Telegram (human-approved) continue to use `sh -c` and support all shell syntax — this restriction only applies to auto-approved commands.
 
+## Hot-Reload
+
+Set `hot_reload = true` in `aisudo.toml` to pick up config changes without restarting the daemon. On each incoming connection, the daemon checks file modification times (main config + `conf.d/` drop-ins) and re-parses if anything changed. If the new config is invalid, the old config is kept.
+
+**Reloads at runtime:** `allowlist`, `timeout_seconds`, `max_stdin_bytes`
+
+**Requires daemon restart:** `socket_path`, `db_path`, Telegram settings
+
 ## Architecture
 
 - **`aisudo-cli`** — CLI wrapper, connects to daemon via Unix socket

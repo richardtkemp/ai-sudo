@@ -142,6 +142,67 @@ pub struct ListRulesResponse {
     pub nopasswd_rules: Vec<String>,
 }
 
+/// Request to retrieve a Bitwarden vault item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BwGetRequest {
+    pub user: String,
+    pub item_name: String,
+    /// Which field to retrieve: "password", "username", "totp", "notes", "uri"
+    #[serde(default = "default_bw_field")]
+    pub field: String,
+}
+
+fn default_bw_field() -> String {
+    "password".to_string()
+}
+
+/// Response to a Bitwarden get request.
+/// Phase 1: decision set, value: None, awaiting_confirmation: true
+/// Phase 2: value set (credential), awaiting_confirmation: false
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BwGetResponse {
+    pub request_id: String,
+    pub decision: Decision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_item_name: Option<String>,
+    #[serde(default)]
+    pub awaiting_confirmation: bool,
+}
+
+/// Request to lock the Bitwarden vault session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BwLockRequest {
+    pub user: String,
+}
+
+/// Response to a lock request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BwLockResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Request to check vault session status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BwStatusRequest {
+    pub user: String,
+}
+
+/// Response with vault status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BwStatusResponse {
+    pub session_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked_since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<String>,
+}
+
 /// Wire-level message wrapper for the Unix socket protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -149,6 +210,9 @@ pub enum SocketMessage {
     SudoRequest(SudoRequest),
     TempRuleRequest(TempRuleRequest),
     ListRules(ListRulesRequest),
+    BwGet(BwGetRequest),
+    BwLock(BwLockRequest),
+    BwStatus(BwStatusRequest),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +427,105 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let deserialized: TempRuleResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.expires_at.as_deref(), Some("2025-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn socket_message_bw_get_roundtrip() {
+        let msg = SocketMessage::BwGet(BwGetRequest {
+            user: "test".to_string(),
+            item_name: "GitHub Token".to_string(),
+            field: "password".to_string(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"bw_get\""));
+        let _: SocketMessage = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn socket_message_bw_lock_roundtrip() {
+        let msg = SocketMessage::BwLock(BwLockRequest {
+            user: "test".to_string(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"bw_lock\""));
+        let _: SocketMessage = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn socket_message_bw_status_roundtrip() {
+        let msg = SocketMessage::BwStatus(BwStatusRequest {
+            user: "test".to_string(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"bw_status\""));
+        let _: SocketMessage = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn bw_get_request_default_field() {
+        let json = r#"{"user":"a","item_name":"test"}"#;
+        let req: BwGetRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.field, "password");
+    }
+
+    #[test]
+    fn bw_get_response_serde() {
+        let resp = BwGetResponse {
+            request_id: "abc".to_string(),
+            decision: Decision::Approved,
+            value: Some("secret123".to_string()),
+            error: None,
+            resolved_item_name: Some("GitHub Token".to_string()),
+            awaiting_confirmation: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: BwGetResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.decision, Decision::Approved);
+        assert_eq!(deserialized.value.as_deref(), Some("secret123"));
+        assert!(!deserialized.awaiting_confirmation);
+    }
+
+    #[test]
+    fn bw_get_response_phase1() {
+        let resp = BwGetResponse {
+            request_id: "abc".to_string(),
+            decision: Decision::Approved,
+            value: None,
+            error: None,
+            resolved_item_name: Some("GitHub Token".to_string()),
+            awaiting_confirmation: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("\"value\""));
+        let deserialized: BwGetResponse = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.value.is_none());
+        assert!(deserialized.awaiting_confirmation);
+    }
+
+    #[test]
+    fn bw_lock_response_serde() {
+        let resp = BwLockResponse {
+            success: true,
+            error: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: BwLockResponse = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.success);
+        assert!(deserialized.error.is_none());
+    }
+
+    #[test]
+    fn bw_status_response_serde() {
+        let resp = BwStatusResponse {
+            session_active: true,
+            locked_since: None,
+            last_used: Some("2026-02-08T12:00:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: BwStatusResponse = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.session_active);
+        assert!(deserialized.locked_since.is_none());
+        assert_eq!(deserialized.last_used.as_deref(), Some("2026-02-08T12:00:00Z"));
     }
 
     #[test]

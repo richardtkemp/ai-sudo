@@ -26,6 +26,7 @@ pub struct Config {
     #[serde(default)]
     pub hot_reload: bool,
 
+    pub bitwarden: Option<BitwardenConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +91,74 @@ fn default_limits() -> LimitsConfig {
         stdin_preview_bytes: default_stdin_preview(),
         max_temp_rule_duration_seconds: default_max_temp_rule_duration(),
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BitwardenConfig {
+    #[serde(default = "default_bw_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_bw_binary")]
+    pub bw_binary: PathBuf,
+
+    /// Auto-lock timeout in seconds (idle before session is locked).
+    #[serde(default = "default_auto_lock_timeout")]
+    pub auto_lock_timeout: u32,
+
+    /// Seconds after retrieval before scrubbing credential from logs.
+    #[serde(default = "default_scrub_delay")]
+    pub scrub_delay: u32,
+
+    /// How often the scrubber checks for pending scrubs (seconds).
+    #[serde(default = "default_scrub_interval")]
+    pub scrub_interval: u32,
+
+    /// Directory containing session log .jsonl files to scrub.
+    pub session_log_dir: PathBuf,
+
+    /// Web UI port (bound to localhost, exposed via Tailscale Serve).
+    #[serde(default = "default_web_ui_port")]
+    pub web_ui_port: u16,
+
+    /// Max BW requests per minute per user.
+    #[serde(default = "default_bw_max_rpm")]
+    pub max_requests_per_minute: u32,
+
+    /// Max password entry attempts per request.
+    #[serde(default = "default_max_password_attempts")]
+    pub max_password_attempts: u32,
+}
+
+fn default_bw_enabled() -> bool {
+    true
+}
+
+fn default_bw_binary() -> PathBuf {
+    PathBuf::from("/usr/bin/bw")
+}
+
+fn default_auto_lock_timeout() -> u32 {
+    3600 // 1 hour
+}
+
+fn default_scrub_delay() -> u32 {
+    600 // 10 minutes
+}
+
+fn default_scrub_interval() -> u32 {
+    30
+}
+
+fn default_web_ui_port() -> u16 {
+    8377
+}
+
+fn default_bw_max_rpm() -> u32 {
+    10
+}
+
+fn default_max_password_attempts() -> u32 {
+    5
 }
 
 /// Recursively deep-merge two TOML values. Overlay wins for scalars.
@@ -595,6 +664,44 @@ max_stdin_bytes = 1024
 
         let mtimes = collect_config_mtimes(Path::new(&path));
         assert_eq!(mtimes.len(), 1);
+    }
+
+    #[test]
+    fn bitwarden_config_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_content = r#"
+socket_path = "/tmp/test.sock"
+db_path = "/tmp/test.db"
+
+[telegram]
+bot_token = "token123"
+chat_id = 42
+
+[bitwarden]
+session_log_dir = "/home/rich/sessions"
+auto_lock_timeout = 1800
+scrub_delay = 300
+"#;
+        let path = write_main_config(tmp.path(), config_content);
+        let config = Config::load(&path).unwrap();
+        let bw = config.bitwarden.unwrap();
+        assert!(bw.enabled);
+        assert_eq!(bw.bw_binary.to_str().unwrap(), "/usr/bin/bw");
+        assert_eq!(bw.auto_lock_timeout, 1800);
+        assert_eq!(bw.scrub_delay, 300);
+        assert_eq!(bw.scrub_interval, 30); // default
+        assert_eq!(bw.session_log_dir.to_str().unwrap(), "/home/rich/sessions");
+        assert_eq!(bw.web_ui_port, 8377); // default
+        assert_eq!(bw.max_requests_per_minute, 10); // default
+        assert_eq!(bw.max_password_attempts, 5); // default
+    }
+
+    #[test]
+    fn bitwarden_config_absent() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+        let config = Config::load(&path).unwrap();
+        assert!(config.bitwarden.is_none());
     }
 
     #[test]

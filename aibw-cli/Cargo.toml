@@ -1,0 +1,13 @@
+[package]
+name = "aibw-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "aibw"
+path = "src/main.rs"
+
+[dependencies]
+aisudo-common = { path = "../aisudo-common" }
+serde_json = "1"
+libc = "0.2"

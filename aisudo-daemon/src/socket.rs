@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use crate::bw_session::BwSessionManager;
-use crate::config::ConfigHolder;
+use crate::config::{ConfigHolder, LimitsConfig, RateLimitMode};
 use crate::db::Database;
 use crate::notification::{BwConfirmRecord, BwRequestRecord, NotificationBackend, TempRuleRecord};
 use crate::sudoers::SudoersCache;
@@ -275,8 +275,7 @@ pub async fn run_socket_listener(
                 let config = config_holder.config();
                 let timeout = config.timeout_seconds;
                 let allowlist = config.allowlist.clone();
-                let max_stdin_bytes = config.limits.max_stdin_bytes;
-                let max_temp_rule_duration = config.limits.max_temp_rule_duration_seconds;
+                let limits = config.limits.clone();
 
                 let bw_ctx = bw_session.as_ref().and_then(|session| {
                     config.bitwarden.as_ref().map(|bw_config| {
@@ -293,7 +292,7 @@ pub async fn run_socket_listener(
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(stream, db, backend, sudoers, timeout, &allowlist, max_stdin_bytes, max_temp_rule_duration, bw_ctx).await
+                        handle_connection(stream, db, backend, sudoers, timeout, &allowlist, limits, bw_ctx).await
                     {
                         error!("Connection handler error: {e:#}");
                     }
@@ -321,8 +320,7 @@ async fn handle_connection(
     sudoers: Arc<SudoersCache>,
     timeout_seconds: u32,
     allowlist: &[String],
-    max_stdin_bytes: usize,
-    max_temp_rule_duration: u32,
+    limits: LimitsConfig,
     bw_ctx: Option<Arc<BwHandlerContext>>,
 ) -> Result<()> {
     // Extract the real UID of the connecting process via SO_PEERCRED.
@@ -343,11 +341,11 @@ async fn handle_connection(
         match msg {
             SocketMessage::SudoRequest(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
-                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, max_stdin_bytes).await
+                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, &limits).await
             }
             SocketMessage::TempRuleRequest(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
-                handle_temp_rule_request(request, &mut writer, db, backend, max_temp_rule_duration).await
+                handle_temp_rule_request(request, &mut writer, db, backend, limits.max_temp_rule_duration_seconds).await
             }
             SocketMessage::ListRules(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
@@ -412,7 +410,7 @@ async fn handle_connection(
         match serde_json::from_str::<SudoRequest>(&line) {
             Ok(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
-                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, max_stdin_bytes).await
+                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, &limits).await
             }
             Err(_e) => Err(anyhow::anyhow!("invalid request")),
         }
@@ -459,7 +457,7 @@ async fn handle_sudo_request(
     sudoers: Arc<SudoersCache>,
     timeout_seconds: u32,
     allowlist: &[String],
-    max_stdin_bytes: usize,
+    limits: &LimitsConfig,
 ) -> Result<()> {
     let mode = request.mode;
     info!(
@@ -472,11 +470,11 @@ async fn handle_sudo_request(
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(stdin_b64)
             .map_err(|_| anyhow::anyhow!("invalid stdin encoding"))?;
-        if decoded.len() > max_stdin_bytes {
+        if decoded.len() > limits.max_stdin_bytes {
             warn!(
                 "stdin too large: {} bytes (max {})",
                 decoded.len(),
-                max_stdin_bytes
+                limits.max_stdin_bytes
             );
             let response = SudoResponse {
                 request_id: String::new(),
@@ -484,7 +482,7 @@ async fn handle_sudo_request(
                 error: Some(format!(
                     "stdin exceeds size limit ({} bytes, max {})",
                     decoded.len(),
-                    max_stdin_bytes
+                    limits.max_stdin_bytes
                 )),
             };
             let resp_json = serde_json::to_string(&response)?;
@@ -575,9 +573,19 @@ async fn handle_sudo_request(
         }
     }
 
-    // Rate limiting: max 30 non-allowlisted requests per minute per user
-    if !db.check_rate_limit(&request.user, 30)? {
-        warn!("Rate limit exceeded for user: {}", request.user);
+    // Rate limiting with configurable settings
+    let global_rate_limit = limits.rate_limit_mode == RateLimitMode::Global;
+    if !db.check_rate_limit(
+        &request.user,
+        limits.rate_limit_requests,
+        limits.rate_limit_window_seconds,
+        global_rate_limit,
+    )? {
+        let limit_type = if global_rate_limit { "global" } else { "per-user" };
+        warn!(
+            "Rate limit exceeded ({}): user={} limit={} window={}s",
+            limit_type, request.user, limits.rate_limit_requests, limits.rate_limit_window_seconds
+        );
         let response = SudoResponse {
             request_id: String::new(),
             decision: Decision::Denied,
@@ -1730,8 +1738,17 @@ mod tests {
 
         // Spawn the daemon handler
         let sudoers = Arc::new(SudoersCache::new(300));
+        let limits = LimitsConfig {
+            max_stdin_bytes: 10 * 1024 * 1024,
+            stdin_preview_bytes: 2048,
+            max_temp_rule_duration_seconds: 86400,
+            rate_limit_requests: 3,
+            rate_limit_window_seconds: 60,
+            rate_limit_count_allowlisted: false,
+            rate_limit_mode: RateLimitMode::PerUser,
+        };
         let handler = tokio::spawn(async move {
-            handle_connection(server, db_clone, backend, sudoers, 60, &[], 10 * 1024 * 1024, 86400, None).await
+            handle_connection(server, db_clone, backend, sudoers, 60, &[], limits, None).await
         });
 
         // Client side: send a request that should be rate-limited
@@ -1873,14 +1890,33 @@ mod tests {
         resolve_username(nix::unistd::getuid().as_raw()).unwrap_or_else(|| "unknown".to_string())
     }
 
+    /// Create a default LimitsConfig for tests.
+    fn test_limits() -> LimitsConfig {
+        LimitsConfig {
+            max_stdin_bytes: 10 * 1024 * 1024,
+            stdin_preview_bytes: 2048,
+            max_temp_rule_duration_seconds: 86400,
+            rate_limit_requests: 30,
+            rate_limit_window_seconds: 60,
+            rate_limit_count_allowlisted: false,
+            rate_limit_mode: RateLimitMode::PerUser,
+        }
+    }
+
+    /// Create a LimitsConfig with specific max_stdin_bytes for testing stdin limits.
+    fn test_limits_with_stdin(max_stdin_bytes: usize) -> LimitsConfig {
+        let mut limits = test_limits();
+        limits.max_stdin_bytes = max_stdin_bytes;
+        limits
+    }
+
     /// Helper: send a JSON message through the socket handler and return the first response line.
     async fn send_and_receive(
         db: Arc<crate::db::Database>,
         backend: Arc<dyn crate::notification::NotificationBackend>,
         request_json: &str,
         allowlist: &[String],
-        max_stdin_bytes: usize,
-        max_temp_rule_duration: u32,
+        limits: LimitsConfig,
     ) -> String {
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
         let sudoers = Arc::new(SudoersCache::new(0)); // 0 TTL so cache is always stale
@@ -1889,7 +1925,7 @@ mod tests {
         let backend2 = Arc::clone(&backend);
         let allowlist = allowlist.to_vec();
         let handler = tokio::spawn(async move {
-            handle_connection(server, db2, backend2, sudoers, 60, &allowlist, max_stdin_bytes, max_temp_rule_duration, None).await
+            handle_connection(server, db2, backend2, sudoers, 60, &allowlist, limits, None).await
         });
 
         let (reader, mut writer) = client.into_split();
@@ -1932,7 +1968,7 @@ mod tests {
 
         let resp_line = send_and_receive(
             db, backend, &json,
-            &["apt list".to_string()], 10_000_000, 86400,
+            &["apt list".to_string()], test_limits(),
         ).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
@@ -1957,7 +1993,7 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -1981,7 +2017,7 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2005,7 +2041,7 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2035,7 +2071,7 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
 
         // max_stdin_bytes = 100, so 200-byte stdin should be rejected
-        let resp_line = send_and_receive(db, backend, &json, &[], 100, 86400).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], test_limits_with_stdin(100)).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2049,7 +2085,7 @@ mod tests {
         let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
 
         let resp_line = send_and_receive(
-            db, backend, "this is not json", &[], 10_000_000, 86400,
+            db, backend, "this is not json", &[], test_limits(),
         ).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
@@ -2072,7 +2108,9 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
 
         // max_temp_rule_duration = 3600
-        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 3600).await;
+        let mut limits = test_limits();
+        limits.max_temp_rule_duration_seconds = 3600;
+        let resp_line = send_and_receive(db, backend, &json, &[], limits).await;
 
         let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2093,7 +2131,7 @@ mod tests {
         });
         let json = serde_json::to_string(&msg).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
 
         let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2114,7 +2152,7 @@ mod tests {
         });
         let json = serde_json::to_string(&msg).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
 
         let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -2144,7 +2182,7 @@ mod tests {
 
         let resp_line = send_and_receive(
             db, backend, &json,
-            &["apt list".to_string()], 10_000_000, 86400,
+            &["apt list".to_string()], test_limits(),
         ).await;
 
         let response: aisudo_common::ListRulesResponse = serde_json::from_str(&resp_line).unwrap();
@@ -2181,7 +2219,7 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], 10_000_000, 86400).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);

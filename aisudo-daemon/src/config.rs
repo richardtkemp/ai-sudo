@@ -61,6 +61,22 @@ fn default_poll_timeout() -> u32 {
     30
 }
 
+/// Rate limiting mode: per-user or global.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitMode {
+    /// Each user has their own rate limit bucket.
+    PerUser,
+    /// All users share a single global rate limit bucket.
+    Global,
+}
+
+impl Default for RateLimitMode {
+    fn default() -> Self {
+        Self::PerUser
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
     #[serde(default = "default_max_stdin")]
@@ -71,6 +87,33 @@ pub struct LimitsConfig {
 
     #[serde(default = "default_max_temp_rule_duration")]
     pub max_temp_rule_duration_seconds: u32,
+
+    /// Maximum requests per rate limit window.
+    /// Default: 30 (same as previous hardcoded value).
+    #[serde(default = "default_rate_limit_requests")]
+    pub rate_limit_requests: u32,
+
+    /// Rate limit window duration in seconds.
+    /// Default: 60 (1 minute).
+    #[serde(default = "default_rate_limit_window_seconds")]
+    pub rate_limit_window_seconds: u32,
+
+    /// Whether allowlisted/temp-rule commands count toward rate limit.
+    /// Default: false (allowlisted commands bypass rate limiting entirely).
+    #[serde(default)]
+    pub rate_limit_count_allowlisted: bool,
+
+    /// Rate limit mode: per_user (default) or global.
+    #[serde(default)]
+    pub rate_limit_mode: RateLimitMode,
+}
+
+fn default_rate_limit_requests() -> u32 {
+    30
+}
+
+fn default_rate_limit_window_seconds() -> u32 {
+    60
 }
 
 fn default_max_stdin() -> usize {
@@ -90,6 +133,10 @@ fn default_limits() -> LimitsConfig {
         max_stdin_bytes: default_max_stdin(),
         stdin_preview_bytes: default_stdin_preview(),
         max_temp_rule_duration_seconds: default_max_temp_rule_duration(),
+        rate_limit_requests: default_rate_limit_requests(),
+        rate_limit_window_seconds: default_rate_limit_window_seconds(),
+        rate_limit_count_allowlisted: false,
+        rate_limit_mode: RateLimitMode::PerUser,
     }
 }
 
@@ -233,9 +280,11 @@ fn load_conf_d(config_path: &Path) -> anyhow::Result<Vec<(String, Value)>> {
 
     let mut results = Vec::new();
     for (name, path) in entries {
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("cannot read drop-in config '{}': {}", path.display(), e))?;
-        let value: Value = content.parse()
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("cannot read drop-in config '{}': {}", path.display(), e)
+        })?;
+        let value: Value = content
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid TOML in drop-in '{}': {}", name, e))?;
         results.push((name, value));
     }
@@ -249,7 +298,8 @@ impl Config {
 
         let content = std::fs::read_to_string(config_path)
             .map_err(|e| anyhow::anyhow!("cannot read config file '{}': {}", path, e))?;
-        let mut base: Value = content.parse()
+        let mut base: Value = content
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid config in '{}': {}", path, e))?;
 
         let dropins = load_conf_d(config_path)?;
@@ -258,7 +308,8 @@ impl Config {
             base = merge_toml_values(base, overlay.clone());
         }
 
-        let config: Config = base.try_into()
+        let config: Config = base
+            .try_into()
             .map_err(|e| anyhow::anyhow!("invalid config after merging drop-ins: {}", e))?;
         Ok(config)
     }
@@ -440,11 +491,7 @@ max_stdin_bytes = 1024
         let conf_d = tmp.path().join("conf.d");
         fs::create_dir(&conf_d).unwrap();
         // Only override chat_id within [telegram], leave bot_token intact
-        fs::write(
-            conf_d.join("telegram.toml"),
-            "[telegram]\nchat_id = 999\n",
-        )
-        .unwrap();
+        fs::write(conf_d.join("telegram.toml"), "[telegram]\nchat_id = 999\n").unwrap();
 
         let path = write_main_config(tmp.path(), BASE_CONFIG);
         let config = Config::load(&path).unwrap();
@@ -477,7 +524,11 @@ max_stdin_bytes = 1024
         let path = write_main_config(tmp.path(), BASE_CONFIG);
         let err = Config::load(&path).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("bad.toml"), "error should mention filename: {}", msg);
+        assert!(
+            msg.contains("bad.toml"),
+            "error should mention filename: {}",
+            msg
+        );
     }
 
     #[test]
@@ -499,7 +550,10 @@ max_stdin_bytes = 1024
     fn merge_toml_values_overlay_wins_for_non_tables() {
         let base: Value = "hello".into();
         let overlay: Value = "world".into();
-        assert_eq!(merge_toml_values(base, overlay), Value::String("world".into()));
+        assert_eq!(
+            merge_toml_values(base, overlay),
+            Value::String("world".into())
+        );
     }
 
     #[test]
@@ -612,8 +666,14 @@ max_stdin_bytes = 1024
         let tmp = TempDir::new().unwrap();
         let path = write_main_config(tmp.path(), "");
         let config = Config::load(&path).unwrap();
-        assert_eq!(config.socket_path.to_str().unwrap(), "/var/run/aisudo/aisudo.sock");
-        assert_eq!(config.db_path.to_str().unwrap(), "/var/lib/aisudo/aisudo.db");
+        assert_eq!(
+            config.socket_path.to_str().unwrap(),
+            "/var/run/aisudo/aisudo.sock"
+        );
+        assert_eq!(
+            config.db_path.to_str().unwrap(),
+            "/var/lib/aisudo/aisudo.db"
+        );
         assert_eq!(config.timeout_seconds, 60);
         assert!(config.allowlist.is_empty());
         assert!(config.telegram.is_none());
@@ -719,5 +779,65 @@ scrub_delay = 300
         let config = Config::load(&path).unwrap();
         assert_eq!(config.limits.max_temp_rule_duration_seconds, 7200);
         assert_eq!(config.limits.max_stdin_bytes, 1024); // unchanged from base
+    }
+
+    // ===== Rate Limit Configuration Tests =====
+
+    #[test]
+    fn rate_limit_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), "");
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.limits.rate_limit_requests, 30);
+        assert_eq!(config.limits.rate_limit_window_seconds, 60);
+        assert!(!config.limits.rate_limit_count_allowlisted);
+        assert_eq!(config.limits.rate_limit_mode, RateLimitMode::PerUser);
+    }
+
+    #[test]
+    fn rate_limit_custom_values() {
+        let tmp = TempDir::new().unwrap();
+        let config_content = r#"
+        [limits]
+        rate_limit_requests = 100
+        rate_limit_window_seconds = 300
+        rate_limit_count_allowlisted = true
+        rate_limit_mode = "global"
+        "#;
+        let path = write_main_config(tmp.path(), config_content);
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.limits.rate_limit_requests, 100);
+        assert_eq!(config.limits.rate_limit_window_seconds, 300);
+        assert!(config.limits.rate_limit_count_allowlisted);
+        assert_eq!(config.limits.rate_limit_mode, RateLimitMode::Global);
+    }
+
+    #[test]
+    fn rate_limit_mode_per_user_parsing() {
+        let tmp = TempDir::new().unwrap();
+        let config_content = r#"
+        [limits]
+        rate_limit_mode = "per_user"
+        "#;
+        let path = write_main_config(tmp.path(), config_content);
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.limits.rate_limit_mode, RateLimitMode::PerUser);
+    }
+
+    #[test]
+    fn rate_limit_partial_override() {
+        let tmp = TempDir::new().unwrap();
+        let conf_d = tmp.path().join("conf.d");
+        fs::create_dir(&conf_d).unwrap();
+        fs::write(
+            conf_d.join("rate_limits.toml"),
+            "[limits]\nrate_limit_requests = 50\n",
+        )
+        .unwrap();
+
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.limits.rate_limit_requests, 50);
+        assert_eq!(config.limits.rate_limit_window_seconds, 60); // default
     }
 }

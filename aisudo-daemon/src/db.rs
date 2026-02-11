@@ -179,7 +179,14 @@ impl Database {
             Some(n) => format!(" stdin_bytes={n}"),
             None => String::new(),
         };
-        self.audit_log(&record.id, "request_created", &format!("user={} command={}{}", record.user, record.command, stdin_info))?;
+        self.audit_log(
+            &record.id,
+            "request_created",
+            &format!(
+                "user={} command={}{}",
+                record.user, record.command, stdin_info
+            ),
+        )?;
         Ok(())
     }
 
@@ -321,7 +328,11 @@ impl Database {
             params![id, user, patterns_json, duration_seconds, requested_at, expires_at, nonce, reason],
         )?;
         drop(conn);
-        self.audit_log(id, "temp_rule_created", &format!("user={user} patterns={patterns_json} duration={duration_seconds}s"))?;
+        self.audit_log(
+            id,
+            "temp_rule_created",
+            &format!("user={user} patterns={patterns_json} duration={duration_seconds}s"),
+        )?;
         Ok(())
     }
 
@@ -485,7 +496,11 @@ impl Database {
             params![id, user, item_name, field, nonce],
         )?;
         drop(conn);
-        self.audit_log(id, "bw_request_created", &format!("user={user} item={item_name} field={field}"))?;
+        self.audit_log(
+            id,
+            "bw_request_created",
+            &format!("user={user} item={item_name} field={field}"),
+        )?;
         Ok(())
     }
 
@@ -503,7 +518,11 @@ impl Database {
         )?;
         if changed > 0 {
             drop(conn);
-            self.audit_log(id, &format!("bw_request_{status}"), &format!("by={decided_by}"))?;
+            self.audit_log(
+                id,
+                &format!("bw_request_{status}"),
+                &format!("by={decided_by}"),
+            )?;
         }
         Ok(changed > 0)
     }
@@ -632,7 +651,10 @@ impl Database {
         self.audit_log(
             request_id,
             "bw_scrub_scheduled",
-            &format!("hash={credential_hash} scrub_at={scrub_at} files={}", session_files.len()),
+            &format!(
+                "hash={credential_hash} scrub_at={scrub_at} files={}",
+                session_files.len()
+            ),
         )?;
         Ok(())
     }
@@ -645,8 +667,7 @@ impl Database {
         )?;
         let rows = stmt.query_map([], |row| {
             let files_json: String = row.get(5)?;
-            let session_files: Vec<String> =
-                serde_json::from_str(&files_json).unwrap_or_default();
+            let session_files: Vec<String> = serde_json::from_str(&files_json).unwrap_or_default();
             Ok(ScrubQueueEntry {
                 id: row.get(0)?,
                 request_id: row.get(1)?,
@@ -727,15 +748,47 @@ impl Database {
         Ok(count < max_per_minute)
     }
 
-    pub fn check_rate_limit(&self, user: &str, max_per_minute: u32) -> Result<bool> {
+    /// Check sudo request rate limit.
+    ///
+    /// - `user`: The user making the request (ignored if mode is global)
+    /// - `max_requests`: Maximum requests allowed in the window
+    /// - `window_seconds`: The rate limit window duration in seconds
+    /// - `global`: If true, count requests from all users; if false, only this user
+    pub fn check_rate_limit(
+        &self,
+        user: &str,
+        max_requests: u32,
+        window_seconds: u32,
+        global: bool,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let count: u32 = conn.query_row(
-            "SELECT COUNT(*) FROM requests
-             WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 minute')",
-            params![user],
-            |row| row.get(0),
-        )?;
-        Ok(count < max_per_minute)
+        let count: u32 = if global {
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM requests
+                     WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-{} seconds')",
+                    window_seconds
+                ),
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM requests
+                     WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-{} seconds')",
+                    window_seconds
+                ),
+                params![user],
+                |row| row.get(0),
+            )?
+        };
+        Ok(count < max_requests)
+    }
+
+    /// Legacy rate limit check for backwards compatibility (1-minute window, per-user).
+    pub fn check_rate_limit_legacy(&self, user: &str, max_per_minute: u32) -> Result<bool> {
+        self.check_rate_limit(user, max_per_minute, 60, false)
     }
 }
 
@@ -758,9 +811,16 @@ mod tests {
         let patterns = serde_json::to_string(&vec!["apt install", "apt list"]).unwrap();
 
         db.insert_temp_rule(
-            "rule-1", "alice", &patterns, 3600,
-            &now.to_rfc3339(), &expires, "nonce-1", Some("need deps"),
-        ).unwrap();
+            "rule-1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &expires,
+            "nonce-1",
+            Some("need deps"),
+        )
+        .unwrap();
 
         let rule = db.get_temp_rule("rule-1").unwrap().unwrap();
         assert_eq!(rule.user, "alice");
@@ -777,23 +837,77 @@ mod tests {
         let patterns = serde_json::to_string(&vec!["apt install"]).unwrap();
 
         // Approved, not expired — should be returned
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         // Pending — should NOT be returned
-        db.insert_temp_rule("r2", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n2", None).unwrap();
+        db.insert_temp_rule(
+            "r2",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n2",
+            None,
+        )
+        .unwrap();
 
         // Denied — should NOT be returned
-        db.insert_temp_rule("r3", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n3", None).unwrap();
-        db.update_temp_rule_decision("r3", Decision::Denied, "test").unwrap();
+        db.insert_temp_rule(
+            "r3",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n3",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r3", Decision::Denied, "test")
+            .unwrap();
 
         // Approved but expired — should NOT be returned
-        db.insert_temp_rule("r4", "alice", &patterns, 3600, &now.to_rfc3339(), &past, "n4", None).unwrap();
-        db.update_temp_rule_decision("r4", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r4",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &past,
+            "n4",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r4", Decision::Approved, "test")
+            .unwrap();
 
         // Different user — should NOT be returned
-        db.insert_temp_rule("r5", "bob", &patterns, 3600, &now.to_rfc3339(), &future, "n5", None).unwrap();
-        db.update_temp_rule_decision("r5", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r5",
+            "bob",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n5",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r5", Decision::Approved, "test")
+            .unwrap();
 
         let active = db.get_active_temp_rules("alice").unwrap();
         assert_eq!(active.len(), 1);
@@ -807,13 +921,27 @@ mod tests {
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["apt install"]).unwrap();
 
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
 
         // First update should succeed
-        assert!(db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap());
+        assert!(db
+            .update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap());
 
         // Second update should fail (no longer pending)
-        assert!(!db.update_temp_rule_decision("r1", Decision::Denied, "test").unwrap());
+        assert!(!db
+            .update_temp_rule_decision("r1", Decision::Denied, "test")
+            .unwrap());
 
         let rule = db.get_temp_rule("r1").unwrap().unwrap();
         assert_eq!(rule.status, "approved");
@@ -893,7 +1021,9 @@ mod tests {
         let id = record.id.clone();
         db.insert_request(&record).unwrap();
 
-        assert!(db.update_decision(&id, Decision::Approved, "tester").unwrap());
+        assert!(db
+            .update_decision(&id, Decision::Approved, "tester")
+            .unwrap());
 
         let fetched = db.get_request(&id).unwrap().unwrap();
         assert_eq!(fetched.status, Decision::Approved);
@@ -918,7 +1048,9 @@ mod tests {
         let id = record.id.clone();
         db.insert_request(&record).unwrap();
 
-        assert!(db.update_decision(&id, Decision::Approved, "first").unwrap());
+        assert!(db
+            .update_decision(&id, Decision::Approved, "first")
+            .unwrap());
         assert!(!db.update_decision(&id, Decision::Denied, "second").unwrap());
 
         let fetched = db.get_request(&id).unwrap().unwrap();
@@ -961,8 +1093,28 @@ mod tests {
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["apt install"]).unwrap();
 
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.insert_temp_rule("r2", "bob", &patterns, 7200, &now.to_rfc3339(), &future, "n2", Some("testing")).unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.insert_temp_rule(
+            "r2",
+            "bob",
+            &patterns,
+            7200,
+            &now.to_rfc3339(),
+            &future,
+            "n2",
+            Some("testing"),
+        )
+        .unwrap();
 
         let all = db.get_all_temp_rules().unwrap();
         assert_eq!(all.len(), 2);
@@ -975,8 +1127,19 @@ mod tests {
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["apt install", "apt list"]).unwrap();
 
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         let detailed = db.get_active_temp_rules_detailed("alice").unwrap();
         assert_eq!(detailed.len(), 1);
@@ -986,7 +1149,7 @@ mod tests {
     #[test]
     fn check_rate_limit_under_limit() {
         let (_dir, db) = test_db();
-        assert!(db.check_rate_limit("alice", 5).unwrap());
+        assert!(db.check_rate_limit("alice", 5, 60, false).unwrap());
     }
 
     #[test]
@@ -1006,9 +1169,70 @@ mod tests {
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
         }
-        assert!(!db.check_rate_limit("alice", 5).unwrap());
-        // Different user still under limit
-        assert!(db.check_rate_limit("bob", 5).unwrap());
+        assert!(!db.check_rate_limit("alice", 5, 60, false).unwrap());
+        // Different user still under limit (per-user mode)
+        assert!(db.check_rate_limit("bob", 5, 60, false).unwrap());
+    }
+
+    #[test]
+    fn check_rate_limit_global_mode() {
+        let (_dir, db) = test_db();
+        // Insert 3 requests for alice
+        for i in 0..3 {
+            let req = aisudo_common::SudoRequest {
+                user: "alice".to_string(),
+                command: format!("cmd-{i}"),
+                cwd: "/".to_string(),
+                pid: i as u32,
+                mode: aisudo_common::RequestMode::Pam,
+                reason: None,
+                stdin: None,
+                skip_nopasswd: false,
+            };
+            let record = aisudo_common::SudoRequestRecord::new(req, 60);
+            db.insert_request(&record).unwrap();
+        }
+        // Insert 2 requests for bob
+        for i in 0..2 {
+            let req = aisudo_common::SudoRequest {
+                user: "bob".to_string(),
+                command: format!("cmd-{i}"),
+                cwd: "/".to_string(),
+                pid: i as u32,
+                mode: aisudo_common::RequestMode::Pam,
+                reason: None,
+                stdin: None,
+                skip_nopasswd: false,
+            };
+            let record = aisudo_common::SudoRequestRecord::new(req, 60);
+            db.insert_request(&record).unwrap();
+        }
+        // Global limit of 5: should be exceeded now (3 + 2 = 5)
+        assert!(!db.check_rate_limit("charlie", 5, 60, true).unwrap());
+    }
+
+    #[test]
+    fn check_rate_limit_custom_window() {
+        let (_dir, db) = test_db();
+        // Insert 3 requests
+        for i in 0..3 {
+            let req = aisudo_common::SudoRequest {
+                user: "alice".to_string(),
+                command: format!("cmd-{i}"),
+                cwd: "/".to_string(),
+                pid: i as u32,
+                mode: aisudo_common::RequestMode::Pam,
+                reason: None,
+                stdin: None,
+                skip_nopasswd: false,
+            };
+            let record = aisudo_common::SudoRequestRecord::new(req, 60);
+            db.insert_request(&record).unwrap();
+        }
+        // With window of 60s and limit of 2, should be exceeded
+        assert!(!db.check_rate_limit("alice", 2, 60, false).unwrap());
+        // With window of 60s and limit of 5, should be under limit
+        assert!(db.check_rate_limit("alice", 5, 60, false).unwrap());
     }
 
     #[test]
@@ -1020,12 +1244,34 @@ mod tests {
         let patterns = serde_json::to_string(&vec!["apt install"]).unwrap();
 
         // Approved and expired
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &past, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &past,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         // Approved but not expired yet
-        db.insert_temp_rule("r2", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n2", None).unwrap();
-        db.update_temp_rule_decision("r2", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r2",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n2",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r2", Decision::Approved, "test")
+            .unwrap();
 
         let expired = db.expire_temp_rules().unwrap();
         assert_eq!(expired, vec!["r1"]);
@@ -1043,7 +1289,8 @@ mod tests {
     #[test]
     fn insert_and_get_bw_request() {
         let (_dir, db) = test_db();
-        db.insert_bw_request("bw-1", "alice", "GitHub Token", "password", "nonce-1").unwrap();
+        db.insert_bw_request("bw-1", "alice", "GitHub Token", "password", "nonce-1")
+            .unwrap();
 
         let req = db.get_bw_request("bw-1").unwrap().unwrap();
         assert_eq!(req.user, "alice");
@@ -1064,8 +1311,11 @@ mod tests {
     #[test]
     fn update_bw_request_status_and_get() {
         let (_dir, db) = test_db();
-        db.insert_bw_request("bw-1", "alice", "Token", "password", "n1").unwrap();
-        assert!(db.update_bw_request_status("bw-1", "approved", "telegram").unwrap());
+        db.insert_bw_request("bw-1", "alice", "Token", "password", "n1")
+            .unwrap();
+        assert!(db
+            .update_bw_request_status("bw-1", "approved", "telegram")
+            .unwrap());
 
         let req = db.get_bw_request("bw-1").unwrap().unwrap();
         assert_eq!(req.status, "approved");
@@ -1076,18 +1326,25 @@ mod tests {
     #[test]
     fn set_bw_resolved_name() {
         let (_dir, db) = test_db();
-        db.insert_bw_request("bw-1", "alice", "Token", "password", "n1").unwrap();
-        db.set_bw_resolved_name("bw-1", "GitHub Personal Access Token").unwrap();
+        db.insert_bw_request("bw-1", "alice", "Token", "password", "n1")
+            .unwrap();
+        db.set_bw_resolved_name("bw-1", "GitHub Personal Access Token")
+            .unwrap();
 
         let req = db.get_bw_request("bw-1").unwrap().unwrap();
-        assert_eq!(req.resolved_item_name.as_deref(), Some("GitHub Personal Access Token"));
+        assert_eq!(
+            req.resolved_item_name.as_deref(),
+            Some("GitHub Personal Access Token")
+        );
     }
 
     #[test]
     fn set_bw_credential_hash() {
         let (_dir, db) = test_db();
-        db.insert_bw_request("bw-1", "alice", "Token", "password", "n1").unwrap();
-        db.set_bw_credential_hash("bw-1", "sha256:abc12345").unwrap();
+        db.insert_bw_request("bw-1", "alice", "Token", "password", "n1")
+            .unwrap();
+        db.set_bw_credential_hash("bw-1", "sha256:abc12345")
+            .unwrap();
 
         let req = db.get_bw_request("bw-1").unwrap().unwrap();
         assert_eq!(req.credential_hash.as_deref(), Some("sha256:abc12345"));
@@ -1096,8 +1353,19 @@ mod tests {
     #[test]
     fn insert_and_get_scrub_entry() {
         let (_dir, db) = test_db();
-        let files = vec!["/tmp/session1.jsonl".to_string(), "/tmp/session2.jsonl".to_string()];
-        db.insert_scrub_entry("scrub-1", "bw-1", "sha256:abc", "secret123", "2026-02-08T12:00:00Z", &files).unwrap();
+        let files = vec![
+            "/tmp/session1.jsonl".to_string(),
+            "/tmp/session2.jsonl".to_string(),
+        ];
+        db.insert_scrub_entry(
+            "scrub-1",
+            "bw-1",
+            "sha256:abc",
+            "secret123",
+            "2026-02-08T12:00:00Z",
+            &files,
+        )
+        .unwrap();
 
         let pending = db.get_pending_scrubs().unwrap();
         assert_eq!(pending.len(), 1);
@@ -1113,7 +1381,15 @@ mod tests {
     fn complete_scrub_removes_from_pending() {
         let (_dir, db) = test_db();
         let files = vec!["/tmp/session.jsonl".to_string()];
-        db.insert_scrub_entry("scrub-1", "bw-1", "sha256:abc", "secret", "2026-02-08T12:00:00Z", &files).unwrap();
+        db.insert_scrub_entry(
+            "scrub-1",
+            "bw-1",
+            "sha256:abc",
+            "secret",
+            "2026-02-08T12:00:00Z",
+            &files,
+        )
+        .unwrap();
 
         db.complete_scrub("scrub-1").unwrap();
 
@@ -1125,7 +1401,15 @@ mod tests {
     fn defer_scrub_increments_retry() {
         let (_dir, db) = test_db();
         let files = vec!["/tmp/session.jsonl".to_string()];
-        db.insert_scrub_entry("scrub-1", "bw-1", "sha256:abc", "secret", "2026-02-08T12:00:00Z", &files).unwrap();
+        db.insert_scrub_entry(
+            "scrub-1",
+            "bw-1",
+            "sha256:abc",
+            "secret",
+            "2026-02-08T12:00:00Z",
+            &files,
+        )
+        .unwrap();
         db.update_scrub_status("scrub-1", "in_progress").unwrap();
 
         db.defer_scrub("scrub-1", 30).unwrap();
@@ -1140,9 +1424,19 @@ mod tests {
     fn extend_scrub_timer_existing() {
         let (_dir, db) = test_db();
         let files = vec!["/tmp/session.jsonl".to_string()];
-        db.insert_scrub_entry("scrub-1", "bw-1", "sha256:abc", "secret", "2026-02-08T12:00:00Z", &files).unwrap();
+        db.insert_scrub_entry(
+            "scrub-1",
+            "bw-1",
+            "sha256:abc",
+            "secret",
+            "2026-02-08T12:00:00Z",
+            &files,
+        )
+        .unwrap();
 
-        assert!(db.extend_scrub_timer("sha256:abc", "2026-02-08T13:00:00Z").unwrap());
+        assert!(db
+            .extend_scrub_timer("sha256:abc", "2026-02-08T13:00:00Z")
+            .unwrap());
 
         let pending = db.get_pending_scrubs().unwrap();
         assert_eq!(pending[0].scrub_at, "2026-02-08T13:00:00Z");
@@ -1151,7 +1445,9 @@ mod tests {
     #[test]
     fn extend_scrub_timer_no_match() {
         let (_dir, db) = test_db();
-        assert!(!db.extend_scrub_timer("sha256:nonexistent", "2026-02-08T13:00:00Z").unwrap());
+        assert!(!db
+            .extend_scrub_timer("sha256:nonexistent", "2026-02-08T13:00:00Z")
+            .unwrap());
     }
 
     #[test]
@@ -1172,7 +1468,14 @@ mod tests {
     fn check_bw_rate_limit_at_limit() {
         let (_dir, db) = test_db();
         for i in 0..10 {
-            db.insert_bw_request(&format!("bw-{i}"), "alice", "Token", "password", &format!("n{i}")).unwrap();
+            db.insert_bw_request(
+                &format!("bw-{i}"),
+                "alice",
+                "Token",
+                "password",
+                &format!("n{i}"),
+            )
+            .unwrap();
         }
         assert!(!db.check_bw_rate_limit("alice", 10).unwrap());
         // Different user still under limit

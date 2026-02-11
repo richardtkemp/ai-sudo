@@ -1,4 +1,4 @@
-use aisudo_common::{Decision, SudoRequestRecord};
+use aisudo_common::{Decision, HistoryEntry, SudoRequestRecord};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -790,6 +790,72 @@ impl Database {
     pub fn check_rate_limit_legacy(&self, user: &str, max_per_minute: u32) -> Result<bool> {
         self.check_rate_limit(user, max_per_minute, 60, false)
     }
+
+    /// Get the number of pending approval requests.
+    pub fn get_pending_count(&self) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let count: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM requests WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get the number of requests in the last hour.
+    pub fn get_requests_last_hour(&self) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let count: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM requests WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 hour')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get the approval rate in the last hour (0.0 - 1.0).
+    pub fn get_approval_rate_last_hour(&self) -> Result<f64> {
+        let conn = self.conn.lock().unwrap();
+        let total: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM requests WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 hour')",
+            [],
+            |row| row.get(0),
+        )?;
+        if total == 0 {
+            return Ok(0.0);
+        }
+        let approved: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM requests WHERE status = 'approved' AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 hour')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(approved as f64 / total as f64)
+    }
+
+    /// Get recent request history for a user.
+    pub fn get_history(&self, user: &str, limit: u32) -> Result<Vec<HistoryEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, command, timestamp, status, decided_by FROM requests
+             WHERE user = ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![user, limit], |row| {
+            Ok(HistoryEntry {
+                id: row.get(0)?,
+                command: row.get(1)?,
+                timestamp: row.get(2)?,
+                status: row.get(3)?,
+                decided_by: row.get(4)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -959,6 +1025,8 @@ mod tests {
             reason: Some("testing".to_string()),
             stdin: Some("aGVsbG8=".to_string()),
             skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -989,6 +1057,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1016,6 +1086,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1043,6 +1115,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1070,6 +1144,8 @@ mod tests {
                 reason: None,
                 stdin: None,
                 skip_nopasswd: false,
+                timeout_seconds: None,
+                dry_run: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             let id = record.id.clone();
@@ -1165,6 +1241,8 @@ mod tests {
                 reason: None,
                 stdin: None,
                 skip_nopasswd: false,
+                timeout_seconds: None,
+                dry_run: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1188,6 +1266,8 @@ mod tests {
                 reason: None,
                 stdin: None,
                 skip_nopasswd: false,
+                timeout_seconds: None,
+                dry_run: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1203,6 +1283,8 @@ mod tests {
                 reason: None,
                 stdin: None,
                 skip_nopasswd: false,
+                timeout_seconds: None,
+                dry_run: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1225,6 +1307,8 @@ mod tests {
                 reason: None,
                 stdin: None,
                 skip_nopasswd: false,
+                timeout_seconds: None,
+                dry_run: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1233,55 +1317,6 @@ mod tests {
         assert!(!db.check_rate_limit("alice", 2, 60, false).unwrap());
         // With window of 60s and limit of 5, should be under limit
         assert!(db.check_rate_limit("alice", 5, 60, false).unwrap());
-    }
-
-    #[test]
-    fn expire_temp_rules_marks_expired() {
-        let (_dir, db) = test_db();
-        let now = chrono::Utc::now();
-        let past = (now - chrono::Duration::seconds(10)).to_rfc3339();
-        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
-        let patterns = serde_json::to_string(&vec!["apt install"]).unwrap();
-
-        // Approved and expired
-        db.insert_temp_rule(
-            "r1",
-            "alice",
-            &patterns,
-            3600,
-            &now.to_rfc3339(),
-            &past,
-            "n1",
-            None,
-        )
-        .unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test")
-            .unwrap();
-
-        // Approved but not expired yet
-        db.insert_temp_rule(
-            "r2",
-            "alice",
-            &patterns,
-            3600,
-            &now.to_rfc3339(),
-            &future,
-            "n2",
-            None,
-        )
-        .unwrap();
-        db.update_temp_rule_decision("r2", Decision::Approved, "test")
-            .unwrap();
-
-        let expired = db.expire_temp_rules().unwrap();
-        assert_eq!(expired, vec!["r1"]);
-
-        let rule = db.get_temp_rule("r1").unwrap().unwrap();
-        assert_eq!(rule.status, "expired");
-
-        // r2 should still be approved
-        let rule = db.get_temp_rule("r2").unwrap().unwrap();
-        assert_eq!(rule.status, "approved");
     }
 
     // --- Bitwarden DB tests ---

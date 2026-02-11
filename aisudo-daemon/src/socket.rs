@@ -1,7 +1,8 @@
 use aisudo_common::{
     ActiveTempRule, BwGetResponse, BwLockResponse, BwStatusResponse, Decision, ExecOutput,
-    ListRulesRequest, ListRulesResponse, RequestMode, SocketMessage, SudoRequest,
-    SudoRequestRecord, SudoResponse, TempRuleRequest, TempRuleResponse,
+    HistoryRequest, HistoryResponse, ListRulesRequest, ListRulesResponse, RequestMode,
+    SocketMessage, StatusRequest, StatusResponse, SudoRequest, SudoRequestRecord, SudoResponse,
+    TempRuleRequest, TempRuleResponse,
 };
 use anyhow::Result;
 use base64::Engine as _;
@@ -351,6 +352,14 @@ async fn handle_connection(
                 override_user_from_peer(&mut request.user, peer_uid);
                 handle_list_rules(request, &mut writer, db, sudoers, allowlist).await
             }
+            SocketMessage::Status(mut request) => {
+                override_user_from_peer(&mut request.user, peer_uid);
+                handle_status(request, &mut writer, db, bw_ctx.is_some()).await
+            }
+            SocketMessage::History(mut request) => {
+                override_user_from_peer(&mut request.user, peer_uid);
+                handle_history(request, &mut writer, db).await
+            }
             SocketMessage::BwGet(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
                 match &bw_ctx {
@@ -500,9 +509,27 @@ async fn handle_sudo_request(
     // Check allowlist first - auto-approved commands skip rate limiting
     let command = request.command.clone();
     let cwd = request.cwd.clone();
+    let dry_run = request.dry_run;
+    let effective_timeout = request.timeout_seconds.unwrap_or(timeout_seconds);
+    
     if is_allowed(&command, allowlist) {
         info!("Command auto-approved via allowlist: {}", command);
-        let record = SudoRequestRecord::new(request, timeout_seconds);
+        
+        // For dry-run, just return approved without executing or logging
+        if dry_run {
+            let response = SudoResponse {
+                request_id: String::new(),
+                decision: Decision::Approved,
+                error: None,
+            };
+            let resp_json = serde_json::to_string(&response)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+        
+        let record = SudoRequestRecord::new(request, effective_timeout);
         db.insert_request(&record)?;
         db.update_decision(&record.id, Decision::Approved, "allowlist")?;
         let response = SudoResponse {
@@ -525,7 +552,22 @@ async fn handle_sudo_request(
     // Check active temp rules - auto-approved commands skip rate limiting
     if is_temp_rule_allowed(&db, &request.user, &command)? {
         info!("Command auto-approved via temp rule: {}", command);
-        let record = SudoRequestRecord::new(request, timeout_seconds);
+        
+        // For dry-run, just return approved without executing or logging
+        if dry_run {
+            let response = SudoResponse {
+                request_id: String::new(),
+                decision: Decision::Approved,
+                error: None,
+            };
+            let resp_json = serde_json::to_string(&response)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+        
+        let record = SudoRequestRecord::new(request.clone(), effective_timeout);
         db.insert_request(&record)?;
         db.update_decision(&record.id, Decision::Approved, "temp_rule")?;
         let response = SudoResponse {
@@ -557,7 +599,22 @@ async fn handle_sudo_request(
 
         if is_nopasswd {
             info!("Command matches NOPASSWD rule, telling CLI to use sudo: {}", command);
-            let record = SudoRequestRecord::new(request, timeout_seconds);
+            
+            // For dry-run, just return UseSudo without logging
+            if dry_run {
+                let response = SudoResponse {
+                    request_id: String::new(),
+                    decision: Decision::UseSudo,
+                    error: None,
+                };
+                let resp_json = serde_json::to_string(&response)?;
+                writer.write_all(resp_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+                return Ok(());
+            }
+            
+            let record = SudoRequestRecord::new(request.clone(), effective_timeout);
             db.insert_request(&record)?;
             db.update_decision(&record.id, Decision::UseSudo, "nopasswd")?;
             let response = SudoResponse {
@@ -598,8 +655,24 @@ async fn handle_sudo_request(
         return Ok(());
     }
 
-    // Create request record
-    let record = SudoRequestRecord::new(request, timeout_seconds);
+    // Create request record - use request-specific timeout if provided
+    let record = SudoRequestRecord::new(request.clone(), effective_timeout);
+    
+    // For dry-run mode, we don't insert into DB or send notifications
+    // We just return that it would require approval
+    if dry_run {
+        let response = SudoResponse {
+            request_id: String::new(),
+            decision: Decision::Denied,
+            error: Some("dry-run: would require approval".to_string()),
+        };
+        let resp_json = serde_json::to_string(&response)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+    
     db.insert_request(&record)?;
 
     // Send notification and wait for response
@@ -785,6 +858,62 @@ async fn handle_list_rules(
         temp_rules,
         nopasswd_rules,
     };
+
+    let resp_json = serde_json::to_string(&response)?;
+    writer.write_all(resp_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    Ok(())
+}
+
+async fn handle_status(
+    request: StatusRequest,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    db: Arc<Database>,
+    bw_active: bool,
+) -> Result<()> {
+    info!("Received status request for user={}", request.user);
+
+    let pending_requests = db.get_pending_count()?;
+    let requests_last_hour = db.get_requests_last_hour()?;
+    let approval_rate = db.get_approval_rate_last_hour()?;
+
+    // Calculate uptime from the oldest audit log entry (approximation)
+    let uptime_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let response = StatusResponse {
+        uptime_seconds,
+        pending_requests,
+        requests_last_hour,
+        approval_rate,
+        bw_active,
+    };
+
+    let resp_json = serde_json::to_string(&response)?;
+    writer.write_all(resp_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    Ok(())
+}
+
+async fn handle_history(
+    request: HistoryRequest,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    db: Arc<Database>,
+) -> Result<()> {
+    info!(
+        "Received history request for user={} limit={}",
+        request.user, request.limit
+    );
+
+    let entries = db.get_history(&request.user, request.limit)?;
+
+    let response = HistoryResponse { entries };
 
     let resp_json = serde_json::to_string(&response)?;
     writer.write_all(resp_json.as_bytes()).await?;
@@ -1726,6 +1855,8 @@ mod tests {
                 reason: None,
                 stdin: None,
                 skip_nopasswd: false,
+        timeout_seconds: None,
+        dry_run: false,
             };
             let record = SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1762,6 +1893,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: false,
+        timeout_seconds: None,
+        dry_run: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         writer.write_all(json.as_bytes()).await.unwrap();
@@ -1963,6 +2096,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -1990,6 +2125,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -2014,6 +2151,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -2038,6 +2177,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -2067,6 +2208,8 @@ mod tests {
             reason: None,
             stdin: Some(b64),
             skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -2216,6 +2359,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 

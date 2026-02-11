@@ -27,6 +27,13 @@ pub struct SudoRequest {
     /// Skip NOPASSWD check (set on retry after sudo -n fails).
     #[serde(default)]
     pub skip_nopasswd: bool,
+    /// Override timeout for this specific request (None = use daemon default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+    /// Dry-run mode: check if command would be auto-approved without executing.
+    /// Returns decision without actually running the command.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 fn default_mode() -> RequestMode {
@@ -127,6 +134,56 @@ pub struct ListRulesRequest {
     pub user: String,
 }
 
+/// Request daemon status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusRequest {
+    pub user: String,
+}
+
+/// Response with daemon status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusResponse {
+    /// Daemon uptime in seconds.
+    pub uptime_seconds: u64,
+    /// Number of pending approval requests.
+    pub pending_requests: u32,
+    /// Total requests in the last hour.
+    pub requests_last_hour: u32,
+    /// Approval rate in the last hour (0.0 - 1.0).
+    pub approval_rate: f64,
+    /// Whether Bitwarden integration is active.
+    pub bw_active: bool,
+}
+
+/// Request command history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryRequest {
+    pub user: String,
+    /// Maximum number of entries to return.
+    #[serde(default = "default_history_limit")]
+    pub limit: u32,
+}
+
+fn default_history_limit() -> u32 {
+    20
+}
+
+/// A single history entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub id: String,
+    pub command: String,
+    pub timestamp: String,
+    pub status: String,
+    pub decided_by: Option<String>,
+}
+
+/// Response with command history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryResponse {
+    pub entries: Vec<HistoryEntry>,
+}
+
 /// An active temporary rule with its patterns and expiry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveTempRule {
@@ -210,6 +267,8 @@ pub enum SocketMessage {
     SudoRequest(SudoRequest),
     TempRuleRequest(TempRuleRequest),
     ListRules(ListRulesRequest),
+    Status(StatusRequest),
+    History(HistoryRequest),
     BwGet(BwGetRequest),
     BwLock(BwLockRequest),
     BwStatus(BwStatusRequest),
@@ -290,6 +349,8 @@ mod tests {
             reason: Some("testing".to_string()),
             stdin: Some("aGVsbG8=".to_string()),
             skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let record = SudoRequestRecord::new(req, 60);
         assert_eq!(record.user, "alice");
@@ -316,6 +377,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let record = SudoRequestRecord::new(req, 30);
         assert_eq!(record.user, "bob");
@@ -343,6 +406,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"sudo_request\""));
@@ -426,7 +491,10 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         let deserialized: TempRuleResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.expires_at.as_deref(), Some("2025-01-01T00:00:00Z"));
+        assert_eq!(
+            deserialized.expires_at.as_deref(),
+            Some("2025-01-01T00:00:00Z")
+        );
     }
 
     #[test]
@@ -525,7 +593,10 @@ mod tests {
         let deserialized: BwStatusResponse = serde_json::from_str(&json).unwrap();
         assert!(deserialized.session_active);
         assert!(deserialized.locked_since.is_none());
-        assert_eq!(deserialized.last_used.as_deref(), Some("2026-02-08T12:00:00Z"));
+        assert_eq!(
+            deserialized.last_used.as_deref(),
+            Some("2026-02-08T12:00:00Z")
+        );
     }
 
     #[test]

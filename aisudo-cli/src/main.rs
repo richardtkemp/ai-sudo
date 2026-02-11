@@ -15,10 +15,22 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
-        eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
+        eprintln!("Usage: aisudo [OPTIONS] <command> [args...]");
         eprintln!("       aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
         eprintln!("       aisudo -l | --list-rules");
-        eprintln!("       aisudo -h | --help");
+        eprintln!("       aisudo --status");
+        eprintln!("       aisudo --history [N]");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  -r, --reason <text>      Reason for the command (shown in approval request)");
+        eprintln!("  -t, --timeout <seconds>  Override approval timeout for this request");
+        eprintln!(
+            "  -n, --dry-run            Check if command would be approved without executing"
+        );
+        eprintln!("  -l, --list-rules         Show active rules for current user");
+        eprintln!("  --status                 Show daemon status");
+        eprintln!("  --history [N]            Show last N requests (default 20)");
+        eprintln!("  -h, --help               Show this help message");
         return ExitCode::from(1);
     }
 
@@ -27,31 +39,76 @@ fn main() -> ExitCode {
         return handle_list_rules();
     }
 
+    // Check for --status mode
+    if args.iter().any(|a| a == "--status") {
+        return handle_status();
+    }
+
+    // Check for --history mode
+    if args.iter().any(|a| a == "--history") {
+        return handle_history(&args);
+    }
+
     // Check for --request-rule mode
     if args.iter().any(|a| a == "--request-rule") {
         return handle_request_rule(&args);
     }
 
-    // Parse optional -r/--reason flag before the command
-    let (reason, cmd_start) = if (args[1] == "-r" || args[1] == "--reason") && args.len() >= 4 {
-        (Some(args[2].clone()), 3)
-    } else {
-        (None, 1)
-    };
+    // Parse flags: -r/--reason, -t/--timeout, -n/--dry-run
+    let mut reason: Option<String> = None;
+    let mut timeout: Option<u32> = None;
+    let mut dry_run = false;
+    let mut cmd_start = 1;
+    let mut i = 1;
 
-    if cmd_start >= args.len() {
-        eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
-        eprintln!("       aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
-        eprintln!("       aisudo -l | --list-rules");
-        eprintln!("       aisudo -h | --help");
-        return ExitCode::from(1);
+    while i < args.len() {
+        match args[i].as_str() {
+            "-r" | "--reason" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("aisudo: -r/--reason requires a value");
+                    return ExitCode::from(1);
+                }
+                reason = Some(args[i].clone());
+                i += 1;
+                cmd_start = i;
+            }
+            "-t" | "--timeout" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("aisudo: -t/--timeout requires a value");
+                    return ExitCode::from(1);
+                }
+                match args[i].parse::<u32>() {
+                    Ok(t) => {
+                        timeout = Some(t);
+                        i += 1;
+                        cmd_start = i;
+                    }
+                    Err(_) => {
+                        eprintln!("aisudo: -t/--timeout must be a positive integer");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-n" | "--dry-run" => {
+                dry_run = true;
+                i += 1;
+                cmd_start = i;
+            }
+            other if other.starts_with('-') => {
+                eprintln!("aisudo: unrecognized option '{}'", other);
+                return ExitCode::from(1);
+            }
+            _ => {
+                // Found command start
+                break;
+            }
+        }
     }
 
-    if args[cmd_start].starts_with('-') {
-        eprintln!("aisudo: unrecognized option '{}'", args[cmd_start]);
-        eprintln!("Usage: aisudo [-r \"reason\"] <command> [args...]");
-        eprintln!("       aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
-        eprintln!("       aisudo -l | --list-rules");
+    if cmd_start >= args.len() {
+        eprintln!("Usage: aisudo [OPTIONS] <command> [args...]");
         eprintln!("       aisudo -h | --help");
         return ExitCode::from(1);
     }
@@ -80,13 +137,23 @@ fn main() -> ExitCode {
         command: command.clone(),
         cwd,
         pid,
-        mode: RequestMode::Exec,
+        mode: if dry_run {
+            RequestMode::Pam
+        } else {
+            RequestMode::Exec
+        },
         reason,
         stdin: stdin_data.clone(),
         skip_nopasswd: false,
+        timeout_seconds: timeout,
+        dry_run,
     };
 
-    eprintln!("aisudo: requesting approval for: {command}");
+    if dry_run {
+        eprintln!("aisudo: checking if command would be approved: {command}");
+    } else {
+        eprintln!("aisudo: requesting approval for: {command}");
+    }
 
     let stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
@@ -98,9 +165,7 @@ fn main() -> ExitCode {
     };
 
     // Set a generous read timeout (daemon handles its own approval timeout)
-    stream
-        .set_read_timeout(Some(Duration::from_secs(300)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -158,22 +223,48 @@ fn main() -> ExitCode {
 
     match response.decision {
         Decision::Approved => {
+            if dry_run {
+                println!("\x1b[32maisudo: command would be auto-approved\x1b[0m");
+                return ExitCode::from(0);
+            }
             // In exec mode, the daemon will now stream output lines
         }
         Decision::UseSudo => {
+            if dry_run {
+                println!("\x1b[32maisudo: command would be approved via NOPASSWD rule\x1b[0m");
+                return ExitCode::from(0);
+            }
             eprintln!("aisudo: command permitted by sudo NOPASSWD rule, executing via sudo");
             return run_via_sudo(&command, &stdin_data);
         }
         Decision::Denied => {
+            if dry_run {
+                if let Some(ref err) = response.error {
+                    if err.contains("rate limit") {
+                        println!("\x1b[33maisudo: command would be denied (rate limit)\x1b[0m");
+                    } else {
+                        println!("\x1b[33maisudo: command would require approval\x1b[0m");
+                    }
+                } else {
+                    println!("\x1b[33maisudo: command would require approval\x1b[0m");
+                }
+                return ExitCode::from(0);
+            }
             if let Some(ref err) = response.error {
-                eprintln!("aisudo: denied due to error: {err}");
+                eprintln!("\x1b[31maisudo: denied due to error: {err}\x1b[0m");
             } else {
-                eprintln!("aisudo: request denied by user");
+                eprintln!("\x1b[31maisudo: request denied by user\x1b[0m");
             }
             return ExitCode::from(1);
         }
         Decision::Timeout => {
-            eprintln!("aisudo: request timed out (no response within approval window)");
+            if dry_run {
+                println!("\x1b[33maisudo: dry-run check timed out\x1b[0m");
+                return ExitCode::from(1);
+            }
+            eprintln!(
+                "\x1b[33maisudo: request timed out (no response within approval window)\x1b[0m"
+            );
             return ExitCode::from(1);
         }
         Decision::Pending => {
@@ -304,9 +395,7 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
         }
     };
 
-    stream
-        .set_read_timeout(Some(Duration::from_secs(300)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -403,9 +492,7 @@ fn handle_list_rules() -> ExitCode {
         }
     };
 
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -495,6 +582,225 @@ fn handle_list_rules() -> ExitCode {
     ExitCode::from(0)
 }
 
+fn handle_status() -> ExitCode {
+    use aisudo_common::{StatusRequest, StatusResponse};
+
+    let user = get_current_user();
+    let request = StatusRequest { user: user.clone() };
+    let msg = SocketMessage::Status(request);
+
+    let socket_path =
+        std::env::var("AISUDO_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+
+    let stream = match UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
+            eprintln!("aisudo: is aisudo-daemon running?");
+            return ExitCode::from(1);
+        }
+    };
+
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("aisudo: socket error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let msg_json = match serde_json::to_string(&msg) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("aisudo: serialization error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Err(e) = writer.write_all(msg_json.as_bytes()) {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.write_all(b"\n") {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("aisudo: flush error: {e}");
+        return ExitCode::from(1);
+    }
+
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+
+    let first_line = match lines.next() {
+        Some(Ok(line)) => line,
+        Some(Err(e)) => {
+            eprintln!("aisudo: connection to daemon lost: {e}");
+            return ExitCode::from(1);
+        }
+        None => {
+            eprintln!("aisudo: daemon closed connection unexpectedly");
+            return ExitCode::from(1);
+        }
+    };
+
+    let response: StatusResponse = match serde_json::from_str(&first_line) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("aisudo: invalid response from daemon: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!("=== aisudo daemon status ===");
+    println!();
+    println!(
+        "  Uptime: {}s ({:.1} hours)",
+        response.uptime_seconds,
+        response.uptime_seconds as f64 / 3600.0
+    );
+    println!("  Pending requests: {}", response.pending_requests);
+    println!("  Requests (last hour): {}", response.requests_last_hour);
+    println!(
+        "  Approval rate (last hour): {:.1}%",
+        response.approval_rate * 100.0
+    );
+    println!(
+        "  Bitwarden: {}",
+        if response.bw_active {
+            "active"
+        } else {
+            "inactive"
+        }
+    );
+
+    ExitCode::from(0)
+}
+
+fn handle_history(args: &[String]) -> ExitCode {
+    use aisudo_common::{HistoryRequest, HistoryResponse};
+
+    let user = get_current_user();
+
+    // Parse optional limit argument
+    let limit = if args.len() > 2 {
+        match args[2].parse::<u32>() {
+            Ok(n) if n > 0 && n <= 100 => n,
+            _ => {
+                eprintln!("aisudo: history limit must be between 1 and 100");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        20
+    };
+
+    let request = HistoryRequest {
+        user: user.clone(),
+        limit,
+    };
+    let msg = SocketMessage::History(request);
+
+    let socket_path =
+        std::env::var("AISUDO_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+
+    let stream = match UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
+            eprintln!("aisudo: is aisudo-daemon running?");
+            return ExitCode::from(1);
+        }
+    };
+
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("aisudo: socket error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let msg_json = match serde_json::to_string(&msg) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("aisudo: serialization error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Err(e) = writer.write_all(msg_json.as_bytes()) {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.write_all(b"\n") {
+        eprintln!("aisudo: write error: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("aisudo: flush error: {e}");
+        return ExitCode::from(1);
+    }
+
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+
+    let first_line = match lines.next() {
+        Some(Ok(line)) => line,
+        Some(Err(e)) => {
+            eprintln!("aisudo: connection to daemon lost: {e}");
+            return ExitCode::from(1);
+        }
+        None => {
+            eprintln!("aisudo: daemon closed connection unexpectedly");
+            return ExitCode::from(1);
+        }
+    };
+
+    let response: HistoryResponse = match serde_json::from_str(&first_line) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("aisudo: invalid response from daemon: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!(
+        "=== Command history (last {} entries) ===",
+        response.entries.len()
+    );
+    println!();
+
+    if response.entries.is_empty() {
+        println!("  (no history)");
+    } else {
+        for entry in &response.entries {
+            let status_color = match entry.status.as_str() {
+                "approved" => "\x1b[32m",
+                "denied" => "\x1b[31m",
+                "timeout" => "\x1b[33m",
+                _ => "",
+            };
+            let reset = if status_color.is_empty() {
+                ""
+            } else {
+                "\x1b[0m"
+            };
+            println!(
+                "  {}[{:8}]{}\t{} — {}",
+                status_color, entry.status, reset, entry.timestamp, entry.command
+            );
+        }
+    }
+
+    ExitCode::from(0)
+}
+
 /// Run a command via sudo -n. If sudo needs a password (NOPASSWD rule no longer
 /// applies), fall back to requesting normal aisudo approval.
 fn run_via_sudo(command: &str, stdin_data: &Option<String>) -> ExitCode {
@@ -571,6 +877,8 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
         reason: None,
         stdin: stdin_data.clone(),
         skip_nopasswd: true,
+        timeout_seconds: None,
+        dry_run: false,
     };
 
     let msg = SocketMessage::SudoRequest(request);
@@ -583,9 +891,7 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
         }
     };
 
-    stream
-        .set_read_timeout(Some(Duration::from_secs(300)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,

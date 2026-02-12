@@ -276,6 +276,8 @@ pub async fn run_socket_listener(
                 let config = config_holder.config();
                 let timeout = config.timeout_seconds;
                 let allowlist = config.allowlist.clone();
+                let denylist = config.denylist.clone();
+                let allowlist_per_user = config.allowlist_per_user.clone();
                 let limits = config.limits.clone();
 
                 let bw_ctx = bw_session.as_ref().and_then(|session| {
@@ -293,7 +295,7 @@ pub async fn run_socket_listener(
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(stream, db, backend, sudoers, timeout, &allowlist, limits, bw_ctx).await
+                        handle_connection(stream, db, backend, sudoers, timeout, &allowlist, &denylist, &allowlist_per_user, limits, bw_ctx).await
                     {
                         error!("Connection handler error: {e:#}");
                     }
@@ -321,6 +323,8 @@ async fn handle_connection(
     sudoers: Arc<SudoersCache>,
     timeout_seconds: u32,
     allowlist: &[String],
+    denylist: &[String],
+    allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
     limits: LimitsConfig,
     bw_ctx: Option<Arc<BwHandlerContext>>,
 ) -> Result<()> {
@@ -342,7 +346,7 @@ async fn handle_connection(
         match msg {
             SocketMessage::SudoRequest(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
-                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, &limits).await
+                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, denylist, allowlist_per_user, &limits).await
             }
             SocketMessage::TempRuleRequest(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
@@ -419,7 +423,7 @@ async fn handle_connection(
         match serde_json::from_str::<SudoRequest>(&line) {
             Ok(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
-                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, &limits).await
+                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, denylist, allowlist_per_user, &limits).await
             }
             Err(_e) => Err(anyhow::anyhow!("invalid request")),
         }
@@ -466,6 +470,8 @@ async fn handle_sudo_request(
     sudoers: Arc<SudoersCache>,
     timeout_seconds: u32,
     allowlist: &[String],
+    denylist: &[String],
+    allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
     limits: &LimitsConfig,
 ) -> Result<()> {
     let mode = request.mode;
@@ -506,13 +512,38 @@ async fn handle_sudo_request(
         None
     };
 
-    // Check allowlist first - auto-approved commands skip rate limiting
     let command = request.command.clone();
     let cwd = request.cwd.clone();
     let dry_run = request.dry_run;
     let effective_timeout = request.timeout_seconds.unwrap_or(timeout_seconds);
-    
-    if is_allowed(&command, allowlist) {
+    let user = &request.user;
+
+    // Check denylist FIRST - deny always takes precedence
+    if is_denied(&command, denylist) {
+        warn!("Command denied via denylist: {}", command);
+        let response = SudoResponse {
+            request_id: String::new(),
+            decision: Decision::Denied,
+            error: Some("command is on denylist".to_string()),
+        };
+        let resp_json = serde_json::to_string(&response)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    // Build effective allowlist: global + per-user (if any)
+    let effective_allowlist: Vec<String> = if let Some(user_allowlist) = allowlist_per_user.get(user) {
+        let mut combined = allowlist.to_vec();
+        combined.extend(user_allowlist.clone());
+        combined
+    } else {
+        allowlist.to_vec()
+    };
+
+    // Check allowlist - auto-approved commands skip rate limiting
+    if is_allowed(&command, &effective_allowlist) {
         info!("Command auto-approved via allowlist: {}", command);
         
         // For dry-run, just return approved without executing or logging
@@ -1801,6 +1832,34 @@ fn is_allowed(command: &str, allowlist: &[String]) -> bool {
     segments.iter().all(|seg| is_single_command_allowed(&seg.command, allowlist))
 }
 
+/// Check if a command is denied by the denylist.
+/// Uses same prefix matching as allowlist. If ANY segment matches, the whole command is denied.
+fn is_denied(command: &str, denylist: &[String]) -> bool {
+    if denylist.is_empty() {
+        return false;
+    }
+    // Try parsing as a command chain. If parsing fails, don't deny based on denylist
+    // (parsing failures are handled separately).
+    let segments = match parse_command_chain(command) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // If ANY segment matches the denylist, deny the whole command
+    segments.iter().any(|seg| {
+        for pattern in denylist {
+            if seg.command == *pattern {
+                return true;
+            }
+            if seg.command.starts_with(pattern.as_str())
+                && seg.command.as_bytes().get(pattern.len()) == Some(&b' ')
+            {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1879,7 +1938,7 @@ mod tests {
             rate_limit_mode: RateLimitMode::PerUser,
         };
         let handler = tokio::spawn(async move {
-            handle_connection(server, db_clone, backend, sudoers, 60, &[], limits, None).await
+            handle_connection(server, db_clone, backend, sudoers, 60, &[], &[], &std::collections::HashMap::new(), limits, None).await
         });
 
         // Client side: send a request that should be rate-limited
@@ -2049,6 +2108,8 @@ mod tests {
         backend: Arc<dyn crate::notification::NotificationBackend>,
         request_json: &str,
         allowlist: &[String],
+        denylist: &[String],
+        allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
         limits: LimitsConfig,
     ) -> String {
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
@@ -2057,8 +2118,10 @@ mod tests {
         let db2 = Arc::clone(&db);
         let backend2 = Arc::clone(&backend);
         let allowlist = allowlist.to_vec();
+        let denylist = denylist.to_vec();
+        let allowlist_per_user = allowlist_per_user.clone();
         let handler = tokio::spawn(async move {
-            handle_connection(server, db2, backend2, sudoers, 60, &allowlist, limits, None).await
+            handle_connection(server, db2, backend2, sudoers, 60, &allowlist, &denylist, &allowlist_per_user, limits, None).await
         });
 
         let (reader, mut writer) = client.into_split();
@@ -2103,7 +2166,7 @@ mod tests {
 
         let resp_line = send_and_receive(
             db, backend, &json,
-            &["apt list".to_string()], test_limits(),
+            &["apt list".to_string()], &[], &std::collections::HashMap::new(), test_limits(),
         ).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
@@ -2130,7 +2193,7 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -2156,7 +2219,7 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2182,7 +2245,7 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2214,7 +2277,7 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
 
         // max_stdin_bytes = 100, so 200-byte stdin should be rejected
-        let resp_line = send_and_receive(db, backend, &json, &[], test_limits_with_stdin(100)).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits_with_stdin(100)).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2228,7 +2291,7 @@ mod tests {
         let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
 
         let resp_line = send_and_receive(
-            db, backend, "this is not json", &[], test_limits(),
+            db, backend, "this is not json", &[], &[], &std::collections::HashMap::new(), test_limits(),
         ).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
@@ -2253,7 +2316,7 @@ mod tests {
         // max_temp_rule_duration = 3600
         let mut limits = test_limits();
         limits.max_temp_rule_duration_seconds = 3600;
-        let resp_line = send_and_receive(db, backend, &json, &[], limits).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), limits).await;
 
         let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2274,7 +2337,7 @@ mod tests {
         });
         let json = serde_json::to_string(&msg).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
 
         let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2295,7 +2358,7 @@ mod tests {
         });
         let json = serde_json::to_string(&msg).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
 
         let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -2325,7 +2388,7 @@ mod tests {
 
         let resp_line = send_and_receive(
             db, backend, &json,
-            &["apt list".to_string()], test_limits(),
+            &["apt list".to_string()], &[], &std::collections::HashMap::new(), test_limits(),
         ).await;
 
         let response: aisudo_common::ListRulesResponse = serde_json::from_str(&resp_line).unwrap();
@@ -2364,7 +2427,7 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], test_limits()).await;
+        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -2727,6 +2790,128 @@ mod tests {
     fn split_argv_empty() {
         assert!(split_command_argv("").is_err());
         assert!(split_command_argv("   ").is_err());
+    }
+
+    // ===== Denylist and Per-User Allowlist Tests =====
+
+    #[test]
+    fn is_denied_empty_denylist() {
+        assert!(!is_denied("rm -rf /", &[]));
+    }
+
+    #[test]
+    fn is_denied_exact_match() {
+        assert!(is_denied("rm -rf /", &["rm -rf /".to_string()]));
+    }
+
+    #[test]
+    fn is_denied_prefix_match() {
+        assert!(is_denied("rm -rf /important", &["rm -rf".to_string()]));
+        assert!(!is_denied("rm important", &["rm -rf".to_string()])); // no space after pattern
+    }
+
+    #[test]
+    fn is_denied_any_segment_matches() {
+        // In a chain, if ANY segment matches denylist, deny the whole command
+        assert!(is_denied("echo hello; rm -rf /", &["rm -rf".to_string()]));
+        assert!(is_denied("apt update && rm -rf /", &["rm -rf".to_string()]));
+    }
+
+    #[test]
+    fn is_denied_does_not_match_different_command() {
+        assert!(!is_denied("apt update", &["rm -rf".to_string()]));
+        assert!(!is_denied("ls -la", &["rm".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn denylist_blocks_command_even_if_on_allowlist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "apt install vim".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        // "apt install" is on allowlist, but "apt install vim" is on denylist
+        let denylist = vec!["apt install vim".to_string()];
+        let allowlist = vec!["apt install".to_string()];
+        let resp_line = send_and_receive(
+            db, backend, &json, &allowlist, &denylist, &std::collections::HashMap::new(), test_limits()
+        ).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        assert!(response.error.unwrap().contains("denylist"));
+    }
+
+    #[tokio::test]
+    async fn per_user_allowlist_adds_to_global() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+
+        // Use real username since SO_PEERCRED overrides it
+        let real_user = real_test_user();
+
+        // Global allowlist has "apt list", per-user has "docker ps"
+        let mut per_user = std::collections::HashMap::new();
+        per_user.insert(real_user.clone(), vec!["docker ps".to_string()]);
+        
+        // Test that "docker ps" is allowed for the real user
+        let request = SudoRequest {
+            user: real_user.clone(),
+            command: "docker ps".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let allowlist = vec!["apt list".to_string()]; // global
+        let resp_line = send_and_receive(
+            db.clone(), Arc::clone(&backend), &json, &allowlist, &[], &per_user, test_limits()
+        ).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+
+        // Test that "apt list" is also still allowed (global)
+        let request2 = SudoRequest {
+            user: real_user.clone(),
+            command: "apt list".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
+        };
+        let json2 = serde_json::to_string(&request2).unwrap();
+
+        let resp_line2 = send_and_receive(
+            db, backend, &json2, &allowlist, &[], &per_user, test_limits()
+        ).await;
+
+        let response2: SudoResponse = serde_json::from_str(&resp_line2).unwrap();
+        assert_eq!(response2.decision, Decision::Approved);
     }
 }
 

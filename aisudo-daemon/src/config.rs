@@ -18,6 +18,17 @@ pub struct Config {
     #[serde(default)]
     pub allowlist: Vec<String>,
 
+    /// Commands that are always denied, regardless of allowlist or temp rules.
+    /// Checked before allowlist - deny takes precedence.
+    /// Pattern matching is prefix-based, same as allowlist.
+    #[serde(default)]
+    pub denylist: Vec<String>,
+
+    /// Per-user allowlists. Keys are usernames, values are lists of command patterns.
+    /// These are additive to the global allowlist.
+    #[serde(default)]
+    pub allowlist_per_user: std::collections::HashMap<String, Vec<String>>,
+
     pub telegram: Option<TelegramConfig>,
 
     #[serde(default = "default_limits")]

@@ -1,5 +1,6 @@
 use super::{BwConfirmRecord, BwRequestRecord, NotificationBackend, TempRuleRecord};
 use crate::config::ConfigHolder;
+use crate::db::Database;
 use aisudo_common::{Decision, SudoRequestRecord};
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
@@ -25,20 +26,15 @@ pub struct TelegramBackend {
     bot_token: String,
     chat_id: i64,
     client: Client,
-    /// Maps pending key -> oneshot sender for delivering callback responses.
     pending: Arc<DashMap<String, oneshot::Sender<Decision>>>,
-    /// Offset for Telegram getUpdates long polling.
     update_offset: Arc<Mutex<i64>>,
-    /// How long to wait for a response before giving up.
     request_timeout: Duration,
-    /// Maps pending key -> (message_id, original_text) for editing messages after decision.
     message_map: Arc<DashMap<String, (i64, String)>>,
-    /// Max bytes of stdin to show in notification preview.
     stdin_preview_bytes: usize,
-    /// Timeout in seconds for Telegram long-polling requests.
     poll_timeout_seconds: u32,
-    /// Config holder for hot-reloading message_template and other settings.
     config_holder: Arc<ConfigHolder>,
+    /// Database reference for stats queries (optional for backward compat).
+    db: Option<Arc<Database>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +48,7 @@ struct TelegramResponse<T> {
 struct Update {
     update_id: i64,
     callback_query: Option<CallbackQuery>,
+    message: Option<TelegramMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,8 +64,16 @@ struct CallbackUser {
 }
 
 #[derive(Debug, Deserialize)]
-struct Message {
+struct TelegramMessage {
     message_id: i64,
+    from: Option<CallbackUser>,
+    text: Option<String>,
+    chat: Option<ChatInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatInfo {
+    id: i64,
 }
 
 impl TelegramBackend {
@@ -91,7 +96,13 @@ impl TelegramBackend {
             stdin_preview_bytes,
             poll_timeout_seconds,
             config_holder,
+            db: None,
         }
+    }
+
+    /// Set the database reference for stats queries.
+    pub fn set_db(&mut self, db: Arc<Database>) {
+        self.db = Some(db);
     }
 
     /// Start the background polling loop for Telegram callback queries.
@@ -190,7 +201,7 @@ impl TelegramBackend {
             .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<Message> = resp.json().await
+        let result: TelegramResponse<TelegramMessage> = resp.json().await
             .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
         if !result.ok {
             let desc = result
@@ -271,7 +282,7 @@ impl TelegramBackend {
             .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<Message> = resp.json().await
+        let result: TelegramResponse<TelegramMessage> = resp.json().await
             .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
         if !result.ok {
             let desc = result
@@ -326,7 +337,7 @@ impl TelegramBackend {
             .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<Message> = resp.json().await
+        let result: TelegramResponse<TelegramMessage> = resp.json().await
             .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
         if !result.ok {
             let desc = result.description.unwrap_or_else(|| "no description".to_string());
@@ -380,7 +391,7 @@ impl TelegramBackend {
             .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<Message> = resp.json().await
+        let result: TelegramResponse<TelegramMessage> = resp.json().await
             .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
         if !result.ok {
             let desc = result.description.unwrap_or_else(|| "no description".to_string());
@@ -418,7 +429,7 @@ impl TelegramBackend {
             .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<Message> = resp.json().await
+        let result: TelegramResponse<TelegramMessage> = resp.json().await
             .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
         if !result.ok {
             let desc = result.description.unwrap_or_else(|| "no description".to_string());
@@ -476,7 +487,7 @@ impl TelegramBackend {
             .query(&[
                 ("offset", offset.to_string()),
                 ("timeout", self.poll_timeout_seconds.to_string()),
-                ("allowed_updates", "[\"callback_query\"]".to_string()),
+                ("allowed_updates", "[\"callback_query\", \"message\"]".to_string()),
             ])
             .timeout(Duration::from_secs(self.poll_timeout_seconds as u64 + 5))
             .send()
@@ -508,10 +519,70 @@ impl TelegramBackend {
                 if let Some(cb) = update.callback_query {
                     self.handle_callback(cb).await;
                 }
+
+                if let Some(msg) = update.message {
+                    self.handle_message(msg).await;
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Handle incoming Telegram messages (e.g., /stats command).
+    async fn handle_message(&self, msg: TelegramMessage) {
+        // Verify the message comes from the authorized chat
+        let chat_id = match &msg.chat {
+            Some(chat) => chat.id,
+            None => return,
+        };
+        if chat_id != self.chat_id {
+            return;
+        }
+
+        let text = match &msg.text {
+            Some(t) => t.trim().to_lowercase(),
+            None => return,
+        };
+
+        // Handle /stats command
+        if text == "/stats" || text.starts_with("/stats@") {
+            self.send_stats_response(msg.message_id).await;
+        }
+    }
+
+    /// Send stats response to a /stats command.
+    async fn send_stats_response(&self, reply_to: i64) {
+        let stats_text = match &self.db {
+            Some(db) => {
+                let pending = db.get_pending_count().unwrap_or(0);
+                let last_hour = db.get_requests_last_hour().unwrap_or(0);
+                let approval_rate = db.get_approval_rate_last_hour().unwrap_or(0.0);
+                
+                format!(
+                    "📊 *aisudo stats*\n\n\
+                     *Pending:* {}\n\
+                     *Requests (1h):* {}\n\
+                     *Approval rate:* {:.1}%",
+                    pending, last_hour, approval_rate * 100.0
+                )
+            }
+            None => "Stats unavailable (no database)".to_string(),
+        };
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": stats_text,
+            "parse_mode": "Markdown",
+            "reply_to_message_id": reply_to,
+        });
+
+        let _ = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await;
     }
 
     async fn handle_callback(&self, cb: CallbackQuery) {

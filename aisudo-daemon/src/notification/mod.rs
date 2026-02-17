@@ -3,6 +3,13 @@ pub mod telegram;
 use aisudo_common::{Decision, SudoRequestRecord};
 use anyhow::Result;
 
+/// Information needed to update a notification with command completion status.
+pub struct CompletionInfo {
+    pub request_id: String,
+    pub exit_code: i32,
+    pub last_lines: Option<String>,
+}
+
 /// Daemon-internal record for a pending temp rule request.
 pub struct TempRuleRecord {
     pub id: String,
@@ -59,6 +66,9 @@ pub trait NotificationBackend: Send + Sync {
 
     /// Send a notification about completed credential scrubbing.
     async fn send_scrub_complete(&self, request_id: &str, item_name: &str) -> Result<()>;
+
+    /// Update an approved notification with command completion status.
+    async fn update_completion_status(&self, info: &CompletionInfo);
 
     /// Backend name for logging/audit.
     fn name(&self) -> &'static str;

@@ -18,8 +18,14 @@ use tracing::{error, info, warn};
 use crate::bw_session::BwSessionManager;
 use crate::config::{ConfigHolder, LimitsConfig, RateLimitMode};
 use crate::db::Database;
-use crate::notification::{BwConfirmRecord, BwRequestRecord, NotificationBackend, TempRuleRecord};
+use crate::notification::{BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord};
 use crate::sudoers::SudoersCache;
+
+/// Result of executing a command, containing exit code and last N lines of output.
+struct ExecResult {
+    exit_code: i32,
+    last_lines: Option<String>,
+}
 
 /// Operator connecting two commands in a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,6 +723,8 @@ async fn handle_sudo_request(
 
     // Update database
     db.update_decision(&record.id, decision, backend.name())?;
+    
+    let request_id = record.id.clone();
 
     // Send response
     let response = SudoResponse {
@@ -730,7 +738,18 @@ async fn handle_sudo_request(
 
     // If exec mode and approved, execute via shell (human approved the exact command)
     if mode == RequestMode::Exec && decision == Decision::Approved {
-        exec_command(&command, &cwd, stdin_bytes, writer, true).await?;
+        let exec_result = exec_command(&command, &cwd, stdin_bytes, writer, true).await?;
+        
+        // Update Telegram notification with completion status
+        backend.update_completion_status(&CompletionInfo {
+            request_id,
+            exit_code: exec_result.exit_code,
+            last_lines: if exec_result.exit_code != 0 {
+                exec_result.last_lines
+            } else {
+                None
+            },
+        }).await;
     }
 
     Ok(())
@@ -1326,8 +1345,12 @@ async fn exec_command(
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     use_shell: bool,
-) -> Result<()> {
+) -> Result<ExecResult> {
     use tokio::process::Command;
+    use std::collections::VecDeque;
+
+    const MAX_LAST_LINES: usize = 5;
+    let mut output_lines: VecDeque<String> = VecDeque::with_capacity(MAX_LAST_LINES);
 
     info!("Executing command (shell={}): {command}", use_shell);
 
@@ -1425,8 +1448,16 @@ async fn exec_command(
     // Drop the last sender so rx completes when both streams are done
     drop(tx);
 
-    // Forward all output to the socket
+    // Forward all output to the socket and collect last N lines
     while let Some(output) = rx.recv().await {
+        // Track lines for completion notification
+        for line in output.data.lines() {
+            if output_lines.len() >= MAX_LAST_LINES {
+                output_lines.pop_front();
+            }
+            output_lines.push_back(line.to_string());
+        }
+        
         let json = serde_json::to_string(&output)?;
         writer.write_all(json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
@@ -1449,7 +1480,13 @@ async fn exec_command(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
 
-    Ok(())
+    let last_lines = if output_lines.is_empty() {
+        None
+    } else {
+        Some(output_lines.into_iter().collect::<Vec<_>>().join("\n"))
+    };
+
+    Ok(ExecResult { exit_code, last_lines })
 }
 
 /// Split a single command string into argv, respecting single and double quotes.

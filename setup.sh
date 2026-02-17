@@ -53,10 +53,83 @@ fi
 
 # ── Stop running daemon ──────────────────────────────────────────────
 
-if systemctl is-active --quiet aisudo-daemon 2>/dev/null; then
-    info "Stopping running aisudo-daemon..."
-    systemctl stop aisudo-daemon
-fi
+# Fork daemon-stopping and installation into background process so it survives
+# when the daemon is stopped (script may be running as child of the daemon)
+info "Forking installation to survive daemon stop..."
+setsid bash -c '
+    LOG_FILE="/var/log/aisudo-setup.log"
+    exec >"$LOG_FILE" 2>&1
+    echo "=== aisudo setup started at $(date) ==="
+    
+    SCRIPT_DIR="'"$SCRIPT_DIR"'"
+    CONFIG_FILE="'"$CONFIG_FILE"'"
+    DAEMON_BIN="'"$DAEMON_BIN"'"
+    CLI_BIN="'"$CLI_BIN"'"
+    
+    info()  { echo -e "\033[0;32m[✓]\033[0m $*"; }
+    warn()  { echo -e "\033[1;33m[!]\033[0m $*"; }
+    error() { echo -e "\033[0;31m[✗]\033[0m $*"; }
+    
+    if systemctl is-active --quiet aisudo-daemon 2>/dev/null; then
+        info "Stopping running aisudo-daemon..."
+        systemctl stop aisudo-daemon
+    fi
+    
+    info "Installing daemon binary to /usr/local/bin/aisudo-daemon..."
+    cp "$DAEMON_BIN" /usr/local/bin/aisudo-daemon
+    chmod 755 /usr/local/bin/aisudo-daemon
+    
+    info "Installing CLI wrapper to /usr/local/bin/aisudo..."
+    cp "$CLI_BIN" /usr/local/bin/aisudo
+    chmod 755 /usr/local/bin/aisudo
+    
+    info "Installing config to /etc/aisudo/aisudo.toml..."
+    mkdir -p /etc/aisudo
+    cp "$CONFIG_FILE" /etc/aisudo/aisudo.toml
+    chmod 600 /etc/aisudo/aisudo.toml
+    
+    if ! getent group aisudo &>/dev/null; then
+        info "Creating aisudo service group..."
+        /usr/sbin/groupadd --system aisudo
+    else
+        info "aisudo group already exists"
+    fi
+    
+    info "Creating runtime directories..."
+    mkdir -p /var/run/aisudo
+    chown root:aisudo /var/run/aisudo
+    chmod 775 /var/run/aisudo
+    
+    mkdir -p /var/lib/aisudo
+    chmod 750 /var/lib/aisudo
+    
+    info "Installing systemd service..."
+    cp "$SCRIPT_DIR/aisudo-daemon.service" /etc/systemd/system/aisudo-daemon.service
+    systemctl daemon-reload
+    
+    info "Enabling and starting aisudo-daemon..."
+    systemctl enable aisudo-daemon
+    systemctl restart aisudo-daemon
+    
+    sleep 2
+    
+    if systemctl is-active --quiet aisudo-daemon; then
+        info "aisudo-daemon is running!"
+        echo ""
+        echo "=== aisudo setup completed at $(date) ==="
+        echo "View this log: cat /var/log/aisudo-setup.log"
+    else
+        error "aisudo-daemon failed to start. Check: journalctl -u aisudo-daemon -n 20"
+        echo ""
+        echo "=== aisudo setup FAILED at $(date) ==="
+    fi
+' </dev/null &
+
+echo ""
+echo "Installation forked to background process."
+echo "Monitor progress: tail -f /var/log/aisudo-setup.log"
+echo ""
+exit 0
 
 # ── Install daemon ────────────────────────────────────────────────────
 

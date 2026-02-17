@@ -1,4 +1,4 @@
-use super::{BwConfirmRecord, BwRequestRecord, NotificationBackend, TempRuleRecord};
+use super::{BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord};
 use crate::config::ConfigHolder;
 use crate::db::Database;
 use aisudo_common::{Decision, SudoRequestRecord};
@@ -30,10 +30,10 @@ pub struct TelegramBackend {
     update_offset: Arc<Mutex<i64>>,
     request_timeout: Duration,
     message_map: Arc<DashMap<String, (i64, String)>>,
+    completion_map: Arc<DashMap<String, (i64, String, String)>>,
     stdin_preview_bytes: usize,
     poll_timeout_seconds: u32,
     config_holder: Arc<ConfigHolder>,
-    /// Database reference for stats queries (optional for backward compat).
     db: Option<Arc<Database>>,
 }
 
@@ -93,6 +93,7 @@ impl TelegramBackend {
             update_offset: Arc::new(Mutex::new(0)),
             request_timeout: Duration::from_secs(timeout_seconds as u64),
             message_map: Arc::new(DashMap::new()),
+            completion_map: Arc::new(DashMap::new()),
             stdin_preview_bytes,
             poll_timeout_seconds,
             config_holder,
@@ -641,6 +642,12 @@ impl TelegramBackend {
             _ => format!("{decision:?} at {time}"),
         };
         if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
+            if decision == Decision::Approved {
+                self.completion_map.insert(
+                    pending_key.clone(),
+                    (msg_id, original_text.clone(), status_line.clone()),
+                );
+            }
             let _ = self
                 .edit_message_status(msg_id, &original_text, &status_line)
                 .await;
@@ -857,6 +864,40 @@ impl NotificationBackend for TelegramBackend {
 
     async fn send_scrub_complete(&self, request_id: &str, item_name: &str) -> Result<()> {
         self.send_bw_scrub_complete_message(request_id, item_name).await
+    }
+
+    async fn update_completion_status(&self, info: &CompletionInfo) {
+        if let Some((_, (msg_id, original_text, approved_status))) = self.completion_map.remove(&info.request_id) {
+            let completion_text = if info.exit_code == 0 {
+                format!("{} \u{2192} Exit 0", approved_status)
+            } else {
+                let error_indicator = "\u{274c}";
+                let base = format!("{} \u{2192} {} Exit {}", approved_status, error_indicator, info.exit_code);
+                if let Some(ref last_lines) = info.last_lines {
+                    format!("{}\n```\n{}\n```", base, last_lines)
+                } else {
+                    base
+                }
+            };
+            
+            let body = serde_json::json!({
+                "chat_id": self.chat_id,
+                "message_id": msg_id,
+                "text": format!("{}\n\n{}", original_text, completion_text),
+                "parse_mode": "Markdown"
+            });
+
+            match self
+                .client
+                .post(self.api_url("editMessageText"))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(_) => info!("Updated completion status for request {}", info.request_id),
+                Err(e) => warn!("Failed to update completion status: {e}"),
+            }
+        }
     }
 
     fn name(&self) -> &'static str {

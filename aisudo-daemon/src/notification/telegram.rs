@@ -13,14 +13,14 @@ use tokio::sync::{oneshot, Mutex};
 use chrono::Local;
 use tracing::{debug, error, info, warn};
 
-/// Default message template matching the original hardcoded format.
-const DEFAULT_TEMPLATE: &str = "\u{1f510} *Sudo Request*\n\n\
-    *User:* `{{user}}`\n\
-    *Command:* `{{command}}`\n\
-    *CWD:* `{{directory}}`\n\
-    *PID:* `{{pid}}`\n\
-    *Request ID:* `{{request_id}}`\n\
-    *Timeout:* {{timeout}}s{{reason}}{{stdin}}";
+/// Default message template matching the original hardcoded format (HTML).
+const DEFAULT_TEMPLATE: &str = "\u{1f510} <b>Sudo Request</b>\n\n\
+    <b>User:</b> <code>{{user}}</code>\n\
+    <b>Command:</b> <code>{{command}}</code>\n\
+    <b>CWD:</b> <code>{{directory}}</code>\n\
+    <b>PID:</b> <code>{{pid}}</code>\n\
+    <b>Request ID:</b> <code>{{request_id}}</code>\n\
+    <b>Timeout:</b> {{timeout}}s{{reason}}{{stdin}}";
 
 pub struct TelegramBackend {
     bot_token: String,
@@ -184,7 +184,7 @@ impl TelegramBackend {
         let main_body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "reply_markup": {
                 "inline_keyboard": [[
                     {"text": "✅ Approve", "callback_data": approve_data},
@@ -232,30 +232,30 @@ impl TelegramBackend {
         let patterns_list: String = record
             .patterns
             .iter()
-            .map(|p| format!("  \u{2022} `{p}`"))
+            .map(|p| format!("  \u{2022} <code>{}</code>", escape_html(p)))
             .collect::<Vec<_>>()
             .join("\n");
 
         let hours = record.duration_seconds as f64 / 3600.0;
         let reason_line = match &record.reason {
-            Some(r) => format!("\n*Reason:* {r}"),
+            Some(r) => format!("\n<b>Reason:</b> {}", escape_html(r)),
             None => String::new(),
         };
 
         let text = format!(
-            "\u{23f1}\u{fe0f} *Temporary Rule Request*\n\n\
-             *User:* `{}`\n\
-             *Patterns:*\n{}\n\
-             *Duration:* {}s ({:.1} hour{})\n\
-             *Expires at:* `{}`\n\
-             *Request ID:* `{}`{}",
-            record.user,
+            "\u{23f1}\u{fe0f} <b>Temporary Rule Request</b>\n\n\
+             <b>User:</b> <code>{}</code>\n\
+             <b>Patterns:</b>\n{}\n\
+             <b>Duration:</b> {}s ({:.1} hour{})\n\
+             <b>Expires at:</b> <code>{}</code>\n\
+             <b>Request ID:</b> <code>{}</code>{}",
+            escape_html(&record.user),
             patterns_list,
             record.duration_seconds,
             hours,
             if hours == 1.0 { "" } else { "s" },
-            record.expires_at,
-            record.id,
+            escape_html(&record.expires_at),
+            escape_html(&record.id),
             reason_line,
         );
 
@@ -265,7 +265,7 @@ impl TelegramBackend {
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "reply_markup": {
                 "inline_keyboard": [[
                     {"text": "\u{2705} Approve", "callback_data": approve_data},
@@ -305,13 +305,14 @@ impl TelegramBackend {
 
         let session_status = if record.session_active { "unlocked" } else { "locked" };
         let text = format!(
-            "\u{1f511} *Bitwarden Request*\n\n\
-             *User:* `{}`\n\
-             *Item:* `{}`\n\
-             *Field:* `{}`\n\
-             *Vault:* {}\n\
-             *Request ID:* `{}`",
-            record.user, record.item_name, record.field, session_status, record.id,
+            "\u{1f511} <b>Bitwarden Request</b>\n\n\
+             <b>User:</b> <code>{}</code>\n\
+             <b>Item:</b> <code>{}</code>\n\
+             <b>Field:</b> <code>{}</code>\n\
+             <b>Vault:</b> {}\n\
+             <b>Request ID:</b> <code>{}</code>",
+            escape_html(&record.user), escape_html(&record.item_name),
+            escape_html(&record.field), session_status, escape_html(&record.id),
         );
 
         let approve_data = format!("approve_bw:{}", record.id);
@@ -320,7 +321,7 @@ impl TelegramBackend {
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "reply_markup": {
                 "inline_keyboard": [[
                     {"text": "\u{2705} Approve", "callback_data": approve_data},
@@ -357,15 +358,16 @@ impl TelegramBackend {
         info!("Sending BW confirm Telegram message for request {}", record.id);
 
         let text = format!(
-            "\u{1f50d} *Bitwarden Confirmation*\n\n\
-             *User:* `{}`\n\
-             *Requested:* `{}`\n\
-             *Resolved to:* `{}`\n\
-             *Field:* `{}`\n\
-             *Request ID:* `{}`\n\n\
+            "\u{1f50d} <b>Bitwarden Confirmation</b>\n\n\
+             <b>User:</b> <code>{}</code>\n\
+             <b>Requested:</b> <code>{}</code>\n\
+             <b>Resolved to:</b> <code>{}</code>\n\
+             <b>Field:</b> <code>{}</code>\n\
+             <b>Request ID:</b> <code>{}</code>\n\n\
              \u{26a0}\u{fe0f} Names differ \u{2014} please confirm.",
-            record.user, record.requested_item_name, record.resolved_item_name,
-            record.field, record.id,
+            escape_html(&record.user), escape_html(&record.requested_item_name),
+            escape_html(&record.resolved_item_name),
+            escape_html(&record.field), escape_html(&record.id),
         );
 
         let confirm_data = format!("confirm_bw:{}", record.id);
@@ -374,7 +376,7 @@ impl TelegramBackend {
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "reply_markup": {
                 "inline_keyboard": [[
                     {"text": "\u{2705} Confirm", "callback_data": confirm_data},
@@ -409,16 +411,16 @@ impl TelegramBackend {
 
     async fn send_bw_scrub_complete_message(&self, request_id: &str, item_name: &str) -> Result<()> {
         let text = format!(
-            "\u{1f9f9} *Credential Scrubbed*\n\n\
-             *Item:* `{}`\n\
-             *Request ID:* `{}`",
-            item_name, request_id,
+            "\u{1f9f9} <b>Credential Scrubbed</b>\n\n\
+             <b>Item:</b> <code>{}</code>\n\
+             <b>Request ID:</b> <code>{}</code>",
+            escape_html(item_name), escape_html(request_id),
         );
 
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML"
         });
 
         let resp = self
@@ -447,7 +449,7 @@ impl TelegramBackend {
             "chat_id": self.chat_id,
             "message_id": message_id,
             "text": format!("{}\n\n{}", original_text, status_line),
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML"
         });
 
         let resp = self
@@ -561,10 +563,10 @@ impl TelegramBackend {
                 let approval_rate = db.get_approval_rate_last_hour().unwrap_or(0.0);
                 
                 format!(
-                    "📊 *aisudo stats*\n\n\
-                     *Pending:* {}\n\
-                     *Requests (1h):* {}\n\
-                     *Approval rate:* {:.1}%",
+                    "📊 <b>aisudo stats</b>\n\n\
+                     <b>Pending:</b> {}\n\
+                     <b>Requests (1h):</b> {}\n\
+                     <b>Approval rate:</b> {:.1}%",
                     pending, last_hour, approval_rate * 100.0
                 )
             }
@@ -574,7 +576,7 @@ impl TelegramBackend {
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": stats_text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "reply_to_message_id": reply_to,
         });
 
@@ -832,20 +834,21 @@ impl NotificationBackend for TelegramBackend {
 
     async fn send_bw_locked_notification(&self, record: &BwRequestRecord) -> Result<()> {
         let text = format!(
-            "\u{1f512} *Bitwarden Request*\n\n\
-             *User:* `{}`\n\
-             *Item:* `{}`\n\
-             *Field:* `{}`\n\
-             *Vault:* \u{1f512} locked\n\
-             *Request ID:* `{}`\n\n\
+            "\u{1f512} <b>Bitwarden Request</b>\n\n\
+             <b>User:</b> <code>{}</code>\n\
+             <b>Item:</b> <code>{}</code>\n\
+             <b>Field:</b> <code>{}</code>\n\
+             <b>Vault:</b> \u{1f512} locked\n\
+             <b>Request ID:</b> <code>{}</code>\n\n\
              Unlock via dashboard to approve.",
-            record.user, record.item_name, record.field, record.id,
+            escape_html(&record.user), escape_html(&record.item_name),
+            escape_html(&record.field), escape_html(&record.id),
         );
 
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML"
         });
 
         // Fire and forget — no buttons, no waiting
@@ -874,7 +877,7 @@ impl NotificationBackend for TelegramBackend {
                 let error_indicator = "\u{274c}";
                 let base = format!("{} \u{2192} {} Exit {}", approved_status, error_indicator, info.exit_code);
                 if let Some(ref last_lines) = info.last_lines {
-                    format!("{}\n```\n{}\n```", base, last_lines)
+                    format!("{}\n<pre>{}</pre>", base, escape_html(last_lines))
                 } else {
                     base
                 }
@@ -884,7 +887,7 @@ impl NotificationBackend for TelegramBackend {
                 "chat_id": self.chat_id,
                 "message_id": msg_id,
                 "text": format!("{}\n\n{}", original_text, completion_text),
-                "parse_mode": "Markdown"
+                "parse_mode": "HTML"
             });
 
             match self
@@ -913,26 +916,26 @@ fn render_template(template: &str, record: &SudoRequestRecord, stdin_preview_byt
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let reason_val = match &record.reason {
-        Some(r) => format!("\n*Reason:* {}", r),
+        Some(r) => format!("\n<b>Reason:</b> {}", escape_html(r)),
         None => String::new(),
     };
     let stdin_val = match &record.stdin {
         Some(stdin_b64) => {
             let preview = format_stdin_preview(stdin_b64, stdin_preview_bytes);
-            format!("\n\n*Stdin:*\n```\n{}\n```", preview)
+            format!("\n\n<b>Stdin:</b>\n<pre>{}</pre>", escape_html(&preview))
         }
         None => String::new(),
     };
 
     template
-        .replace("{{user}}", &record.user)
-        .replace("{{command}}", &record.command)
-        .replace("{{directory}}", &record.cwd)
-        .replace("{{hostname}}", &hostname)
-        .replace("{{timestamp}}", &timestamp)
+        .replace("{{user}}", &escape_html(&record.user))
+        .replace("{{command}}", &escape_html(&record.command))
+        .replace("{{directory}}", &escape_html(&record.cwd))
+        .replace("{{hostname}}", &escape_html(&hostname))
+        .replace("{{timestamp}}", &escape_html(&timestamp))
         .replace("{{reason}}", &reason_val)
         .replace("{{pid}}", &record.pid.to_string())
-        .replace("{{request_id}}", &record.id)
+        .replace("{{request_id}}", &escape_html(&record.id))
         .replace("{{timeout}}", &record.timeout_seconds.to_string())
         .replace("{{stdin}}", &stdin_val)
 }
@@ -958,6 +961,13 @@ fn format_stdin_preview(stdin_b64: &str, max_preview_bytes: usize) -> String {
             decoded.len()
         )
     }
+}
+
+/// Escape special characters for Telegram HTML parse mode.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Heuristic: if >5% of the first 512 bytes are non-printable control chars, treat as binary.
@@ -1187,13 +1197,39 @@ chat_id = 1
     }
 
     #[test]
-    fn test_render_template_markdown_passthrough() {
+    fn test_render_template_html_passthrough() {
         let record = make_test_record();
-        let tmpl = "**Bold** `{{command}}` _italic_ {{user}}";
+        let tmpl = "<b>Bold</b> <code>{{command}}</code> <i>italic</i> {{user}}";
         let result = render_template(tmpl, &record, 2048);
-        assert_eq!(result, "**Bold** `apt install nginx` _italic_ alice");
+        assert_eq!(result, "<b>Bold</b> <code>apt install nginx</code> <i>italic</i> alice");
     }
 
+
+    #[test]
+    fn test_escape_html() {
+        assert_eq!(escape_html("hello"), "hello");
+        assert_eq!(escape_html("<script>"), "&lt;script&gt;");
+        assert_eq!(escape_html("a & b"), "a &amp; b");
+        assert_eq!(escape_html("foo(bar) + baz"), "foo(bar) + baz");
+        assert_eq!(escape_html("a<b>c&d"), "a&lt;b&gt;c&amp;d");
+    }
+
+    #[test]
+    fn test_render_template_reason_with_special_chars() {
+        let mut record = make_test_record();
+        record.reason = Some("install nginx (v1.2+3) & reload <config>".to_string());
+        let result = render_template(DEFAULT_TEMPLATE, &record, 2048);
+        assert!(result.contains("install nginx (v1.2+3) &amp; reload &lt;config&gt;"));
+        assert!(!result.contains("<config>"));
+    }
+
+    #[test]
+    fn test_render_template_command_with_angle_brackets() {
+        let mut record = make_test_record();
+        record.command = "echo <hello>".to_string();
+        let result = render_template(DEFAULT_TEMPLATE, &record, 2048);
+        assert!(result.contains("echo &lt;hello&gt;"));
+    }
 
     #[test]
     fn test_config_message_template_deserialization() {

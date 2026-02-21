@@ -1923,6 +1923,7 @@ mod tests {
         async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
         fn name(&self) -> &'static str {
             "mock"
         }
@@ -2054,6 +2055,7 @@ mod tests {
         async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
         fn name(&self) -> &'static str {
             "mock_approve"
         }
@@ -2081,6 +2083,7 @@ mod tests {
         async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
         fn name(&self) -> &'static str {
             "mock_deny"
         }
@@ -2108,6 +2111,7 @@ mod tests {
         async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
         fn name(&self) -> &'static str {
             "mock_error"
         }

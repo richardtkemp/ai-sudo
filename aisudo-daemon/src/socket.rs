@@ -13,9 +13,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
+use std::sync::OnceLock;
 use tracing::{error, info, warn};
 
 use crate::bw_session::BwSessionManager;
+
+/// Records the instant the daemon started accepting connections.
+static DAEMON_START: OnceLock<std::time::Instant> = OnceLock::new();
 use crate::config::{ConfigHolder, LimitsConfig, RateLimitMode};
 use crate::db::Database;
 use crate::notification::{BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord};
@@ -253,6 +257,8 @@ pub async fn run_socket_listener(
     bw_session: Option<Arc<BwSessionManager>>,
     pending_unlocks: Arc<DashMap<String, oneshot::Sender<()>>>,
 ) -> Result<()> {
+    DAEMON_START.get_or_init(std::time::Instant::now);
+
     let socket_path = config_holder.config().socket_path.clone();
     let sudoers_cache = Arc::new(SudoersCache::new(300));
 
@@ -929,11 +935,10 @@ async fn handle_status(
     let requests_last_hour = db.get_requests_last_hour()?;
     let approval_rate = db.get_approval_rate_last_hour()?;
 
-    // Calculate uptime from the oldest audit log entry (approximation)
-    let uptime_seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let uptime_seconds = DAEMON_START
+        .get()
+        .map(|start| start.elapsed().as_secs())
+        .unwrap_or(0);
 
     let response = StatusResponse {
         uptime_seconds,

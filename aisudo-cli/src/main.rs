@@ -11,15 +11,20 @@ use std::time::Duration;
 
 const MAX_STDIN_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
+include!(concat!(env!("OUT_DIR"), "/bin_name.rs"));
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
-        eprintln!("Usage: aisudo [OPTIONS] <command> [args...]");
-        eprintln!("       aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
-        eprintln!("       aisudo -l | --list-rules");
-        eprintln!("       aisudo --status");
-        eprintln!("       aisudo --history [N]");
+        eprintln!("Usage: {} [OPTIONS] <command> [args...]", BINARY_NAME);
+        eprintln!(
+            "       {} --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]",
+            BINARY_NAME
+        );
+        eprintln!("       {} -l | --list-rules", BINARY_NAME);
+        eprintln!("       {} --status", BINARY_NAME);
+        eprintln!("       {} --history [N]", BINARY_NAME);
         eprintln!();
         eprintln!("Options:");
         eprintln!("  -r, --reason <text>      Reason for the command (shown in approval request)");
@@ -34,27 +39,8 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // Check for --list-rules / -l mode
-    if args.iter().any(|a| a == "--list-rules" || a == "-l") {
-        return handle_list_rules();
-    }
-
-    // Check for --status mode
-    if args.iter().any(|a| a == "--status") {
-        return handle_status();
-    }
-
-    // Check for --history mode
-    if args.iter().any(|a| a == "--history") {
-        return handle_history(&args);
-    }
-
-    // Check for --request-rule mode
-    if args.iter().any(|a| a == "--request-rule") {
-        return handle_request_rule(&args);
-    }
-
-    // Parse flags: -r/--reason, -t/--timeout, -n/--dry-run
+    // Parse flags: -r/--reason, -t/--timeout, -n/--dry-run, and mode flags
+    // Stop at first non-flag argument - everything after is the command
     let mut reason: Option<String> = None;
     let mut timeout: Option<u32> = None;
     let mut dry_run = false;
@@ -63,10 +49,22 @@ fn main() -> ExitCode {
 
     while i < args.len() {
         match args[i].as_str() {
+            "-l" | "--list-rules" => {
+                return handle_list_rules();
+            }
+            "--status" => {
+                return handle_status();
+            }
+            "--history" => {
+                return handle_history(&args, i);
+            }
+            "--request-rule" => {
+                return handle_request_rule(&args);
+            }
             "-r" | "--reason" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("aisudo: -r/--reason requires a value");
+                    eprintln!("{}: -r/--reason requires a value", BINARY_NAME);
                     return ExitCode::from(1);
                 }
                 reason = Some(args[i].clone());
@@ -76,7 +74,7 @@ fn main() -> ExitCode {
             "-t" | "--timeout" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("aisudo: -t/--timeout requires a value");
+                    eprintln!("{}: -t/--timeout requires a value", BINARY_NAME);
                     return ExitCode::from(1);
                 }
                 match args[i].parse::<u32>() {
@@ -86,7 +84,7 @@ fn main() -> ExitCode {
                         cmd_start = i;
                     }
                     Err(_) => {
-                        eprintln!("aisudo: -t/--timeout must be a positive integer");
+                        eprintln!("{}: -t/--timeout must be a positive integer", BINARY_NAME);
                         return ExitCode::from(1);
                     }
                 }
@@ -96,8 +94,13 @@ fn main() -> ExitCode {
                 i += 1;
                 cmd_start = i;
             }
+            "--" => {
+                // Explicit end of flags
+                cmd_start = i + 1;
+                break;
+            }
             other if other.starts_with('-') => {
-                eprintln!("aisudo: unrecognized option '{}'", other);
+                eprintln!("{}: unrecognized option '{}'", BINARY_NAME, other);
                 return ExitCode::from(1);
             }
             _ => {
@@ -108,8 +111,8 @@ fn main() -> ExitCode {
     }
 
     if cmd_start >= args.len() {
-        eprintln!("Usage: aisudo [OPTIONS] <command> [args...]");
-        eprintln!("       aisudo -h | --help");
+        eprintln!("Usage: sudo [OPTIONS] <command> [args...]");
+        eprintln!("       sudo -h | --help");
         return ExitCode::from(1);
     }
 
@@ -124,7 +127,7 @@ fn main() -> ExitCode {
     let stdin_data = match capture_stdin() {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("aisudo: {e}");
+            eprintln!("{}: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -150,16 +153,22 @@ fn main() -> ExitCode {
     };
 
     if dry_run {
-        eprintln!("aisudo: checking if command would be approved: {command}");
+        eprintln!(
+            "{}: checking if command would be approved: {command}",
+            BINARY_NAME
+        );
     } else {
-        eprintln!("aisudo: requesting approval for: {command}");
+        eprintln!("{}: requesting approval for: {command}", BINARY_NAME);
     }
 
     let stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
-            eprintln!("aisudo: is aisudo-daemon running?");
+            eprintln!(
+                "{}: failed to connect to daemon at {socket_path}: {e}",
+                BINARY_NAME
+            );
+            eprintln!("{}: is the daemon running?", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -170,7 +179,7 @@ fn main() -> ExitCode {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("aisudo: socket error: {e}");
+            eprintln!("{}: socket error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -178,21 +187,21 @@ fn main() -> ExitCode {
     let request_json = match serde_json::to_string(&request) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("aisudo: serialization error: {e}");
+            eprintln!("{}: serialization error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
 
     if let Err(e) = writer.write_all(request_json.as_bytes()) {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.write_all(b"\n") {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.flush() {
-        eprintln!("aisudo: flush error: {e}");
+        eprintln!("{}: flush error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
 
@@ -204,11 +213,14 @@ fn main() -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("aisudo: connection to daemon lost: {e}");
+            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
-            eprintln!("aisudo: daemon closed connection unexpectedly (is it running?)");
+            eprintln!(
+                "{}: daemon closed connection unexpectedly (is it running?)",
+                BINARY_NAME
+            );
             return ExitCode::from(1);
         }
     };
@@ -216,7 +228,7 @@ fn main() -> ExitCode {
     let response: SudoResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("aisudo: invalid response from daemon: {e}");
+            eprintln!("{}: invalid response from daemon: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -224,51 +236,54 @@ fn main() -> ExitCode {
     match response.decision {
         Decision::Approved => {
             if dry_run {
-                println!("\x1b[32maisudo: command would be auto-approved\x1b[0m");
+                println!("\x1b[32msudo: command would be auto-approved\x1b[0m");
                 return ExitCode::from(0);
             }
             // In exec mode, the daemon will now stream output lines
         }
         Decision::UseSudo => {
             if dry_run {
-                println!("\x1b[32maisudo: command would be approved via NOPASSWD rule\x1b[0m");
+                println!("\x1b[32msudo: command would be approved via NOPASSWD rule\x1b[0m");
                 return ExitCode::from(0);
             }
-            eprintln!("aisudo: command permitted by sudo NOPASSWD rule, executing via sudo");
+            eprintln!(
+                "{}: command permitted by sudo NOPASSWD rule, executing via sudo",
+                BINARY_NAME
+            );
             return run_via_sudo(&command, &stdin_data);
         }
         Decision::Denied => {
             if dry_run {
                 if let Some(ref err) = response.error {
                     if err.contains("rate limit") {
-                        println!("\x1b[33maisudo: command would be denied (rate limit)\x1b[0m");
+                        println!("\x1b[33msudo: command would be denied (rate limit)\x1b[0m");
                     } else {
-                        println!("\x1b[33maisudo: command would require approval\x1b[0m");
+                        println!("\x1b[33msudo: command would require approval\x1b[0m");
                     }
                 } else {
-                    println!("\x1b[33maisudo: command would require approval\x1b[0m");
+                    println!("\x1b[33msudo: command would require approval\x1b[0m");
                 }
                 return ExitCode::from(0);
             }
             if let Some(ref err) = response.error {
-                eprintln!("\x1b[31maisudo: denied due to error: {err}\x1b[0m");
+                eprintln!("\x1b[31msudo: denied due to error: {err}\x1b[0m");
             } else {
-                eprintln!("\x1b[31maisudo: request denied by user\x1b[0m");
+                eprintln!("\x1b[31msudo: request denied by user\x1b[0m");
             }
             return ExitCode::from(1);
         }
         Decision::Timeout => {
             if dry_run {
-                println!("\x1b[33maisudo: dry-run check timed out\x1b[0m");
+                println!("\x1b[33msudo: dry-run check timed out\x1b[0m");
                 return ExitCode::from(1);
             }
             eprintln!(
-                "\x1b[33maisudo: request timed out (no response within approval window)\x1b[0m"
+                "\x1b[33msudo: request timed out (no response within approval window)\x1b[0m"
             );
             return ExitCode::from(1);
         }
         Decision::Pending => {
-            eprintln!("aisudo: unexpected pending response");
+            eprintln!("{}: unexpected pending response", BINARY_NAME);
             return ExitCode::from(1);
         }
     }
@@ -280,7 +295,7 @@ fn main() -> ExitCode {
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("aisudo: read error during execution: {e}");
+                eprintln!("{}: read error during execution: {e}", BINARY_NAME);
                 return ExitCode::from(1);
             }
         };
@@ -326,13 +341,13 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
             "--duration" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("aisudo: --duration requires a value");
+                    eprintln!("{}: --duration requires a value", BINARY_NAME);
                     return ExitCode::from(1);
                 }
                 match args[i].parse::<u32>() {
                     Ok(d) => duration = Some(d),
                     Err(_) => {
-                        eprintln!("aisudo: --duration must be a positive integer");
+                        eprintln!("{}: --duration must be a positive integer", BINARY_NAME);
                         return ExitCode::from(1);
                     }
                 }
@@ -340,7 +355,7 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
             "-r" | "--reason" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("aisudo: -r/--reason requires a value");
+                    eprintln!("{}: -r/--reason requires a value", BINARY_NAME);
                     return ExitCode::from(1);
                 }
                 reason = Some(args[i].clone());
@@ -355,15 +370,18 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
     let duration = match duration {
         Some(d) => d,
         None => {
-            eprintln!("aisudo: --duration is required with --request-rule");
-            eprintln!("Usage: aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
+            eprintln!(
+                "{}: --duration is required with --request-rule",
+                BINARY_NAME
+            );
+            eprintln!("Usage: sudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
             return ExitCode::from(1);
         }
     };
 
     if patterns.is_empty() {
-        eprintln!("aisudo: at least one pattern is required");
-        eprintln!("Usage: aisudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
+        eprintln!("{}: at least one pattern is required", BINARY_NAME);
+        eprintln!("Usage: sudo --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]");
         return ExitCode::from(1);
     }
 
@@ -382,15 +400,18 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
         std::env::var("AISUDO_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
 
     eprintln!(
-        "aisudo: requesting temp rule for patterns {:?} (duration: {}s)",
+        "sudo: requesting temp rule for patterns {:?} (duration: {}s)",
         patterns, duration
     );
 
     let stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
-            eprintln!("aisudo: is aisudo-daemon running?");
+            eprintln!(
+                "{}: failed to connect to daemon at {socket_path}: {e}",
+                BINARY_NAME
+            );
+            eprintln!("{}: is the daemon running?", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -400,7 +421,7 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("aisudo: socket error: {e}");
+            eprintln!("{}: socket error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -408,21 +429,21 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
     let msg_json = match serde_json::to_string(&msg) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("aisudo: serialization error: {e}");
+            eprintln!("{}: serialization error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
 
     if let Err(e) = writer.write_all(msg_json.as_bytes()) {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.write_all(b"\n") {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.flush() {
-        eprintln!("aisudo: flush error: {e}");
+        eprintln!("{}: flush error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
 
@@ -432,11 +453,11 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("aisudo: connection to daemon lost: {e}");
+            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
-            eprintln!("aisudo: daemon closed connection unexpectedly");
+            eprintln!("{}: daemon closed connection unexpectedly", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -444,7 +465,7 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
     let response: TempRuleResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("aisudo: invalid response from daemon: {e}");
+            eprintln!("{}: invalid response from daemon: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -452,23 +473,23 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
     match response.decision {
         Decision::Approved => {
             let expires = response.expires_at.as_deref().unwrap_or("unknown");
-            eprintln!("aisudo: temp rule approved (expires: {expires})");
+            eprintln!("{}: temp rule approved (expires: {expires})", BINARY_NAME);
             ExitCode::from(0)
         }
         Decision::Denied => {
             if let Some(ref err) = response.error {
-                eprintln!("aisudo: temp rule denied: {err}");
+                eprintln!("{}: temp rule denied: {err}", BINARY_NAME);
             } else {
-                eprintln!("aisudo: temp rule denied");
+                eprintln!("{}: temp rule denied", BINARY_NAME);
             }
             ExitCode::from(1)
         }
         Decision::Timeout => {
-            eprintln!("aisudo: temp rule request timed out");
+            eprintln!("{}: temp rule request timed out", BINARY_NAME);
             ExitCode::from(1)
         }
         _ => {
-            eprintln!("aisudo: unexpected response");
+            eprintln!("{}: unexpected response", BINARY_NAME);
             ExitCode::from(1)
         }
     }
@@ -486,8 +507,11 @@ fn handle_list_rules() -> ExitCode {
     let stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
-            eprintln!("aisudo: is aisudo-daemon running?");
+            eprintln!(
+                "{}: failed to connect to daemon at {socket_path}: {e}",
+                BINARY_NAME
+            );
+            eprintln!("{}: is the daemon running?", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -497,7 +521,7 @@ fn handle_list_rules() -> ExitCode {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("aisudo: socket error: {e}");
+            eprintln!("{}: socket error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -505,21 +529,21 @@ fn handle_list_rules() -> ExitCode {
     let msg_json = match serde_json::to_string(&msg) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("aisudo: serialization error: {e}");
+            eprintln!("{}: serialization error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
 
     if let Err(e) = writer.write_all(msg_json.as_bytes()) {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.write_all(b"\n") {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.flush() {
-        eprintln!("aisudo: flush error: {e}");
+        eprintln!("{}: flush error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
 
@@ -529,11 +553,11 @@ fn handle_list_rules() -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("aisudo: connection to daemon lost: {e}");
+            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
-            eprintln!("aisudo: daemon closed connection unexpectedly");
+            eprintln!("{}: daemon closed connection unexpectedly", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -541,7 +565,7 @@ fn handle_list_rules() -> ExitCode {
     let response: ListRulesResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("aisudo: invalid response from daemon: {e}");
+            eprintln!("{}: invalid response from daemon: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -595,8 +619,11 @@ fn handle_status() -> ExitCode {
     let stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
-            eprintln!("aisudo: is aisudo-daemon running?");
+            eprintln!(
+                "{}: failed to connect to daemon at {socket_path}: {e}",
+                BINARY_NAME
+            );
+            eprintln!("{}: is the daemon running?", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -606,7 +633,7 @@ fn handle_status() -> ExitCode {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("aisudo: socket error: {e}");
+            eprintln!("{}: socket error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -614,21 +641,21 @@ fn handle_status() -> ExitCode {
     let msg_json = match serde_json::to_string(&msg) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("aisudo: serialization error: {e}");
+            eprintln!("{}: serialization error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
 
     if let Err(e) = writer.write_all(msg_json.as_bytes()) {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.write_all(b"\n") {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.flush() {
-        eprintln!("aisudo: flush error: {e}");
+        eprintln!("{}: flush error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
 
@@ -638,11 +665,11 @@ fn handle_status() -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("aisudo: connection to daemon lost: {e}");
+            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
-            eprintln!("aisudo: daemon closed connection unexpectedly");
+            eprintln!("{}: daemon closed connection unexpectedly", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -650,12 +677,12 @@ fn handle_status() -> ExitCode {
     let response: StatusResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("aisudo: invalid response from daemon: {e}");
+            eprintln!("{}: invalid response from daemon: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
 
-    println!("=== aisudo daemon status ===");
+    println!("=== sudo daemon status ===");
     println!();
     println!(
         "  Uptime: {}s ({:.1} hours)",
@@ -680,17 +707,17 @@ fn handle_status() -> ExitCode {
     ExitCode::from(0)
 }
 
-fn handle_history(args: &[String]) -> ExitCode {
+fn handle_history(args: &[String], history_idx: usize) -> ExitCode {
     use aisudo_common::{HistoryRequest, HistoryResponse};
 
     let user = get_current_user();
 
-    // Parse optional limit argument
-    let limit = if args.len() > 2 {
-        match args[2].parse::<u32>() {
+    // Parse optional limit argument (after --history flag)
+    let limit = if args.len() > history_idx + 1 {
+        match args[history_idx + 1].parse::<u32>() {
             Ok(n) if n > 0 && n <= 100 => n,
             _ => {
-                eprintln!("aisudo: history limit must be between 1 and 100");
+                eprintln!("{}: history limit must be between 1 and 100", BINARY_NAME);
                 return ExitCode::from(1);
             }
         }
@@ -710,8 +737,11 @@ fn handle_history(args: &[String]) -> ExitCode {
     let stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
-            eprintln!("aisudo: is aisudo-daemon running?");
+            eprintln!(
+                "{}: failed to connect to daemon at {socket_path}: {e}",
+                BINARY_NAME
+            );
+            eprintln!("{}: is the daemon running?", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -721,7 +751,7 @@ fn handle_history(args: &[String]) -> ExitCode {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("aisudo: socket error: {e}");
+            eprintln!("{}: socket error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -729,21 +759,21 @@ fn handle_history(args: &[String]) -> ExitCode {
     let msg_json = match serde_json::to_string(&msg) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("aisudo: serialization error: {e}");
+            eprintln!("{}: serialization error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
 
     if let Err(e) = writer.write_all(msg_json.as_bytes()) {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.write_all(b"\n") {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.flush() {
-        eprintln!("aisudo: flush error: {e}");
+        eprintln!("{}: flush error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
 
@@ -753,11 +783,11 @@ fn handle_history(args: &[String]) -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("aisudo: connection to daemon lost: {e}");
+            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
-            eprintln!("aisudo: daemon closed connection unexpectedly");
+            eprintln!("{}: daemon closed connection unexpectedly", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -765,7 +795,7 @@ fn handle_history(args: &[String]) -> ExitCode {
     let response: HistoryResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("aisudo: invalid response from daemon: {e}");
+            eprintln!("{}: invalid response from daemon: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -818,7 +848,7 @@ fn run_via_sudo(command: &str, stdin_data: &Option<String>) -> ExitCode {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("aisudo: failed to exec sudo: {e}");
+            eprintln!("{}: failed to exec sudo: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -837,7 +867,7 @@ fn run_via_sudo(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let output = match child.wait_with_output() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("aisudo: sudo wait error: {e}");
+            eprintln!("{}: sudo wait error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -845,7 +875,10 @@ fn run_via_sudo(command: &str, stdin_data: &Option<String>) -> ExitCode {
     // Check if sudo failed because a password was required
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() && stderr.contains("a password is required") {
-        eprintln!("aisudo: sudo NOPASSWD rule no longer applies, requesting approval...");
+        eprintln!(
+            "{}: sudo NOPASSWD rule no longer applies, requesting approval...",
+            BINARY_NAME
+        );
         return retry_with_approval(command, stdin_data);
     }
 
@@ -886,7 +919,10 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("aisudo: failed to connect to daemon at {socket_path}: {e}");
+            eprintln!(
+                "{}: failed to connect to daemon at {socket_path}: {e}",
+                BINARY_NAME
+            );
             return ExitCode::from(1);
         }
     };
@@ -896,7 +932,7 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("aisudo: socket error: {e}");
+            eprintln!("{}: socket error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -904,21 +940,21 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let msg_json = match serde_json::to_string(&msg) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("aisudo: serialization error: {e}");
+            eprintln!("{}: serialization error: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
 
     if let Err(e) = writer.write_all(msg_json.as_bytes()) {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.write_all(b"\n") {
-        eprintln!("aisudo: write error: {e}");
+        eprintln!("{}: write error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
     if let Err(e) = writer.flush() {
-        eprintln!("aisudo: flush error: {e}");
+        eprintln!("{}: flush error: {e}", BINARY_NAME);
         return ExitCode::from(1);
     }
 
@@ -928,11 +964,11 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("aisudo: connection to daemon lost: {e}");
+            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
-            eprintln!("aisudo: daemon closed connection unexpectedly");
+            eprintln!("{}: daemon closed connection unexpectedly", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -940,7 +976,7 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let response: SudoResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("aisudo: invalid response from daemon: {e}");
+            eprintln!("{}: invalid response from daemon: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
@@ -949,18 +985,18 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
         Decision::Approved => {}
         Decision::Denied => {
             if let Some(ref err) = response.error {
-                eprintln!("aisudo: denied: {err}");
+                eprintln!("{}: denied: {err}", BINARY_NAME);
             } else {
-                eprintln!("aisudo: request denied by user");
+                eprintln!("{}: request denied by user", BINARY_NAME);
             }
             return ExitCode::from(1);
         }
         Decision::Timeout => {
-            eprintln!("aisudo: request timed out");
+            eprintln!("{}: request timed out", BINARY_NAME);
             return ExitCode::from(1);
         }
         _ => {
-            eprintln!("aisudo: unexpected response");
+            eprintln!("{}: unexpected response", BINARY_NAME);
             return ExitCode::from(1);
         }
     }
@@ -972,7 +1008,7 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("aisudo: read error: {e}");
+                eprintln!("{}: read error: {e}", BINARY_NAME);
                 return ExitCode::from(1);
             }
         };
@@ -1079,4 +1115,171 @@ fn capture_stdin() -> Result<Option<String>, String> {
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
     Ok(Some(encoded))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_aisudo_flag() {
+        assert!(is_aisudo_flag("-l"));
+        assert!(is_aisudo_flag("--list-rules"));
+        assert!(is_aisudo_flag("--status"));
+        assert!(is_aisudo_flag("--history"));
+        assert!(is_aisudo_flag("--request-rule"));
+        assert!(is_aisudo_flag("-r"));
+        assert!(is_aisudo_flag("--reason"));
+        assert!(is_aisudo_flag("-t"));
+        assert!(is_aisudo_flag("--timeout"));
+        assert!(is_aisudo_flag("-n"));
+        assert!(is_aisudo_flag("--dry-run"));
+        assert!(is_aisudo_flag("--"));
+        assert!(is_aisudo_flag("--unknown-flag"));
+
+        assert!(!is_aisudo_flag("crontab"));
+        assert!(!is_aisudo_flag("ls"));
+        assert!(!is_aisudo_flag("sudo"));
+    }
+
+    #[test]
+    fn test_find_command_start_no_flags() {
+        let args = vec![
+            "aisudo".to_string(),
+            "crontab".to_string(),
+            "-l".to_string(),
+        ];
+        assert_eq!(find_command_start(&args), 1);
+    }
+
+    #[test]
+    fn test_find_command_start_with_reason() {
+        let args = vec![
+            "aisudo".to_string(),
+            "-r".to_string(),
+            "reason".to_string(),
+            "crontab".to_string(),
+            "-l".to_string(),
+        ];
+        assert_eq!(find_command_start(&args), 3);
+    }
+
+    #[test]
+    fn test_find_command_start_with_timeout() {
+        let args = vec![
+            "aisudo".to_string(),
+            "-t".to_string(),
+            "30".to_string(),
+            "crontab".to_string(),
+            "-l".to_string(),
+        ];
+        assert_eq!(find_command_start(&args), 3);
+    }
+
+    #[test]
+    fn test_find_command_start_with_dry_run() {
+        let args = vec![
+            "aisudo".to_string(),
+            "-n".to_string(),
+            "crontab".to_string(),
+            "-l".to_string(),
+        ];
+        assert_eq!(find_command_start(&args), 2);
+    }
+
+    #[test]
+    fn test_find_command_start_with_double_dash() {
+        let args = vec![
+            "aisudo".to_string(),
+            "--".to_string(),
+            "crontab".to_string(),
+            "-l".to_string(),
+        ];
+        assert_eq!(find_command_start(&args), 2);
+    }
+
+    #[test]
+    fn test_crontab_l_not_interpreted_as_list_rules() {
+        // This is the bug case: "aisudo crontab -l" should NOT trigger list-rules
+        let args = vec![
+            "aisudo".to_string(),
+            "crontab".to_string(),
+            "-l".to_string(),
+        ];
+        let cmd_start = find_command_start(&args);
+
+        // -l at index 2 should NOT be recognized as a mode flag since it's after the command
+        // The mode flags should only be checked in args[1..cmd_start)
+        for i in 1..cmd_start {
+            assert!(
+                !matches!(args[i].as_str(), "-l" | "--list-rules"),
+                "-l should not be found before command start"
+            );
+        }
+
+        // The command should be "crontab -l"
+        assert_eq!(&args[cmd_start..], &["crontab", "-l"]);
+    }
+
+    #[test]
+    fn test_list_rules_at_start_is_recognized() {
+        // "aisudo -l" should trigger list-rules
+        let args = vec!["aisudo".to_string(), "-l".to_string()];
+        let cmd_start = find_command_start(&args);
+
+        // At index 1, -l should be recognized as a mode flag
+        assert!(
+            args[1..cmd_start.min(args.len())]
+                .iter()
+                .any(|a| a == "-l" || a == "--list-rules")
+                || args.get(1).map(|s| s.as_str()) == Some("-l")
+        );
+    }
+}
+
+#[allow(dead_code)]
+fn is_aisudo_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-l" | "--list-rules"
+            | "--status"
+            | "--history"
+            | "--request-rule"
+            | "-r"
+            | "--reason"
+            | "-t"
+            | "--timeout"
+            | "-n"
+            | "--dry-run"
+            | "--"
+    ) || arg.starts_with('-')
+}
+
+#[allow(dead_code)]
+fn find_command_start(args: &[String]) -> usize {
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-r" | "--reason" => {
+                i += 2;
+            }
+            "-t" | "--timeout" => {
+                i += 2;
+            }
+            "-n" | "--dry-run" | "-l" | "--list-rules" | "--status" | "--history"
+            | "--request-rule" => {
+                i += 1;
+            }
+            "--" => {
+                return i + 1;
+            }
+            other if other.starts_with('-') => {
+                i += 1;
+            }
+            _ => {
+                return i;
+            }
+        }
+    }
+    i
 }

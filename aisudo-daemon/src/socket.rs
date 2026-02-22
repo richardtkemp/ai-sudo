@@ -1459,9 +1459,15 @@ async fn exec_command(
         }
         
         let json = serde_json::to_string(&output)?;
-        writer.write_all(json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        if writer.write_all(json.as_bytes()).await.is_err()
+            || writer.write_all(b"\n").await.is_err()
+            || writer.flush().await.is_err()
+        {
+            warn!("Client disconnected during command execution, killing child process");
+            child.kill().await.ok();
+            let _ = child.wait().await;
+            return Err(anyhow::anyhow!("client disconnected"));
+        }
     }
 
     // Wait for exit code
@@ -1476,9 +1482,10 @@ async fn exec_command(
         exit_code: Some(exit_code),
     };
     let json = serde_json::to_string(&exit_msg)?;
-    writer.write_all(json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+    // Best-effort write of exit code; process already finished
+    let _ = writer.write_all(json.as_bytes()).await;
+    let _ = writer.write_all(b"\n").await;
+    let _ = writer.flush().await;
 
     let last_lines = if output_lines.is_empty() {
         None
@@ -1629,16 +1636,16 @@ async fn exec_command_chain(
         i = pipe_end;
     }
 
-    // Send final exit code
+    // Send final exit code (best-effort; child processes already finished)
     let exit_msg = ExecOutput {
         stream: "exit".to_string(),
         data: String::new(),
         exit_code: Some(last_exit_code),
     };
     let json = serde_json::to_string(&exit_msg)?;
-    writer.write_all(json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+    let _ = writer.write_all(json.as_bytes()).await;
+    let _ = writer.write_all(b"\n").await;
+    let _ = writer.flush().await;
 
     Ok(())
 }
@@ -1778,7 +1785,19 @@ async fn exec_pipeline(
     // Stream output from the last child
     let last_idx = children.len() - 1;
     let last_child = &mut children[last_idx];
-    let exit_code = stream_child_output(last_child, writer).await?;
+    let exit_code = match stream_child_output(last_child, writer).await {
+        Ok(code) => code,
+        Err(e) => {
+            // Client disconnected — kill all pipeline children
+            for child in children.iter_mut() {
+                child.kill().await.ok();
+            }
+            for child in children.iter_mut() {
+                let _ = child.wait().await;
+            }
+            return Err(e);
+        }
+    };
 
     // Wait for all children to finish
     for child in children.iter_mut() {
@@ -1849,9 +1868,15 @@ async fn stream_child_output(
 
     while let Some(output) = rx.recv().await {
         let json = serde_json::to_string(&output)?;
-        writer.write_all(json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        if writer.write_all(json.as_bytes()).await.is_err()
+            || writer.write_all(b"\n").await.is_err()
+            || writer.flush().await.is_err()
+        {
+            warn!("Client disconnected during output streaming, killing child process");
+            child.kill().await.ok();
+            let _ = child.wait().await;
+            return Err(anyhow::anyhow!("client disconnected"));
+        }
     }
 
     let status = child.wait().await?;

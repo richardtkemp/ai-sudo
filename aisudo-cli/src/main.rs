@@ -236,14 +236,14 @@ fn main() -> ExitCode {
     match response.decision {
         Decision::Approved => {
             if dry_run {
-                println!("\x1b[32msudo: command would be auto-approved\x1b[0m");
+                eprintln!("\x1b[32msudo: command would be auto-approved\x1b[0m");
                 return ExitCode::from(0);
             }
             // In exec mode, the daemon will now stream output lines
         }
         Decision::UseSudo => {
             if dry_run {
-                println!("\x1b[32msudo: command would be approved via NOPASSWD rule\x1b[0m");
+                eprintln!("\x1b[32msudo: command would be approved via NOPASSWD rule\x1b[0m");
                 return ExitCode::from(0);
             }
             eprintln!(
@@ -256,12 +256,12 @@ fn main() -> ExitCode {
             if dry_run {
                 if let Some(ref err) = response.error {
                     if err.contains("rate limit") {
-                        println!("\x1b[33msudo: command would be denied (rate limit)\x1b[0m");
+                        eprintln!("\x1b[33msudo: command would be denied (rate limit)\x1b[0m");
                     } else {
-                        println!("\x1b[33msudo: command would require approval\x1b[0m");
+                        eprintln!("\x1b[33msudo: command would require approval\x1b[0m");
                     }
                 } else {
-                    println!("\x1b[33msudo: command would require approval\x1b[0m");
+                    eprintln!("\x1b[33msudo: command would require approval\x1b[0m");
                 }
                 return ExitCode::from(0);
             }

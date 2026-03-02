@@ -25,6 +25,94 @@ use crate::db::Database;
 use crate::notification::{BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord};
 use crate::sudoers::SudoersCache;
 
+/// Check that the binary in a command is owned by a trusted user and not writable by
+/// untrusted users. This prevents an agent from writing a script to /tmp, getting it
+/// allowlisted, and running it as root.
+///
+/// Returns Ok(()) if the check passes or is disabled, Err(message) if rejected.
+fn check_binary_ownership(command: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
+    if !limits.check_binary_ownership {
+        return Ok(());
+    }
+
+    // Extract binary name (first whitespace-delimited token)
+    let binary = command.split_whitespace().next().unwrap_or("");
+    if binary.is_empty() {
+        return Err("empty command".to_string());
+    }
+
+    // Resolve to absolute path
+    let path = if binary.starts_with('/') {
+        std::path::PathBuf::from(binary)
+    } else {
+        // Search PATH
+        match which::which(binary) {
+            Ok(p) => p,
+            Err(_) => return Err(format!("binary not found in PATH: {binary}")),
+        }
+    };
+
+    // Follow symlinks and stat the target
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) => return Err(format!("cannot stat {}: {e}", path.display())),
+    };
+
+    use std::os::unix::fs::MetadataExt;
+
+    let uid = metadata.uid();
+    let mode = metadata.mode();
+
+    // Check owner: must be root (0) or in allowed_binary_owners
+    let mut allowed: Vec<u32> = vec![0];
+    allowed.extend(&limits.allowed_binary_owners);
+    if !allowed.contains(&uid) {
+        return Err(format!(
+            "binary {} owned by uid {uid}, expected one of {allowed:?}",
+            path.display()
+        ));
+    }
+
+    // Check not world-writable (o+w) or group-writable (g+w)
+    if mode & 0o022 != 0 {
+        let writable = if mode & 0o002 != 0 && mode & 0o020 != 0 {
+            "world-writable and group-writable"
+        } else if mode & 0o002 != 0 {
+            "world-writable"
+        } else {
+            "group-writable"
+        };
+        return Err(format!(
+            "binary {} is {writable} (mode {mode:04o})",
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check ownership of all binaries in a command chain.
+/// Parses the command into chain segments and validates each one.
+fn check_command_chain_ownership(command: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
+    if !limits.check_binary_ownership {
+        return Ok(());
+    }
+
+    // Try parsing as a chain; if it fails, just check the whole command as one segment
+    match parse_command_chain(command) {
+        Ok(segments) => {
+            for seg in &segments {
+                check_binary_ownership(&seg.command, limits)?;
+            }
+            Ok(())
+        }
+        Err(_) => {
+            // Not a chain — check the command directly
+            check_binary_ownership(command, limits)
+        }
+    }
+}
+
 /// Result of executing a command, containing exit code and last N lines of output.
 struct ExecResult {
     exit_code: i32,
@@ -556,6 +644,20 @@ async fn handle_sudo_request(
 
     // Check allowlist - auto-approved commands skip rate limiting
     if is_allowed(&command, &effective_allowlist) {
+        // Validate binary ownership before auto-executing
+        if let Err(reason) = check_command_chain_ownership(&command, &limits) {
+            warn!("Allowlisted command rejected (ownership): {reason}");
+            let response = SudoResponse {
+                request_id: String::new(),
+                decision: Decision::Denied,
+                error: Some(format!("ownership check failed: {reason}")),
+            };
+            let resp_json = serde_json::to_string(&response)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
         info!("Command auto-approved via allowlist: {}", command);
         
         // For dry-run, just return approved without executing or logging
@@ -594,6 +696,20 @@ async fn handle_sudo_request(
 
     // Check active temp rules - auto-approved commands skip rate limiting
     if is_temp_rule_allowed(&db, &request.user, &command)? {
+        // Validate binary ownership before auto-executing
+        if let Err(reason) = check_command_chain_ownership(&command, &limits) {
+            warn!("Temp-rule command rejected (ownership): {reason}");
+            let response = SudoResponse {
+                request_id: String::new(),
+                decision: Decision::Denied,
+                error: Some(format!("ownership check failed: {reason}")),
+            };
+            let resp_json = serde_json::to_string(&response)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
         info!("Command auto-approved via temp rule: {}", command);
         
         // For dry-run, just return approved without executing or logging

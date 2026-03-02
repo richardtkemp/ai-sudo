@@ -117,6 +117,18 @@ pub struct LimitsConfig {
     /// Rate limit mode: per_user (default) or global.
     #[serde(default)]
     pub rate_limit_mode: RateLimitMode,
+
+    /// Check binary ownership before auto-approved execution.
+    /// When true, auto-approved commands (allowlist/temp rule) must have their
+    /// binary owned by root (or an allowed owner) and not be world/group-writable.
+    /// Default: true.
+    #[serde(default = "default_check_binary_ownership")]
+    pub check_binary_ownership: bool,
+
+    /// Additional UIDs (beyond root) whose binaries are trusted for auto-execution.
+    /// Default: empty (only root-owned binaries allowed).
+    #[serde(default)]
+    pub allowed_binary_owners: Vec<u32>,
 }
 
 fn default_rate_limit_requests() -> u32 {
@@ -125,6 +137,10 @@ fn default_rate_limit_requests() -> u32 {
 
 fn default_rate_limit_window_seconds() -> u32 {
     60
+}
+
+fn default_check_binary_ownership() -> bool {
+    true
 }
 
 fn default_max_stdin() -> usize {
@@ -148,6 +164,8 @@ fn default_limits() -> LimitsConfig {
         rate_limit_window_seconds: default_rate_limit_window_seconds(),
         rate_limit_count_allowlisted: false,
         rate_limit_mode: RateLimitMode::PerUser,
+        check_binary_ownership: default_check_binary_ownership(),
+        allowed_binary_owners: Vec::new(),
     }
 }
 

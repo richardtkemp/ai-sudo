@@ -213,7 +213,7 @@ fn main() -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
+            eprintln!("{}: connection to daemon lost (main): {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
@@ -453,7 +453,7 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
+            eprintln!("{}: connection to daemon lost (request_rule): {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
@@ -553,7 +553,7 @@ fn handle_list_rules() -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
+            eprintln!("{}: connection to daemon lost (list_rules): {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
@@ -665,7 +665,7 @@ fn handle_status() -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
+            eprintln!("{}: connection to daemon lost (status): {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
@@ -783,7 +783,7 @@ fn handle_history(args: &[String], history_idx: usize) -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
+            eprintln!("{}: connection to daemon lost (history): {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {
@@ -964,7 +964,7 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost: {e}", BINARY_NAME);
+            eprintln!("{}: connection to daemon lost (retry_approval): {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
         None => {

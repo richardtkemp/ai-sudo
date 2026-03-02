@@ -79,6 +79,10 @@ allowlist = [
 [telegram]
 bot_token = "your-bot-token"
 chat_id = 123456789
+
+[limits]
+check_binary_ownership = true    # validate binary ownership for auto-approved commands
+allowed_binary_owners = []       # additional trusted UIDs beyond root (default: root only)
 ```
 
 ### Usage
@@ -175,6 +179,24 @@ If you're using [OpenClaw](https://github.com/openclaw/openclaw), add this to yo
 - All requests and decisions are logged to SQLite for audit
 - Telegram notifications are not E2E encrypted — suitable for personal servers, not high-security environments
 - Rate limiting prevents abuse (10 requests/minute/user)
+
+### Binary Ownership Validation
+
+Auto-approved commands (allowlist or temp rules) are checked for binary ownership before execution. The daemon resolves the command binary via PATH and rejects it if:
+
+- The binary is not owned by root (or an explicitly allowed owner)
+- The binary is world-writable or group-writable
+- The binary is a symlink to an untrusted target (follows symlinks)
+
+This prevents privilege escalation where an attacker replaces a whitelisted binary with a malicious one. Human-approved commands (via Telegram) skip this check since they've already been reviewed.
+
+Configure in `aisudo.toml`:
+
+```toml
+[limits]
+check_binary_ownership = true    # default: true
+allowed_binary_owners = [1000]   # additional trusted UIDs beyond root
+```
 
 ## License
 

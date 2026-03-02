@@ -129,6 +129,14 @@ pub struct LimitsConfig {
     /// Default: empty (only root-owned binaries allowed).
     #[serde(default)]
     pub allowed_binary_owners: Vec<u32>,
+
+    /// Strip shell wrappers (bash/sh -c '...') before allowlist matching.
+    /// When true, commands like `bash -c 'systemctl restart foo'` are matched
+    /// as `systemctl restart foo` against the allowlist. The original command
+    /// (with shell wrapper) is still what gets executed.
+    /// Default: false.
+    #[serde(default)]
+    pub strip_shell_prefix: bool,
 }
 
 fn default_rate_limit_requests() -> u32 {
@@ -166,6 +174,7 @@ fn default_limits() -> LimitsConfig {
         rate_limit_mode: RateLimitMode::PerUser,
         check_binary_ownership: default_check_binary_ownership(),
         allowed_binary_owners: Vec::new(),
+        strip_shell_prefix: false,
     }
 }
 

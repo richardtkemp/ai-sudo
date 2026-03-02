@@ -618,8 +618,15 @@ async fn handle_sudo_request(
     let effective_timeout = request.timeout_seconds.unwrap_or(timeout_seconds);
     let user = &request.user;
 
+    // Normalize command for allowlist/denylist matching (strip shell wrappers if configured)
+    let match_command = if limits.strip_shell_prefix {
+        strip_shell_wrapper(&command)
+    } else {
+        command.clone()
+    };
+
     // Check denylist FIRST - deny always takes precedence
-    if is_denied(&command, denylist) {
+    if is_denied(&match_command, denylist) {
         warn!("Command denied via denylist: {}", command);
         let response = SudoResponse {
             request_id: String::new(),
@@ -643,7 +650,7 @@ async fn handle_sudo_request(
     };
 
     // Check allowlist - auto-approved commands skip rate limiting
-    if is_allowed(&command, &effective_allowlist) {
+    if is_allowed(&match_command, &effective_allowlist) {
         // Validate binary ownership before auto-executing
         if let Err(reason) = check_command_chain_ownership(&command, &limits) {
             warn!("Allowlisted command rejected (ownership): {reason}");
@@ -695,7 +702,7 @@ async fn handle_sudo_request(
     }
 
     // Check active temp rules - auto-approved commands skip rate limiting
-    if is_temp_rule_allowed(&db, &request.user, &command)? {
+    if is_temp_rule_allowed(&db, &request.user, &match_command)? {
         // Validate binary ownership before auto-executing
         if let Err(reason) = check_command_chain_ownership(&command, &limits) {
             warn!("Temp-rule command rejected (ownership): {reason}");
@@ -2015,6 +2022,42 @@ fn is_allowed(command: &str, allowlist: &[String]) -> bool {
     segments.iter().all(|seg| is_single_command_allowed(&seg.command, allowlist))
 }
 
+/// Strip shell wrappers from a command for allowlist matching.
+/// Handles: `bash CMD`, `sh CMD`, `bash -c 'CMD'`, `sh -c 'CMD'`,
+/// `bash -c "CMD"`, `sh -c "CMD"`.
+/// Returns the inner command if a wrapper is found, otherwise returns the original.
+fn strip_shell_wrapper(command: &str) -> String {
+    let trimmed = command.trim();
+
+    for shell in &["bash", "sh"] {
+        // Check for "bash -c '...'" or "bash -c \"...\""
+        let prefix_c = format!("{} -c ", shell);
+        if let Some(rest) = trimmed.strip_prefix(&prefix_c) {
+            let rest = rest.trim();
+            // Strip surrounding quotes if present
+            if (rest.starts_with('\'') && rest.ends_with('\''))
+                || (rest.starts_with('"') && rest.ends_with('"'))
+            {
+                if rest.len() >= 2 {
+                    return rest[1..rest.len() - 1].to_string();
+                }
+            }
+            return rest.to_string();
+        }
+
+        // Check for bare "bash CMD" (no -c flag)
+        let prefix_bare = format!("{} ", shell);
+        if let Some(rest) = trimmed.strip_prefix(&prefix_bare) {
+            let rest = rest.trim();
+            if !rest.is_empty() && !rest.starts_with('-') {
+                return rest.to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
 /// Check if a command is denied by the denylist.
 /// Uses same prefix matching as allowlist. If ANY segment matches, the whole command is denied.
 fn is_denied(command: &str, denylist: &[String]) -> bool {
@@ -2120,6 +2163,9 @@ mod tests {
             rate_limit_window_seconds: 60,
             rate_limit_count_allowlisted: false,
             rate_limit_mode: RateLimitMode::PerUser,
+            check_binary_ownership: false,
+            allowed_binary_owners: Vec::new(),
+            strip_shell_prefix: false,
         };
         let handler = tokio::spawn(async move {
             handle_connection(server, db_clone, backend, sudoers, 60, &[], &[], &std::collections::HashMap::new(), limits, None).await
@@ -2279,6 +2325,9 @@ mod tests {
             rate_limit_window_seconds: 60,
             rate_limit_count_allowlisted: false,
             rate_limit_mode: RateLimitMode::PerUser,
+            check_binary_ownership: false,
+            allowed_binary_owners: Vec::new(),
+            strip_shell_prefix: false,
         }
     }
 
@@ -3099,6 +3148,53 @@ mod tests {
 
         let response2: SudoResponse = serde_json::from_str(&resp_line2).unwrap();
         assert_eq!(response2.decision, Decision::Approved);
+    }
+
+    // strip_shell_wrapper tests
+    #[test]
+    fn strip_bash_c_single_quotes() {
+        assert_eq!(strip_shell_wrapper("bash -c 'systemctl restart foo'"), "systemctl restart foo");
+    }
+
+    #[test]
+    fn strip_bash_c_double_quotes() {
+        assert_eq!(strip_shell_wrapper("bash -c \"systemctl restart foo\""), "systemctl restart foo");
+    }
+
+    #[test]
+    fn strip_sh_c_single_quotes() {
+        assert_eq!(strip_shell_wrapper("sh -c 'apt install vim'"), "apt install vim");
+    }
+
+    #[test]
+    fn strip_bare_bash() {
+        assert_eq!(strip_shell_wrapper("bash systemctl restart foo"), "systemctl restart foo");
+    }
+
+    #[test]
+    fn strip_bare_sh() {
+        assert_eq!(strip_shell_wrapper("sh systemctl restart foo"), "systemctl restart foo");
+    }
+
+    #[test]
+    fn strip_no_wrapper() {
+        assert_eq!(strip_shell_wrapper("systemctl restart foo"), "systemctl restart foo");
+    }
+
+    #[test]
+    fn strip_bash_with_flags_ignored() {
+        // bash -e or bash --login should not be stripped (has flags)
+        assert_eq!(strip_shell_wrapper("bash -e script.sh"), "bash -e script.sh");
+    }
+
+    #[test]
+    fn strip_preserves_inner_quotes() {
+        assert_eq!(strip_shell_wrapper("bash -c 'echo \"hello world\"'"), "echo \"hello world\"");
+    }
+
+    #[test]
+    fn strip_unquoted_bash_c() {
+        assert_eq!(strip_shell_wrapper("bash -c systemctl restart foo"), "systemctl restart foo");
     }
 }
 

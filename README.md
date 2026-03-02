@@ -81,7 +81,7 @@ bot_token = "your-bot-token"
 chat_id = 123456789
 
 [limits]
-check_binary_ownership = true    # validate binary ownership for auto-approved commands
+check_binary_ownership = "auto"  # "off", "auto" (allowlist/temp rules only), or "all" (including Telegram-approved)
 allowed_binary_owners = []       # additional trusted UIDs beyond root (default: root only)
 ```
 
@@ -182,21 +182,31 @@ If you're using [OpenClaw](https://github.com/openclaw/openclaw), add this to yo
 
 ### Binary Ownership Validation
 
-Auto-approved commands (allowlist or temp rules) are checked for binary ownership before execution. The daemon resolves the command binary via PATH and rejects it if:
+Commands can be checked for binary ownership before execution. The daemon resolves the command binary via PATH and rejects it if:
 
 - The binary is not owned by root (or an explicitly allowed owner)
 - The binary is world-writable or group-writable
 - The binary is a symlink to an untrusted target (follows symlinks)
 
-This prevents privilege escalation where an attacker replaces a whitelisted binary with a malicious one. Human-approved commands (via Telegram) skip this check since they've already been reviewed.
+This prevents privilege escalation where an attacker replaces a whitelisted binary with a malicious one.
+
+Three levels are available:
+
+| Level | Description |
+|-------|-------------|
+| `"off"` | No ownership checking |
+| `"auto"` | Check only auto-approved commands (allowlist/temp rules) **(default)** |
+| `"all"` | Check all commands, including human-approved (Telegram) ones |
 
 Configure in `aisudo.toml`:
 
 ```toml
 [limits]
-check_binary_ownership = true    # default: true
+check_binary_ownership = "auto"  # "off", "auto", or "all"
 allowed_binary_owners = [1000]   # additional trusted UIDs beyond root
 ```
+
+For backward compatibility, `true` is treated as `"auto"` and `false` as `"off"`.
 
 ## License
 

@@ -20,7 +20,7 @@ use crate::bw_session::BwSessionManager;
 
 /// Records the instant the daemon started accepting connections.
 static DAEMON_START: OnceLock<std::time::Instant> = OnceLock::new();
-use crate::config::{ConfigHolder, LimitsConfig, RateLimitMode};
+use crate::config::{BinaryOwnershipCheck, ConfigHolder, LimitsConfig, RateLimitMode};
 use crate::db::Database;
 use crate::notification::{BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord};
 use crate::sudoers::SudoersCache;
@@ -31,7 +31,7 @@ use crate::sudoers::SudoersCache;
 ///
 /// Returns Ok(()) if the check passes or is disabled, Err(message) if rejected.
 fn check_binary_ownership(command: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
-    if !limits.check_binary_ownership {
+    if limits.check_binary_ownership == BinaryOwnershipCheck::Off {
         return Ok(());
     }
 
@@ -94,7 +94,7 @@ fn check_binary_ownership(command: &str, limits: &LimitsConfig) -> std::result::
 /// Check ownership of all binaries in a command chain.
 /// Parses the command into chain segments and validates each one.
 fn check_command_chain_ownership(command: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
-    if !limits.check_binary_ownership {
+    if limits.check_binary_ownership == BinaryOwnershipCheck::Off {
         return Ok(());
     }
 
@@ -111,6 +111,41 @@ fn check_command_chain_ownership(command: &str, limits: &LimitsConfig) -> std::r
             check_binary_ownership(command, limits)
         }
     }
+}
+
+/// Check ownership of the original command AND the inner (stripped) command when
+/// strip_shell_prefix is enabled. This ensures both the wrapper binary (e.g. bash)
+/// and the inner command binary (e.g. systemctl) are validated.
+fn check_ownership_with_strip(command: &str, match_command: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
+    // Always check the original command (covers the wrapper binary like bash/sh)
+    check_command_chain_ownership(command, limits)?;
+    // If stripping produced a different command, also check the inner command's binaries
+    if command != match_command {
+        check_command_chain_ownership(match_command, limits)?;
+    }
+    Ok(())
+}
+
+/// Send a generic ownership-check denial to the client.
+///
+/// The detailed reason is logged server-side only; the client receives a
+/// generic `"ownership check failed"` message to avoid leaking internal paths.
+async fn deny_ownership(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    request_id: String,
+    log_msg: &str,
+) -> Result<()> {
+    warn!("{log_msg}");
+    let response = SudoResponse {
+        request_id,
+        decision: Decision::Denied,
+        error: Some("ownership check failed".to_string()),
+    };
+    let resp_json = serde_json::to_string(&response)?;
+    writer.write_all(resp_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 /// Result of executing a command, containing exit code and last N lines of output.
@@ -652,17 +687,8 @@ async fn handle_sudo_request(
     // Check allowlist - auto-approved commands skip rate limiting
     if is_allowed(&match_command, &effective_allowlist) {
         // Validate binary ownership before auto-executing
-        if let Err(reason) = check_command_chain_ownership(&command, &limits) {
-            warn!("Allowlisted command rejected (ownership): {reason}");
-            let response = SudoResponse {
-                request_id: String::new(),
-                decision: Decision::Denied,
-                error: Some(format!("ownership check failed: {reason}")),
-            };
-            let resp_json = serde_json::to_string(&response)?;
-            writer.write_all(resp_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+        if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
+            deny_ownership(writer, String::new(), &format!("Allowlisted command rejected (ownership): {reason}")).await?;
             return Ok(());
         }
         info!("Command auto-approved via allowlist: {}", command);
@@ -704,17 +730,8 @@ async fn handle_sudo_request(
     // Check active temp rules - auto-approved commands skip rate limiting
     if is_temp_rule_allowed(&db, &request.user, &match_command)? {
         // Validate binary ownership before auto-executing
-        if let Err(reason) = check_command_chain_ownership(&command, &limits) {
-            warn!("Temp-rule command rejected (ownership): {reason}");
-            let response = SudoResponse {
-                request_id: String::new(),
-                decision: Decision::Denied,
-                error: Some(format!("ownership check failed: {reason}")),
-            };
-            let resp_json = serde_json::to_string(&response)?;
-            writer.write_all(resp_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+        if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
+            deny_ownership(writer, String::new(), &format!("Temp-rule command rejected (ownership): {reason}")).await?;
             return Ok(());
         }
         info!("Command auto-approved via temp rule: {}", command);
@@ -867,6 +884,13 @@ async fn handle_sudo_request(
 
     // If exec mode and approved, execute via shell (human approved the exact command)
     if mode == RequestMode::Exec && decision == Decision::Approved {
+        // If check_binary_ownership is "all", validate even human-approved commands
+        if limits.check_binary_ownership == BinaryOwnershipCheck::All {
+            if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
+                deny_ownership(writer, request_id.clone(), &format!("Human-approved command rejected (ownership): {reason}")).await?;
+                return Ok(());
+            }
+        }
         let exec_result = exec_command(&command, &cwd, stdin_bytes, writer, true).await?;
         
         // Update Telegram notification with completion status
@@ -2022,40 +2046,80 @@ fn is_allowed(command: &str, allowlist: &[String]) -> bool {
     segments.iter().all(|seg| is_single_command_allowed(&seg.command, allowlist))
 }
 
-/// Strip shell wrappers from a command for allowlist matching.
-/// Handles: `bash CMD`, `sh CMD`, `bash -c 'CMD'`, `sh -c 'CMD'`,
-/// `bash -c "CMD"`, `sh -c "CMD"`.
-/// Returns the inner command if a wrapper is found, otherwise returns the original.
-fn strip_shell_wrapper(command: &str) -> String {
-    let trimmed = command.trim();
+/// Shell names (bare and absolute paths) recognized as wrappers.
+const SHELL_NAMES: &[&str] = &[
+    "/usr/bin/bash", "/bin/bash", "/usr/bin/sh", "/bin/sh",
+    "bash", "sh",
+];
 
-    for shell in &["bash", "sh"] {
-        // Check for "bash -c '...'" or "bash -c \"...\""
+/// Try to strip one shell-wrapper layer from a command.
+///
+/// Handles:
+///  - `env bash -c '...'` / `env sh ...` (strips `env ` prefix first)
+///  - `bash -c 'CMD'`, `bash -c "CMD"` (quoted — returns inner content)
+///  - `bash -c CMD arg0 arg1` (unquoted — returns only the first token, matching real shell behaviour)
+///  - `bash CMD` / `sh CMD` (bare, no `-c`)
+///
+/// Returns `Some(inner)` if a layer was stripped, `None` if no wrapper was found.
+fn strip_one_shell_layer(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+
+    // Handle `env ` prefix: strip it so `env bash -c '...'` is treated like `bash -c '...'`
+    let after_env = trimmed.strip_prefix("env ").map(|s| s.trim_start()).unwrap_or(trimmed);
+
+    for shell in SHELL_NAMES {
+        // ---- shell -c ... ----
         let prefix_c = format!("{} -c ", shell);
-        if let Some(rest) = trimmed.strip_prefix(&prefix_c) {
+        if let Some(rest) = after_env.strip_prefix(&prefix_c) {
             let rest = rest.trim();
-            // Strip surrounding quotes if present
+            if rest.is_empty() {
+                return None;
+            }
+            // Quoted: strip surrounding quotes
             if (rest.starts_with('\'') && rest.ends_with('\''))
                 || (rest.starts_with('"') && rest.ends_with('"'))
             {
                 if rest.len() >= 2 {
-                    return rest[1..rest.len() - 1].to_string();
+                    return Some(rest[1..rest.len() - 1].to_string());
                 }
             }
-            return rest.to_string();
+            // Unquoted: real shell only executes the first token
+            let first_token = rest.split_whitespace().next().unwrap_or(rest);
+            return Some(first_token.to_string());
         }
 
-        // Check for bare "bash CMD" (no -c flag)
+        // ---- bare shell CMD (no -c) ----
         let prefix_bare = format!("{} ", shell);
-        if let Some(rest) = trimmed.strip_prefix(&prefix_bare) {
+        if let Some(rest) = after_env.strip_prefix(&prefix_bare) {
             let rest = rest.trim();
             if !rest.is_empty() && !rest.starts_with('-') {
-                return rest.to_string();
+                return Some(rest.to_string());
             }
         }
     }
 
-    trimmed.to_string()
+    None
+}
+
+/// Strip shell wrappers from a command for allowlist matching.
+///
+/// Handles nested wrappers by iterating up to 10 times (e.g.
+/// `bash -c 'sh -c "cmd"'` → `sh -c "cmd"` → `cmd`).
+///
+/// Supports bare names (`bash`, `sh`) and absolute paths (`/bin/bash`, `/usr/bin/sh`),
+/// as well as an `env` prefix (`env bash -c '...'`).
+///
+/// For unquoted `bash -c CMD arg0 arg1`, only the first token is kept (matching
+/// real shell behaviour where `bash -c CMD arg0 arg1` only executes `CMD`).
+fn strip_shell_wrapper(command: &str) -> String {
+    let mut result = command.trim().to_string();
+    for _ in 0..10 {
+        match strip_one_shell_layer(&result) {
+            Some(inner) if inner != result => result = inner,
+            _ => break,
+        }
+    }
+    result
 }
 
 /// Check if a command is denied by the denylist.
@@ -2163,7 +2227,7 @@ mod tests {
             rate_limit_window_seconds: 60,
             rate_limit_count_allowlisted: false,
             rate_limit_mode: RateLimitMode::PerUser,
-            check_binary_ownership: false,
+            check_binary_ownership: BinaryOwnershipCheck::Off,
             allowed_binary_owners: Vec::new(),
             strip_shell_prefix: false,
         };
@@ -2325,7 +2389,7 @@ mod tests {
             rate_limit_window_seconds: 60,
             rate_limit_count_allowlisted: false,
             rate_limit_mode: RateLimitMode::PerUser,
-            check_binary_ownership: false,
+            check_binary_ownership: BinaryOwnershipCheck::Off,
             allowed_binary_owners: Vec::new(),
             strip_shell_prefix: false,
         }
@@ -3194,7 +3258,186 @@ mod tests {
 
     #[test]
     fn strip_unquoted_bash_c() {
-        assert_eq!(strip_shell_wrapper("bash -c systemctl restart foo"), "systemctl restart foo");
+        // Unquoted `bash -c CMD arg0 arg1` — real shell only executes CMD
+        assert_eq!(strip_shell_wrapper("bash -c systemctl restart foo"), "systemctl");
+    }
+
+    // ===== strip_shell_wrapper: absolute paths, env prefix, nesting =====
+
+    #[test]
+    fn strip_absolute_path_bash() {
+        assert_eq!(
+            strip_shell_wrapper("/bin/bash -c 'systemctl restart foo'"),
+            "systemctl restart foo"
+        );
+    }
+
+    #[test]
+    fn strip_absolute_path_usr_bin_sh() {
+        assert_eq!(
+            strip_shell_wrapper("/usr/bin/sh -c 'apt install vim'"),
+            "apt install vim"
+        );
+    }
+
+    #[test]
+    fn strip_env_prefix() {
+        assert_eq!(
+            strip_shell_wrapper("env bash -c 'systemctl restart foo'"),
+            "systemctl restart foo"
+        );
+    }
+
+    #[test]
+    fn strip_env_prefix_with_sh() {
+        assert_eq!(
+            strip_shell_wrapper("env sh -c 'apt list --installed'"),
+            "apt list --installed"
+        );
+    }
+
+    #[test]
+    fn strip_nested_wrappers() {
+        // bash -c 'sh -c "cmd"' → sh -c "cmd" → cmd
+        assert_eq!(
+            strip_shell_wrapper("bash -c 'sh -c \"systemctl restart foo\"'"),
+            "systemctl restart foo"
+        );
+    }
+
+    #[test]
+    fn strip_nested_absolute_wrappers() {
+        // /bin/bash -c '/bin/sh -c "cmd"' → /bin/sh -c "cmd" → cmd
+        assert_eq!(
+            strip_shell_wrapper("/bin/bash -c '/bin/sh -c \"ls -la\"'"),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn strip_unquoted_single_token() {
+        // Unquoted bash -c with one token: returns that token
+        assert_eq!(strip_shell_wrapper("bash -c ls"), "ls");
+    }
+
+    #[test]
+    fn strip_env_absolute_nested() {
+        // env /usr/bin/bash -c 'sh -c "echo hello"'
+        assert_eq!(
+            strip_shell_wrapper("env /usr/bin/bash -c 'sh -c \"echo hello\"'"),
+            "echo hello"
+        );
+    }
+
+    // ===== check_binary_ownership unit tests =====
+
+    /// Create a LimitsConfig with ownership check enabled (Auto).
+    fn test_limits_ownership_on() -> LimitsConfig {
+        let mut limits = test_limits();
+        limits.check_binary_ownership = BinaryOwnershipCheck::Auto;
+        limits
+    }
+
+    #[test]
+    fn ownership_check_disabled() {
+        let limits = test_limits(); // Off by default
+        assert!(check_binary_ownership("/usr/bin/ls", &limits).is_ok());
+        assert!(check_binary_ownership("nonexistent_xyz", &limits).is_ok());
+    }
+
+    #[test]
+    fn ownership_empty_command() {
+        let limits = test_limits_ownership_on();
+        let result = check_binary_ownership("", &limits);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty command"));
+    }
+
+    #[test]
+    fn ownership_binary_not_found() {
+        let limits = test_limits_ownership_on();
+        let result = check_binary_ownership("nonexistent_binary_xyz_12345", &limits);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found in PATH"));
+    }
+
+    #[test]
+    fn ownership_valid_system_binary() {
+        let limits = test_limits_ownership_on();
+        // /usr/bin/ls should be owned by root and not world/group writable
+        assert!(check_binary_ownership("/usr/bin/ls", &limits).is_ok());
+    }
+
+    #[test]
+    fn ownership_non_root_owner_rejected() {
+        let limits = test_limits_ownership_on();
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("mybin");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The temp file is owned by the current (non-root) user
+        let result = check_binary_ownership(bin.to_str().unwrap(), &limits);
+        if nix::unistd::getuid().as_raw() != 0 {
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("owned by uid"));
+        }
+        // If running as root, this will pass (root is always allowed)
+    }
+
+    #[test]
+    fn ownership_allowed_binary_owner() {
+        let mut limits = test_limits_ownership_on();
+        let current_uid = nix::unistd::getuid().as_raw();
+        limits.allowed_binary_owners = vec![current_uid];
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("mybin");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Current UID is in allowed_binary_owners, so it should pass
+        assert!(check_binary_ownership(bin.to_str().unwrap(), &limits).is_ok());
+    }
+
+    #[test]
+    fn ownership_world_writable_rejected() {
+        let mut limits = test_limits_ownership_on();
+        let current_uid = nix::unistd::getuid().as_raw();
+        limits.allowed_binary_owners = vec![current_uid];
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("mybin");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o757)).unwrap();
+
+        let result = check_binary_ownership(bin.to_str().unwrap(), &limits);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("world-writable"));
+    }
+
+    #[test]
+    fn ownership_group_writable_rejected() {
+        let mut limits = test_limits_ownership_on();
+        let current_uid = nix::unistd::getuid().as_raw();
+        limits.allowed_binary_owners = vec![current_uid];
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("mybin");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        let result = check_binary_ownership(bin.to_str().unwrap(), &limits);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("group-writable"));
     }
 }
 

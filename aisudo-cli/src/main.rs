@@ -274,7 +274,7 @@ fn main() -> ExitCode {
         }
         Decision::Timeout => {
             if dry_run {
-                println!("\x1b[33msudo: dry-run check timed out\x1b[0m");
+                eprintln!("\x1b[33msudo: dry-run check timed out\x1b[0m");
                 return ExitCode::from(1);
             }
             eprintln!(

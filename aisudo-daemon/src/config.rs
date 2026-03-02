@@ -88,6 +88,24 @@ impl Default for RateLimitMode {
     }
 }
 
+/// Binary ownership check level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryOwnershipCheck {
+    /// No ownership checking.
+    Off,
+    /// Check only auto-approved commands (allowlist/temp rules).
+    Auto,
+    /// Check all commands, including human-approved (Telegram) ones.
+    All,
+}
+
+impl Default for BinaryOwnershipCheck {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
     #[serde(default = "default_max_stdin")]
@@ -118,12 +136,13 @@ pub struct LimitsConfig {
     #[serde(default)]
     pub rate_limit_mode: RateLimitMode,
 
-    /// Check binary ownership before auto-approved execution.
-    /// When true, auto-approved commands (allowlist/temp rule) must have their
-    /// binary owned by root (or an allowed owner) and not be world/group-writable.
-    /// Default: true.
-    #[serde(default = "default_check_binary_ownership")]
-    pub check_binary_ownership: bool,
+    /// Check binary ownership before execution.
+    /// - "off": no ownership checking
+    /// - "auto": check only auto-approved commands (allowlist/temp rules) [default]
+    /// - "all": check all commands, including human-approved (Telegram) ones
+    /// Also accepts true (= "auto") and false (= "off") for backward compatibility.
+    #[serde(default, deserialize_with = "deserialize_binary_ownership_check")]
+    pub check_binary_ownership: BinaryOwnershipCheck,
 
     /// Additional UIDs (beyond root) whose binaries are trusted for auto-execution.
     /// Default: empty (only root-owned binaries allowed).
@@ -147,8 +166,41 @@ fn default_rate_limit_window_seconds() -> u32 {
     60
 }
 
-fn default_check_binary_ownership() -> bool {
-    true
+/// Deserialize `check_binary_ownership` from either a bool (backward compat) or a string enum.
+fn deserialize_binary_ownership_check<'de, D>(deserializer: D) -> Result<BinaryOwnershipCheck, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct BoolOrEnum;
+
+    impl<'de> de::Visitor<'de> for BoolOrEnum {
+        type Value = BinaryOwnershipCheck;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a boolean or one of: \"off\", \"auto\", \"all\"")
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+            Ok(if v {
+                BinaryOwnershipCheck::Auto
+            } else {
+                BinaryOwnershipCheck::Off
+            })
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            match v {
+                "off" | "false" => Ok(BinaryOwnershipCheck::Off),
+                "auto" | "true" => Ok(BinaryOwnershipCheck::Auto),
+                "all" => Ok(BinaryOwnershipCheck::All),
+                _ => Err(de::Error::unknown_variant(v, &["off", "auto", "all"])),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(BoolOrEnum)
 }
 
 fn default_max_stdin() -> usize {
@@ -172,7 +224,7 @@ fn default_limits() -> LimitsConfig {
         rate_limit_window_seconds: default_rate_limit_window_seconds(),
         rate_limit_count_allowlisted: false,
         rate_limit_mode: RateLimitMode::PerUser,
-        check_binary_ownership: default_check_binary_ownership(),
+        check_binary_ownership: BinaryOwnershipCheck::Auto,
         allowed_binary_owners: Vec::new(),
         strip_shell_prefix: false,
     }

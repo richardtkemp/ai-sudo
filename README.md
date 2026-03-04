@@ -180,7 +180,11 @@ If you're using [OpenClaw](https://github.com/openclaw/openclaw), add this to yo
 - Telegram notifications are not E2E encrypted — suitable for personal servers, not high-security environments
 - Rate limiting prevents abuse (10 requests/minute/user)
 
-### Binary Ownership Validation
+## Limitations
+
+**Interactive apps like `vim`, `nano`, `less`, `htop` don't work** — no pseudo-terminal (PTY) is allocated. Commands run via pipes with unidirectional output streaming, and stdin is captured upfront (for piped input only), not forwarded interactively. Use `sudo` directly for interactive applications, or non-interactive alternatives like `sed -i` for file edits.
+
+## Binary Ownership Validation
 
 Commands can be checked for binary ownership before execution. The daemon resolves the command binary via PATH and rejects it if:
 

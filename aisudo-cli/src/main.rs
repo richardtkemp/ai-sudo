@@ -3,6 +3,7 @@ use aisudo_common::{
     SudoRequest, SudoResponse, TempRuleRequest, TempRuleResponse, DEFAULT_SOCKET_PATH,
 };
 use base64::Engine as _;
+use shell_escape::escape;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 const MAX_STDIN_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
-include!(concat!(env!("OUT_DIR"), "/bin_name.rs"));
+const BINARY_NAME: &str = "aisudo";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -116,7 +117,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let command = args[cmd_start..].join(" ");
+    let command = shell_escape_command(&args[cmd_start..]);
     let user = get_current_user();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -1117,9 +1118,53 @@ fn capture_stdin() -> Result<Option<String>, String> {
     Ok(Some(encoded))
 }
 
+/// Shell-escape individual arguments and join them with spaces.
+/// This prevents shell metacharacters in arguments from being interpreted as shell operators.
+fn shell_escape_command(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| escape(std::borrow::Cow::from(arg.as_str())).to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shell_escape_command() {
+        // Test basic command with no special characters
+        let args = vec!["ls".to_string(), "-la".to_string()];
+        assert_eq!(shell_escape_command(&args), "ls -la");
+
+        // Test command with pipe character (the bug we're fixing)
+        let args = vec!["sed".to_string(), "-i".to_string(), "s/foo|bar/baz/".to_string(), "file".to_string()];
+        let result = shell_escape_command(&args);
+        assert!(result.contains("'s/foo|bar/baz/'"), "Pipe character should be escaped: {}", result);
+
+        // Test command with shell metacharacters
+        let args = vec!["echo".to_string(), "hello; rm -rf /".to_string()];
+        let result = shell_escape_command(&args);
+        assert!(result.contains("'hello; rm -rf /'"), "Semicolon should be escaped: {}", result);
+
+        // Test command with spaces
+        let args = vec!["echo".to_string(), "hello world".to_string()];
+        let result = shell_escape_command(&args);
+        assert!(result.contains("'hello world'"), "Spaces should be escaped: {}", result);
+
+        // Test command with dollar signs (variable expansion)
+        let args = vec!["echo".to_string(), "$HOME/test".to_string()];
+        let result = shell_escape_command(&args);
+        assert!(result.contains("'$HOME/test'"), "Dollar sign should be escaped: {}", result);
+
+        // Test empty args
+        let args: Vec<String> = vec![];
+        assert_eq!(shell_escape_command(&args), "");
+
+        // Test single argument
+        let args = vec!["ls".to_string()];
+        assert_eq!(shell_escape_command(&args), "ls");
+    }
 
     #[test]
     fn test_is_aisudo_flag() {

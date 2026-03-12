@@ -25,9 +25,71 @@ use crate::db::Database;
 use crate::notification::{BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord};
 use crate::sudoers::SudoersCache;
 
+/// Interpreter basenames whose script argument must also pass ownership checks.
+/// When a command starts with one of these, the next non-flag argument is treated
+/// as a script path and validated with the same ownership/writability rules.
+const INTERPRETER_NAMES: &[&str] = &[
+    "bash", "sh", "python", "python3", "perl", "ruby", "node",
+];
+
+/// Check that a file path is owned by a trusted user and not writable by
+/// untrusted users. Returns Ok(()) on success, Err(message) on rejection.
+fn check_path_ownership(path: &std::path::Path, label: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Follow symlinks and stat the target
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => return Err(format!("cannot stat {}: {e}", path.display())),
+    };
+
+    let uid = metadata.uid();
+    let mode = metadata.mode();
+
+    // Check owner: must be root (0) or in allowed_binary_owners
+    let mut allowed: Vec<u32> = vec![0];
+    allowed.extend(&limits.allowed_binary_owners);
+    if !allowed.contains(&uid) {
+        return Err(format!(
+            "{label} {} owned by uid {uid}, expected one of {allowed:?}",
+            path.display()
+        ));
+    }
+
+    // Check not world-writable (o+w) or group-writable (g+w)
+    if mode & 0o022 != 0 {
+        let writable = if mode & 0o002 != 0 && mode & 0o020 != 0 {
+            "world-writable and group-writable"
+        } else if mode & 0o002 != 0 {
+            "world-writable"
+        } else {
+            "group-writable"
+        };
+        return Err(format!(
+            "{label} {} is {writable} (mode {mode:04o})",
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Return true if `name` (a bare name or absolute path) resolves to a known interpreter.
+fn is_interpreter(name: &str) -> bool {
+    let basename = std::path::Path::new(name)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(name);
+    INTERPRETER_NAMES.contains(&basename)
+}
+
 /// Check that the binary in a command is owned by a trusted user and not writable by
 /// untrusted users. This prevents an agent from writing a script to /tmp, getting it
 /// allowlisted, and running it as root.
+///
+/// When the command is `<interpreter> <script> [args...]`, BOTH the interpreter binary
+/// AND the script path must pass ownership checks. This covers bash, sh, python,
+/// python3, perl, ruby, and node.
 ///
 /// Returns Ok(()) if the check passes or is disabled, Err(message) if rejected.
 fn check_binary_ownership(command: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
@@ -52,40 +114,31 @@ fn check_binary_ownership(command: &str, limits: &LimitsConfig) -> std::result::
         }
     };
 
-    // Follow symlinks and stat the target
-    let metadata = match std::fs::metadata(&path) {
-        Ok(m) => m,
-        Err(e) => return Err(format!("cannot stat {}: {e}", path.display())),
-    };
+    check_path_ownership(&path, "binary", limits)?;
 
-    use std::os::unix::fs::MetadataExt;
-
-    let uid = metadata.uid();
-    let mode = metadata.mode();
-
-    // Check owner: must be root (0) or in allowed_binary_owners
-    let mut allowed: Vec<u32> = vec![0];
-    allowed.extend(&limits.allowed_binary_owners);
-    if !allowed.contains(&uid) {
-        return Err(format!(
-            "binary {} owned by uid {uid}, expected one of {allowed:?}",
-            path.display()
-        ));
-    }
-
-    // Check not world-writable (o+w) or group-writable (g+w)
-    if mode & 0o022 != 0 {
-        let writable = if mode & 0o002 != 0 && mode & 0o020 != 0 {
-            "world-writable and group-writable"
-        } else if mode & 0o002 != 0 {
-            "world-writable"
-        } else {
-            "group-writable"
+    // If the binary is an interpreter, also validate the script argument.
+    // Skip flags (tokens starting with '-') to find the script path.
+    if is_interpreter(binary) || is_interpreter(path.to_str().unwrap_or("")) {
+        let mut tokens = command.split_whitespace().skip(1); // skip the interpreter
+        // Find the first non-flag argument (the script path).
+        // Stop at "-c" since that's an inline command, not a file.
+        let script_arg = loop {
+            match tokens.next() {
+                Some("-c") => break None, // inline command, not a file — skip
+                Some(arg) if arg.starts_with('-') => continue, // skip flags
+                Some(arg) => break Some(arg),
+                None => break None,
+            }
         };
-        return Err(format!(
-            "binary {} is {writable} (mode {mode:04o})",
-            path.display()
-        ));
+        if let Some(script) = script_arg {
+            let script_path = std::path::PathBuf::from(script);
+            // Only check if it looks like a file path (absolute or relative with
+            // a path separator, or an existing file). Skip bare command names that
+            // might be arguments rather than file paths.
+            if script.starts_with('/') || script.contains('/') || script_path.exists() {
+                check_path_ownership(&script_path, "script", limits)?;
+            }
+        }
     }
 
     Ok(())
@@ -3438,6 +3491,188 @@ mod tests {
         let result = check_binary_ownership(bin.to_str().unwrap(), &limits);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("group-writable"));
+    }
+
+    // ===== interpreter script ownership tests =====
+
+    /// Verifies that `bash /tmp/script.sh` checks ownership of the script,
+    /// not just the interpreter. This is the core security fix — without it,
+    /// an agent could write a script to /tmp and run it via an interpreter.
+    #[test]
+    fn ownership_interpreter_non_root_script_rejected() {
+        let limits = test_limits_ownership_on();
+        if nix::unistd::getuid().as_raw() == 0 {
+            return; // root owns everything — skip
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("evil.sh");
+        std::fs::write(&script, "#!/bin/sh\necho pwned\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The script is owned by the current (non-root) user — must be rejected
+        let cmd = format!("bash {}", script.display());
+        let result = check_binary_ownership(&cmd, &limits);
+        assert!(result.is_err(), "bash + non-root script should be rejected");
+        assert!(result.unwrap_err().contains("script"), "error should mention 'script'");
+    }
+
+    /// Same test with /bin/bash (absolute path to interpreter).
+    #[test]
+    fn ownership_absolute_interpreter_non_root_script_rejected() {
+        let limits = test_limits_ownership_on();
+        if nix::unistd::getuid().as_raw() == 0 {
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("evil.sh");
+        std::fs::write(&script, "#!/bin/sh\necho pwned\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cmd = format!("/bin/bash {}", script.display());
+        let result = check_binary_ownership(&cmd, &limits);
+        assert!(result.is_err(), "/bin/bash + non-root script should be rejected");
+    }
+
+    /// Verify all interpreter names are checked: python, python3, perl, ruby, node, sh.
+    #[test]
+    fn ownership_all_interpreters_check_script() {
+        let limits = test_limits_ownership_on();
+        if nix::unistd::getuid().as_raw() == 0 {
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("evil.py");
+        std::fs::write(&script, "print('pwned')\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for interp in &["bash", "sh", "python", "python3", "perl", "ruby", "node"] {
+            // Only test interpreters that exist on this system
+            if which::which(interp).is_err() {
+                continue;
+            }
+            let cmd = format!("{} {}", interp, script.display());
+            let result = check_binary_ownership(&cmd, &limits);
+            assert!(result.is_err(), "{interp} + non-root script should be rejected");
+        }
+    }
+
+    /// `bash -c 'echo hello'` is an inline command (no file) — should NOT trigger
+    /// script ownership check. Only the interpreter itself is validated.
+    #[test]
+    fn ownership_interpreter_dash_c_skips_script_check() {
+        let limits = test_limits_ownership_on();
+        // bash -c 'echo hello' — the -c flag means inline command, not a file
+        let result = check_binary_ownership("bash -c echo", &limits);
+        assert!(result.is_ok(), "bash -c should not trigger script check");
+    }
+
+    /// When an interpreter runs a script owned by an allowed UID, it should pass.
+    #[test]
+    fn ownership_interpreter_allowed_script_owner_passes() {
+        let mut limits = test_limits_ownership_on();
+        let current_uid = nix::unistd::getuid().as_raw();
+        limits.allowed_binary_owners = vec![current_uid];
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("ok.sh");
+        std::fs::write(&script, "#!/bin/sh\necho ok\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cmd = format!("bash {}", script.display());
+        let result = check_binary_ownership(&cmd, &limits);
+        assert!(result.is_ok(), "bash + script owned by allowed UID should pass");
+    }
+
+    /// Interpreter + world-writable script should be rejected even if owner is allowed.
+    #[test]
+    fn ownership_interpreter_world_writable_script_rejected() {
+        let mut limits = test_limits_ownership_on();
+        let current_uid = nix::unistd::getuid().as_raw();
+        limits.allowed_binary_owners = vec![current_uid];
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("writable.sh");
+        std::fs::write(&script, "#!/bin/sh\necho danger\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o757)).unwrap();
+
+        let cmd = format!("bash {}", script.display());
+        let result = check_binary_ownership(&cmd, &limits);
+        assert!(result.is_err(), "bash + world-writable script should be rejected");
+        assert!(result.unwrap_err().contains("world-writable"));
+    }
+
+    /// Interpreter flags before the script path should be skipped correctly.
+    #[test]
+    fn ownership_interpreter_with_flags_checks_script() {
+        let limits = test_limits_ownership_on();
+        if nix::unistd::getuid().as_raw() == 0 {
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("evil.py");
+        std::fs::write(&script, "print('pwned')\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // python3 -u /path/to/evil.py — the -u flag should be skipped
+        if which::which("python3").is_ok() {
+            let cmd = format!("python3 -u {}", script.display());
+            let result = check_binary_ownership(&cmd, &limits);
+            assert!(result.is_err(), "python3 -u + non-root script should be rejected");
+        }
+    }
+
+    /// Non-interpreter commands should not trigger script checking (only binary is checked).
+    #[test]
+    fn ownership_non_interpreter_no_script_check() {
+        let limits = test_limits_ownership_on();
+        // ls is not an interpreter — its arguments are not checked as scripts
+        let result = check_binary_ownership("/usr/bin/ls -la /tmp", &limits);
+        assert!(result.is_ok());
+    }
+
+    // ===== is_interpreter tests =====
+
+    #[test]
+    fn is_interpreter_bare_names() {
+        assert!(is_interpreter("bash"));
+        assert!(is_interpreter("sh"));
+        assert!(is_interpreter("python"));
+        assert!(is_interpreter("python3"));
+        assert!(is_interpreter("perl"));
+        assert!(is_interpreter("ruby"));
+        assert!(is_interpreter("node"));
+    }
+
+    #[test]
+    fn is_interpreter_absolute_paths() {
+        assert!(is_interpreter("/bin/bash"));
+        assert!(is_interpreter("/usr/bin/python3"));
+        assert!(is_interpreter("/usr/bin/perl"));
+        assert!(is_interpreter("/usr/local/bin/node"));
+    }
+
+    #[test]
+    fn is_interpreter_non_interpreters() {
+        assert!(!is_interpreter("ls"));
+        assert!(!is_interpreter("cat"));
+        assert!(!is_interpreter("/usr/bin/ls"));
+        assert!(!is_interpreter("systemctl"));
     }
 }
 

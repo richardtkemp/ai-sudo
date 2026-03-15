@@ -174,8 +174,9 @@ fn main() -> ExitCode {
         }
     };
 
-    // Set a generous read timeout (daemon handles its own approval timeout)
-    stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
+    // No read timeout while waiting for approval — the daemon handles its own
+    // approval timeout (default 7200s) and will always send a response.
+    // A premature client-side timeout causes spurious EAGAIN (os error 11).
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -288,6 +289,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     }
+
+    // Now that we have the approval response, set a read timeout for output streaming.
+    // Uses the cloned writer fd (same underlying socket) to set SO_RCVTIMEO.
+    writer.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
     // Stream output from daemon
     let mut exit_code: i32 = 1;
@@ -417,7 +422,7 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
         }
     };
 
-    stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
+    // No read timeout — daemon waits for Telegram approval and always sends a response.
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -928,7 +933,7 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
         }
     };
 
-    stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
+    // No read timeout — daemon waits for Telegram approval and always sends a response.
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -1001,6 +1006,9 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
             return ExitCode::from(1);
         }
     }
+
+    // Set read timeout for output streaming phase
+    writer.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
     // Stream output from daemon
     let mut exit_code: i32 = 1;

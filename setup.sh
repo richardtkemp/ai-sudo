@@ -26,115 +26,37 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# ── Shared Rust build cache ───────────────────────────────────────────
-# Root has no Rust toolchain by default. Use /var/cache paths (like Go)
-# so both root and the invoking user can share toolchains and build cache.
-# Honour an existing RUSTUP_HOME/CARGO_HOME if already set in the environment.
+# ── Rust toolchain discovery ─────────────────────────────────────────
+# When running under sudo/aisudo, root may not have a Rust toolchain.
+# Use SUDO_USER's standard ~/.rustup and ~/.cargo unless RUSTUP_HOME
+# or CARGO_HOME are already set in the environment.
 
-RUSTUP_HOME="${RUSTUP_HOME:-/var/cache/rustup}"
-CARGO_HOME="${CARGO_HOME:-/var/cache/cargo}"
-export RUSTUP_HOME CARGO_HOME
-
-# find_user_rustup: locate an existing rustup installation to bootstrap from.
-# Checks SUDO_USER's home first, then scans /home/*/.rustup.
-find_user_rustup() {
-    # Try SUDO_USER if set
+if [[ -z "${RUSTUP_HOME:-}" || -z "${CARGO_HOME:-}" ]]; then
+    # Resolve the invoking user's home directory
     if [[ -n "${SUDO_USER:-}" ]]; then
-        local h
-        h=$(eval echo "~$SUDO_USER")
-        if [[ -d "$h/.rustup/toolchains" ]] && [[ -n "$(ls -A "$h/.rustup/toolchains" 2>/dev/null)" ]]; then
-            echo "$h/.rustup"
-            return
-        fi
-    fi
-    # Scan /home for any user with a populated rustup
-    for d in /home/*/.rustup/toolchains; do
-        if [[ -d "$d" ]] && [[ -n "$(ls -A "$d" 2>/dev/null)" ]]; then
-            echo "${d%/toolchains}"
-            return
-        fi
-    done
-    return 1
-}
-
-# Bootstrap from a user's toolchain if the shared one is empty
-if [[ ! -d "$RUSTUP_HOME/toolchains" ]] || [[ -z "$(ls -A "$RUSTUP_HOME/toolchains" 2>/dev/null)" ]]; then
-    SRC_RUSTUP=$(find_user_rustup) || {
-        error "No Rust toolchain found in any /home/*/.rustup. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-        exit 1
-    }
-    info "Bootstrapping shared Rust toolchain from $SRC_RUSTUP..."
-    mkdir -p "$RUSTUP_HOME"
-    cp -a "$SRC_RUSTUP/toolchains" "$RUSTUP_HOME/"
-    cp -a "$SRC_RUSTUP/update-hashes" "$RUSTUP_HOME/" 2>/dev/null || true
-    cp -a "$SRC_RUSTUP/settings.toml" "$RUSTUP_HOME/" 2>/dev/null || true
-fi
-
-# Ensure a default toolchain is configured — rustup will refuse to run without one.
-if [[ ! -f "$RUSTUP_HOME/settings.toml" ]] || ! grep -q 'default_toolchain' "$RUSTUP_HOME/settings.toml" 2>/dev/null; then
-    # Pick the first installed toolchain as the default
-    default_tc=$(ls -1 "$RUSTUP_HOME/toolchains" 2>/dev/null | head -1)
-    if [[ -n "$default_tc" ]]; then
-        info "Setting default toolchain: $default_tc"
-        cat > "$RUSTUP_HOME/settings.toml" <<TOML
-default_toolchain = "$default_tc"
-profile = "default"
-version = "12"
-
-[overrides]
-TOML
+        SUDO_USER_HOME=$(eval echo "~$SUDO_USER")
     else
-        error "No toolchains found in $RUSTUP_HOME/toolchains"
-        exit 1
+        SUDO_USER_HOME="$HOME"
     fi
+    export RUSTUP_HOME="${RUSTUP_HOME:-$SUDO_USER_HOME/.rustup}"
+    export CARGO_HOME="${CARGO_HOME:-$SUDO_USER_HOME/.cargo}"
 fi
 
-# Check for cargo — look in the shared cache, SUDO_USER's home, then /home/*/
+# Check for cargo
 if ! command -v cargo &>/dev/null; then
     if [[ -x "$CARGO_HOME/bin/cargo" ]]; then
         export PATH="$CARGO_HOME/bin:$PATH"
     else
-        found_cargo=""
-        if [[ -n "${SUDO_USER:-}" ]]; then
-            h=$(eval echo "~$SUDO_USER")
-            [[ -x "$h/.cargo/bin/cargo" ]] && found_cargo="$h/.cargo/bin"
-        fi
-        if [[ -z "$found_cargo" ]]; then
-            for c in /home/*/.cargo/bin/cargo; do
-                [[ -x "$c" ]] && found_cargo="${c%/cargo}" && break
-            done
-        fi
-        if [[ -n "$found_cargo" ]]; then
-            export PATH="$found_cargo:$PATH"
-        else
-            error "Rust toolchain not found. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-            exit 1
-        fi
+        error "Rust toolchain not found. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        exit 1
     fi
 fi
 
-# Ensure shared cache dirs exist with group-writable setgid (matches /var/cache/go)
-for d in "$RUSTUP_HOME" "$CARGO_HOME"; do
-    mkdir -p "$d"
-    chown root:rich-readers "$d"
-    chmod 2775 "$d"
-done
-
-# Strip setgid from *files* — the dynamic linker ignores RUNPATH ($ORIGIN/../lib)
-# on setgid binaries as a security measure, which breaks rustc's library loading.
-# Directories keep setgid (for group inheritance); only files lose it.
-find "$RUSTUP_HOME" "$CARGO_HOME" -type f -perm /2000 -exec chmod g-s {} +
-
-# Set LD_LIBRARY_PATH so rustc can find librustc_driver even if the rustup proxy
-# isn't in the call chain (e.g. cargo invokes rustc directly by absolute path).
+# Set LD_LIBRARY_PATH so rustc can find librustc_driver when cargo invokes
+# it directly by absolute path (bypassing the rustup proxy).
 TC_DIR=$(ls -1d "$RUSTUP_HOME"/toolchains/*/lib 2>/dev/null | head -1)
 if [[ -n "$TC_DIR" ]]; then
     export LD_LIBRARY_PATH="${TC_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
-
-# Make sure cargo binary is on PATH
-if [[ -d "$CARGO_HOME/bin" ]] && [[ -x "$CARGO_HOME/bin/cargo" ]]; then
-    export PATH="$CARGO_HOME/bin:$PATH"
 fi
 
 # ── Build ─────────────────────────────────────────────────────────────

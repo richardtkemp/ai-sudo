@@ -775,7 +775,7 @@ async fn handle_sudo_request(
         if mode == RequestMode::Exec {
             let segments = parse_command_chain(&command)
                 .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
-            exec_command_chain(&segments, &cwd, stdin_bytes, writer).await?;
+            exec_command_chain(&segments, &cwd, stdin_bytes, writer, user).await?;
         }
         return Ok(());
     }
@@ -818,7 +818,7 @@ async fn handle_sudo_request(
         if mode == RequestMode::Exec {
             let segments = parse_command_chain(&command)
                 .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
-            exec_command_chain(&segments, &cwd, stdin_bytes, writer).await?;
+            exec_command_chain(&segments, &cwd, stdin_bytes, writer, user).await?;
         }
         return Ok(());
     }
@@ -944,7 +944,7 @@ async fn handle_sudo_request(
                 return Ok(());
             }
         }
-        let exec_result = exec_command(&command, &cwd, stdin_bytes, writer, true).await?;
+        let exec_result = exec_command(&command, &cwd, stdin_bytes, writer, true, user).await?;
         
         // Update Telegram notification with completion status
         backend.update_completion_status(&CompletionInfo {
@@ -1550,6 +1550,7 @@ async fn exec_command(
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     use_shell: bool,
+    sudo_user: &str,
 ) -> Result<ExecResult> {
     use tokio::process::Command;
     use std::collections::VecDeque;
@@ -1573,6 +1574,7 @@ async fn exec_command(
 
     let mut child = cmd
         .current_dir(cwd)
+        .env("SUDO_USER", sudo_user)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(if stdin_bytes.is_some() {
@@ -1785,6 +1787,7 @@ async fn exec_command_chain(
     cwd: &str,
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
+    sudo_user: &str,
 ) -> Result<()> {
     info!("Executing command chain ({} segments)", segments.len());
 
@@ -1827,6 +1830,7 @@ async fn exec_command_chain(
                 cwd,
                 if i == 0 { stdin_bytes.clone() } else { None },
                 writer,
+                sudo_user,
             ).await?;
         } else {
             // Pipeline: connect stdout→stdin between stages
@@ -1835,6 +1839,7 @@ async fn exec_command_chain(
                 cwd,
                 if i == 0 { stdin_bytes.clone() } else { None },
                 writer,
+                sudo_user,
             ).await?;
         }
 
@@ -1872,6 +1877,7 @@ async fn exec_single_command(
     cwd: &str,
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
+    sudo_user: &str,
 ) -> Result<i32> {
     use tokio::process::Command;
 
@@ -1883,6 +1889,7 @@ async fn exec_single_command(
 
     let mut child = cmd
         .current_dir(cwd)
+        .env("SUDO_USER", sudo_user)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(if stdin_bytes.is_some() {
@@ -1911,6 +1918,7 @@ async fn exec_pipeline(
     cwd: &str,
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
+    sudo_user: &str,
 ) -> Result<i32> {
     use std::os::unix::io::FromRawFd;
     use tokio::process::Command;
@@ -1950,6 +1958,7 @@ async fn exec_pipeline(
 
         let mut child = cmd
             .current_dir(cwd)
+            .env("SUDO_USER", sudo_user)
             .stdin(stdin_cfg)
             .stdout(stdout_cfg)
             .stderr(std::process::Stdio::piped())

@@ -704,7 +704,7 @@ async fn handle_sudo_request(
     let cwd = request.cwd.clone();
     let dry_run = request.dry_run;
     let effective_timeout = request.timeout_seconds.unwrap_or(timeout_seconds);
-    let user = &request.user;
+    let user = request.user.clone();
 
     // Normalize command for allowlist/denylist matching (strip shell wrappers if configured)
     let match_command = if limits.strip_shell_prefix {
@@ -729,7 +729,7 @@ async fn handle_sudo_request(
     }
 
     // Build effective allowlist: global + per-user (if any)
-    let effective_allowlist: Vec<String> = if let Some(user_allowlist) = allowlist_per_user.get(user) {
+    let effective_allowlist: Vec<String> = if let Some(user_allowlist) = allowlist_per_user.get(&user) {
         let mut combined = allowlist.to_vec();
         combined.extend(user_allowlist.clone());
         combined
@@ -775,7 +775,7 @@ async fn handle_sudo_request(
         if mode == RequestMode::Exec {
             let segments = parse_command_chain(&command)
                 .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
-            exec_command_chain(&segments, &cwd, stdin_bytes, writer, user).await?;
+            exec_command_chain(&segments, &cwd, stdin_bytes, writer, &user).await?;
         }
         return Ok(());
     }
@@ -818,7 +818,7 @@ async fn handle_sudo_request(
         if mode == RequestMode::Exec {
             let segments = parse_command_chain(&command)
                 .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
-            exec_command_chain(&segments, &cwd, stdin_bytes, writer, user).await?;
+            exec_command_chain(&segments, &cwd, stdin_bytes, writer, &user).await?;
         }
         return Ok(());
     }
@@ -944,7 +944,7 @@ async fn handle_sudo_request(
                 return Ok(());
             }
         }
-        let exec_result = exec_command(&command, &cwd, stdin_bytes, writer, true, user).await?;
+        let exec_result = exec_command(&command, &cwd, stdin_bytes, writer, true, &user).await?;
         
         // Update Telegram notification with completion status
         backend.update_completion_status(&CompletionInfo {

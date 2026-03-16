@@ -120,6 +120,18 @@ for d in "$RUSTUP_HOME" "$CARGO_HOME"; do
     chmod 2775 "$d"
 done
 
+# Strip setgid from *files* — the dynamic linker ignores RUNPATH ($ORIGIN/../lib)
+# on setgid binaries as a security measure, which breaks rustc's library loading.
+# Directories keep setgid (for group inheritance); only files lose it.
+find "$RUSTUP_HOME" "$CARGO_HOME" -type f -perm /2000 -exec chmod g-s {} +
+
+# Set LD_LIBRARY_PATH so rustc can find librustc_driver even if the rustup proxy
+# isn't in the call chain (e.g. cargo invokes rustc directly by absolute path).
+TC_DIR=$(ls -1d "$RUSTUP_HOME"/toolchains/*/lib 2>/dev/null | head -1)
+if [[ -n "$TC_DIR" ]]; then
+    export LD_LIBRARY_PATH="${TC_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 # Make sure cargo binary is on PATH
 if [[ -d "$CARGO_HOME/bin" ]] && [[ -x "$CARGO_HOME/bin/cargo" ]]; then
     export PATH="$CARGO_HOME/bin:$PATH"

@@ -26,40 +26,71 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Check for cargo (also check invoking user's ~/.cargo/bin in case it's not on root's PATH)
-if ! command -v cargo &>/dev/null; then
-    SUDO_USER_HOME=$(eval echo "~${SUDO_USER:-root}")
-    if [[ -x "$SUDO_USER_HOME/.cargo/bin/cargo" ]]; then
-        export PATH="$SUDO_USER_HOME/.cargo/bin:$PATH"
-    elif [[ -x /var/cache/cargo/bin/cargo ]]; then
-        export PATH="/var/cache/cargo/bin:$PATH"
-    else
-        error "Rust toolchain not found. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-        exit 1
-    fi
-fi
-
 # ── Shared Rust build cache ───────────────────────────────────────────
 # Root has no Rust toolchain by default. Use /var/cache paths (like Go)
 # so both root and the invoking user can share toolchains and build cache.
+# Honour an existing RUSTUP_HOME/CARGO_HOME if already set in the environment.
 
-RUSTUP_HOME=/var/cache/rustup
-CARGO_HOME=/var/cache/cargo
+RUSTUP_HOME="${RUSTUP_HOME:-/var/cache/rustup}"
+CARGO_HOME="${CARGO_HOME:-/var/cache/cargo}"
 export RUSTUP_HOME CARGO_HOME
 
-# Bootstrap from the invoking user's toolchain if the shared one is empty
+# find_user_rustup: locate an existing rustup installation to bootstrap from.
+# Checks SUDO_USER's home first, then scans /home/*/.rustup.
+find_user_rustup() {
+    # Try SUDO_USER if set
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local h
+        h=$(eval echo "~$SUDO_USER")
+        if [[ -d "$h/.rustup/toolchains" ]] && [[ -n "$(ls -A "$h/.rustup/toolchains" 2>/dev/null)" ]]; then
+            echo "$h/.rustup"
+            return
+        fi
+    fi
+    # Scan /home for any user with a populated rustup
+    for d in /home/*/.rustup/toolchains; do
+        if [[ -d "$d" ]] && [[ -n "$(ls -A "$d" 2>/dev/null)" ]]; then
+            echo "${d%/toolchains}"
+            return
+        fi
+    done
+    return 1
+}
+
+# Bootstrap from a user's toolchain if the shared one is empty
 if [[ ! -d "$RUSTUP_HOME/toolchains" ]] || [[ -z "$(ls -A "$RUSTUP_HOME/toolchains" 2>/dev/null)" ]]; then
-    SUDO_USER_HOME=$(eval echo "~${SUDO_USER:-root}")
-    SRC_RUSTUP="$SUDO_USER_HOME/.rustup"
-    if [[ -d "$SRC_RUSTUP/toolchains" ]]; then
-        info "Bootstrapping shared Rust toolchain from $SRC_RUSTUP..."
-        mkdir -p "$RUSTUP_HOME"
-        cp -a "$SRC_RUSTUP/toolchains" "$RUSTUP_HOME/"
-        cp -a "$SRC_RUSTUP/update-hashes" "$RUSTUP_HOME/" 2>/dev/null || true
-        cp -a "$SRC_RUSTUP/settings.toml" "$RUSTUP_HOME/" 2>/dev/null || true
-    else
-        error "No Rust toolchain found in $SRC_RUSTUP. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    SRC_RUSTUP=$(find_user_rustup) || {
+        error "No Rust toolchain found in any /home/*/.rustup. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
         exit 1
+    }
+    info "Bootstrapping shared Rust toolchain from $SRC_RUSTUP..."
+    mkdir -p "$RUSTUP_HOME"
+    cp -a "$SRC_RUSTUP/toolchains" "$RUSTUP_HOME/"
+    cp -a "$SRC_RUSTUP/update-hashes" "$RUSTUP_HOME/" 2>/dev/null || true
+    cp -a "$SRC_RUSTUP/settings.toml" "$RUSTUP_HOME/" 2>/dev/null || true
+fi
+
+# Check for cargo — look in the shared cache, SUDO_USER's home, then /home/*/
+if ! command -v cargo &>/dev/null; then
+    if [[ -x "$CARGO_HOME/bin/cargo" ]]; then
+        export PATH="$CARGO_HOME/bin:$PATH"
+    else
+        found_cargo=""
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            h=$(eval echo "~$SUDO_USER")
+            [[ -x "$h/.cargo/bin/cargo" ]] && found_cargo="$h/.cargo/bin"
+        fi
+        if [[ -z "$found_cargo" ]]; then
+            for c in /home/*/.cargo/bin/cargo; do
+                [[ -x "$c" ]] && found_cargo="${c%/cargo}" && break
+            done
+        fi
+        if [[ -n "$found_cargo" ]]; then
+            export PATH="$found_cargo:$PATH"
+        else
+            error "Rust toolchain not found. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+            exit 1
+        fi
     fi
 fi
 

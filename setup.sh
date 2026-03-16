@@ -70,6 +70,25 @@ if [[ ! -d "$RUSTUP_HOME/toolchains" ]] || [[ -z "$(ls -A "$RUSTUP_HOME/toolchai
     cp -a "$SRC_RUSTUP/settings.toml" "$RUSTUP_HOME/" 2>/dev/null || true
 fi
 
+# Ensure a default toolchain is configured — rustup will refuse to run without one.
+if [[ ! -f "$RUSTUP_HOME/settings.toml" ]] || ! grep -q 'default_toolchain' "$RUSTUP_HOME/settings.toml" 2>/dev/null; then
+    # Pick the first installed toolchain as the default
+    default_tc=$(ls -1 "$RUSTUP_HOME/toolchains" 2>/dev/null | head -1)
+    if [[ -n "$default_tc" ]]; then
+        info "Setting default toolchain: $default_tc"
+        cat > "$RUSTUP_HOME/settings.toml" <<TOML
+default_toolchain = "$default_tc"
+profile = "default"
+version = "12"
+
+[overrides]
+TOML
+    else
+        error "No toolchains found in $RUSTUP_HOME/toolchains"
+        exit 1
+    fi
+fi
+
 # Check for cargo — look in the shared cache, SUDO_USER's home, then /home/*/
 if ! command -v cargo &>/dev/null; then
     if [[ -x "$CARGO_HOME/bin/cargo" ]]; then

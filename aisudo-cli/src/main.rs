@@ -15,6 +15,12 @@ const MAX_STDIN_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const BINARY_NAME: &str = "aisudo";
 
 fn main() -> ExitCode {
+    // Reset SIGPIPE to default behavior so writes to closed pipes (e.g. `aisudo find / | head -5`)
+    // terminate the process cleanly instead of panicking. Rust sets SIG_IGN by default.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {

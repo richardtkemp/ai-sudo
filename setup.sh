@@ -26,10 +26,53 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Check for cargo
+# Check for cargo (also check invoking user's ~/.cargo/bin in case it's not on root's PATH)
 if ! command -v cargo &>/dev/null; then
-    error "Rust toolchain not found. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-    exit 1
+    SUDO_USER_HOME=$(eval echo "~${SUDO_USER:-root}")
+    if [[ -x "$SUDO_USER_HOME/.cargo/bin/cargo" ]]; then
+        export PATH="$SUDO_USER_HOME/.cargo/bin:$PATH"
+    elif [[ -x /var/cache/cargo/bin/cargo ]]; then
+        export PATH="/var/cache/cargo/bin:$PATH"
+    else
+        error "Rust toolchain not found. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        exit 1
+    fi
+fi
+
+# ── Shared Rust build cache ───────────────────────────────────────────
+# Root has no Rust toolchain by default. Use /var/cache paths (like Go)
+# so both root and the invoking user can share toolchains and build cache.
+
+RUSTUP_HOME=/var/cache/rustup
+CARGO_HOME=/var/cache/cargo
+export RUSTUP_HOME CARGO_HOME
+
+# Bootstrap from the invoking user's toolchain if the shared one is empty
+if [[ ! -d "$RUSTUP_HOME/toolchains" ]] || [[ -z "$(ls -A "$RUSTUP_HOME/toolchains" 2>/dev/null)" ]]; then
+    SUDO_USER_HOME=$(eval echo "~${SUDO_USER:-root}")
+    SRC_RUSTUP="$SUDO_USER_HOME/.rustup"
+    if [[ -d "$SRC_RUSTUP/toolchains" ]]; then
+        info "Bootstrapping shared Rust toolchain from $SRC_RUSTUP..."
+        mkdir -p "$RUSTUP_HOME"
+        cp -a "$SRC_RUSTUP/toolchains" "$RUSTUP_HOME/"
+        cp -a "$SRC_RUSTUP/update-hashes" "$RUSTUP_HOME/" 2>/dev/null || true
+        cp -a "$SRC_RUSTUP/settings.toml" "$RUSTUP_HOME/" 2>/dev/null || true
+    else
+        error "No Rust toolchain found in $SRC_RUSTUP. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        exit 1
+    fi
+fi
+
+# Ensure shared cache dirs exist with group-writable setgid (matches /var/cache/go)
+for d in "$RUSTUP_HOME" "$CARGO_HOME"; do
+    mkdir -p "$d"
+    chown root:rich-readers "$d"
+    chmod 2775 "$d"
+done
+
+# Make sure cargo binary is on PATH
+if [[ -d "$CARGO_HOME/bin" ]] && [[ -x "$CARGO_HOME/bin/cargo" ]]; then
+    export PATH="$CARGO_HOME/bin:$PATH"
 fi
 
 # ── Build ─────────────────────────────────────────────────────────────

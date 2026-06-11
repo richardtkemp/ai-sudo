@@ -6,6 +6,7 @@ mod scrub;
 mod socket;
 mod sudoers;
 mod web;
+mod web_auth;
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -91,6 +92,22 @@ async fn main() -> Result<()> {
     // Shared pending-unlock channels (web UI -> socket handler signaling)
     let pending_unlocks = Arc::new(DashMap::new());
 
+    // Web access codes/sessions shared between the web UI and the locked-request
+    // notification path. Created unconditionally (cheap); link delivery is only
+    // enabled when web_external_url is set.
+    let web_auth = {
+        let bw = config.bitwarden.as_ref();
+        if bw.is_some() && bw.and_then(|b| b.web_external_url.as_ref()).is_none() {
+            warn!("Bitwarden web UI: web_external_url is unset — Telegram unlock links are disabled (set it to your https Tailscale URL).");
+        }
+        Arc::new(web_auth::WebAuth::new(
+            bw.and_then(|b| b.web_external_url.clone()),
+            bw.map(|b| b.code_ttl_seconds).unwrap_or(600),
+            bw.map(|b| b.session_ttl_seconds).unwrap_or(900),
+            bw.map(|b| b.code_request_cooldown_seconds).unwrap_or(30),
+        ))
+    };
+
     // Start web UI if bitwarden is enabled
     if let Some(ref bw_session_ref) = bw_session {
         if let Some(ref bw_config) = config.bitwarden {
@@ -99,6 +116,8 @@ async fn main() -> Result<()> {
                 Arc::clone(&db),
                 Arc::clone(&pending_unlocks),
                 bw_config.max_password_attempts,
+                Arc::clone(&web_auth),
+                Arc::clone(&backend),
             );
             let port = bw_config.web_ui_port;
             tokio::spawn(async move {
@@ -148,7 +167,7 @@ async fn main() -> Result<()> {
     });
 
     // Run socket listener (blocks)
-    socket::run_socket_listener(config_holder, db, backend, bw_session, pending_unlocks).await?;
+    socket::run_socket_listener(config_holder, db, backend, bw_session, pending_unlocks, web_auth).await?;
 
     Ok(())
 }

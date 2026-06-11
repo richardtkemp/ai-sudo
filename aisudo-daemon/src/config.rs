@@ -264,6 +264,25 @@ pub struct BitwardenConfig {
     /// Max password entry attempts per request.
     #[serde(default = "default_max_password_attempts")]
     pub max_password_attempts: u32,
+
+    /// Public base URL of the web UI (e.g. "https://host.tailnet.ts.net"), used to
+    /// build the tappable unlock links sent over Telegram. If unset, link delivery
+    /// is disabled (a warning is logged) and the locked notification just points at
+    /// the dashboard.
+    #[serde(default)]
+    pub web_external_url: Option<String>,
+
+    /// Lifetime of a single-use web access code (seconds).
+    #[serde(default = "default_code_ttl")]
+    pub code_ttl_seconds: u32,
+
+    /// Lifetime of a web session after a code is redeemed (seconds).
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_seconds: u32,
+
+    /// Minimum interval between "send access code" requests, per caller identity (seconds).
+    #[serde(default = "default_code_request_cooldown")]
+    pub code_request_cooldown_seconds: u32,
 }
 
 fn default_bw_enabled() -> bool {
@@ -296,6 +315,18 @@ fn default_bw_max_rpm() -> u32 {
 
 fn default_max_password_attempts() -> u32 {
     5
+}
+
+fn default_code_ttl() -> u32 {
+    600 // 10 minutes
+}
+
+fn default_session_ttl() -> u32 {
+    900 // 15 minutes
+}
+
+fn default_code_request_cooldown() -> u32 {
+    30
 }
 
 /// Recursively deep-merge two TOML values. Overlay wins for scalars.

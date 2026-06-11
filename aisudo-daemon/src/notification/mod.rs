@@ -29,6 +29,9 @@ pub struct BwRequestRecord {
     pub item_name: String,
     pub field: String,
     pub session_active: bool,
+    /// Tappable web unlock link, set only on the locked path when link delivery
+    /// is configured. None elsewhere.
+    pub unlock_url: Option<String>,
 }
 
 /// Record for BW confirmation phase (after item resolution).
@@ -63,6 +66,10 @@ pub trait NotificationBackend: Send + Sync {
     /// Send a notification that the vault is locked and the user should unlock via dashboard.
     /// Fire-and-forget: does not wait for a callback response.
     async fn send_bw_locked_notification(&self, record: &BwRequestRecord) -> Result<()>;
+
+    /// Send a standalone web-UI access link (the "send access code" button).
+    /// Fire-and-forget delivery of a tappable unlock URL.
+    async fn send_access_link(&self, url: &str) -> Result<()>;
 
     /// Send a notification about completed credential scrubbing.
     async fn send_scrub_complete(&self, request_id: &str, item_name: &str) -> Result<()>;

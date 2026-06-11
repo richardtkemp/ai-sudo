@@ -841,6 +841,13 @@ impl NotificationBackend for TelegramBackend {
     }
 
     async fn send_bw_locked_notification(&self, record: &BwRequestRecord) -> Result<()> {
+        // A tappable single-use unlock link when configured; otherwise point at the
+        // dashboard. The link is daemon-generated (not request-controlled), so it is
+        // safe to embed without escaping.
+        let action = match &record.unlock_url {
+            Some(url) => format!("\u{1f513} Unlock &amp; approve: {url}"),
+            None => "Unlock via dashboard to approve.".to_string(),
+        };
         let text = format!(
             "\u{1f512} <b>Bitwarden Request</b>\n\n\
              <b>User:</b> <code>{}</code>\n\
@@ -848,7 +855,7 @@ impl NotificationBackend for TelegramBackend {
              <b>Field:</b> <code>{}</code>\n\
              <b>Vault:</b> \u{1f512} locked\n\
              <b>Request ID:</b> <code>{}</code>\n\n\
-             Unlock via dashboard to approve.",
+             {action}",
             escape_html(&record.user), escape_html(&record.item_name),
             escape_html(&record.field), escape_html(&record.id),
         );
@@ -870,6 +877,29 @@ impl NotificationBackend for TelegramBackend {
             Err(e) => warn!("Failed to send BW locked notification: {}", self.redact(e)),
         }
 
+        Ok(())
+    }
+
+    async fn send_access_link(&self, url: &str) -> Result<()> {
+        // url is daemon-generated; safe to embed without escaping.
+        let text = format!(
+            "\u{1f513} <b>aibw web access</b>\n\n\
+             Tap to open the vault dashboard (single-use, expires shortly):\n{url}"
+        );
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        });
+        match self.client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(_) => info!("Sent web access link"),
+            Err(e) => warn!("Failed to send web access link: {}", self.redact(e)),
+        }
         Ok(())
     }
 

@@ -241,6 +241,8 @@ struct BwHandlerContext {
     pending_unlocks: Arc<DashMap<String, oneshot::Sender<()>>>,
     /// Timeout for waiting on vault unlock (seconds).
     timeout_seconds: u32,
+    /// Web access codes/sessions; used to mint the tappable unlock link.
+    web_auth: Arc<crate::web_auth::WebAuth>,
 }
 
 /// Parse a command string into a chain of segments split on unquoted operators.
@@ -432,6 +434,7 @@ pub async fn run_socket_listener(
     backend: Arc<dyn NotificationBackend>,
     bw_session: Option<Arc<BwSessionManager>>,
     pending_unlocks: Arc<DashMap<String, oneshot::Sender<()>>>,
+    web_auth: Arc<crate::web_auth::WebAuth>,
 ) -> Result<()> {
     DAEMON_START.get_or_init(std::time::Instant::now);
 
@@ -477,6 +480,7 @@ pub async fn run_socket_listener(
                             scrub_delay: bw_config.scrub_delay,
                             pending_unlocks: Arc::clone(&pending_unlocks),
                             timeout_seconds: config.timeout_seconds,
+                            web_auth: Arc::clone(&web_auth),
                         })
                     })
                 });
@@ -1236,17 +1240,24 @@ async fn handle_bw_get(
 
     // Phase 1: Get approval (different paths for locked vs unlocked vault)
     let session_active = bw_ctx.session.is_session_active().await;
+    // True when approval is obtained via web unlock rather than an explicit
+    // per-item Telegram approve. Such requests always require an explicit release
+    // confirmation below (M4) — unlocking the vault is not approving a release.
+    let approved_via_web_unlock = !session_active;
 
-    let record = BwRequestRecord {
+    let mut record = BwRequestRecord {
         id: id.clone(),
         user: request.user.clone(),
         item_name: request.item_name.clone(),
         field: request.field.clone(),
         session_active,
+        unlock_url: None,
     };
 
     if !session_active {
-        // Vault locked: send notification and wait for web UI unlock
+        // Vault locked: mint a single-use unlock link (if configured) and send the
+        // notification, then wait for web UI unlock.
+        record.unlock_url = bw_ctx.web_auth.issue_link(Some(&id));
         backend.send_bw_locked_notification(&record).await.ok();
 
         let (tx, rx) = oneshot::channel();
@@ -1350,10 +1361,12 @@ async fn handle_bw_get(
         .unwrap_or_else(|| request.item_name.clone());
     db.set_bw_resolved_name(&id, &resolved_name)?;
 
-    // Compare names — if they differ, require human confirmation
+    // Require an explicit release confirmation when the resolved name differs from
+    // the requested one, OR whenever approval came via web unlock (M4): unlocking
+    // the vault must not silently release a specific credential.
     let names_match = resolved_name == request.item_name;
 
-    if !names_match {
+    if !names_match || approved_via_web_unlock {
         // Send phase 1 response (awaiting confirmation)
         let phase1 = BwGetResponse {
             request_id: id.clone(),
@@ -2312,6 +2325,9 @@ mod tests {
         async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
             Ok(())
         }
@@ -2447,6 +2463,9 @@ mod tests {
         async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
             Ok(())
         }
@@ -2475,6 +2494,9 @@ mod tests {
         async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
             Ok(())
         }
@@ -2501,6 +2523,9 @@ mod tests {
             Err(anyhow::anyhow!("notification service down"))
         }
         async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
             Ok(())
         }
         async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {

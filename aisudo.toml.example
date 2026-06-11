@@ -56,3 +56,18 @@ chat_id = 123456789
 
 # Long-poll timeout for Telegram getUpdates (seconds)
 poll_timeout_seconds = 30
+
+# Optional Bitwarden integration + web unlock UI.
+# [bitwarden]
+# session_log_dir = "/home/youruser/.aibw/sessions"
+#
+# The web UI is gated by a single-use access code delivered over Telegram.
+# Set this to the UI's public https URL (e.g. behind `tailscale serve`) so the
+# daemon can send tappable unlock links. If unset, link delivery is disabled.
+# web_external_url = "https://your-host.your-tailnet.ts.net"
+#
+# web_ui_port = 8377                  # localhost port the UI binds to
+# code_ttl_seconds = 600              # lifetime of an access code (default 10 min)
+# session_ttl_seconds = 900           # web session lifetime after redeeming a code
+# code_request_cooldown_seconds = 30  # min interval between "send access code" requests
+# max_password_attempts = 5           # master-password attempts per session window

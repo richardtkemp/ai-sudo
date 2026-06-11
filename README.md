@@ -186,6 +186,25 @@ If you're using [OpenClaw](https://github.com/openclaw/openclaw), add this to yo
 - Telegram notifications are not E2E encrypted — suitable for personal servers, not high-security environments
 - Rate limiting prevents abuse (10 requests/minute/user)
 
+## Bitwarden Web Unlock (optional)
+
+The optional Bitwarden integration exposes a small web UI to unlock the vault. It
+is gated by a **single-use access code delivered over Telegram** — only the
+configured `chat_id` ever receives codes:
+
+- A credential request that finds the vault locked sends a Telegram notification
+  containing a tappable unlock link.
+- You can also request a link any time via the dashboard's **Send access code**
+  button (rate-limited per caller).
+
+Tapping a link redeems the code for a short-lived session cookie (the code is
+stripped from the URL), then you enter the Bitwarden master password to unlock.
+Releasing a specific credential always requires an explicit Telegram
+**Approve/Cancel** — unlocking the vault is not the same as approving a release.
+
+Set `web_external_url` in `[bitwarden]` to your UI's public https URL (e.g. behind
+`tailscale serve`) so the daemon can build the links. See `aisudo.toml.example`.
+
 ## Limitations
 
 **Interactive apps like `vim`, `nano`, `less`, `htop` don't work** — no pseudo-terminal (PTY) is allocated. Commands run via pipes with unidirectional output streaming, and stdin is captured upfront (for piped input only), not forwarded interactively. Use `sudo` directly for interactive applications, or non-interactive alternatives like `sed -i` for file edits.

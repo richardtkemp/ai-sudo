@@ -48,14 +48,17 @@ AI runs `aisudo whoami`
 ```bash
 git clone https://github.com/richardtkemp/ai-sudo.git
 cd ai-sudo
-cargo build --release
+cp aisudo.toml.example aisudo.toml   # then edit in your Telegram settings
 
-# Install daemon + CLI (default)
-sudo bash setup.sh
-
-# Or with PAM module too
-sudo bash setup.sh --pam
+# Build + install. Run via sudo from your normal user account: setup.sh compiles
+# as you (unprivileged) and only the install steps run as root. It refuses to
+# build from a world-writable source tree.
+sudo ./setup.sh
 ```
+
+The build uses `cargo build --release --locked` as the invoking user, then root
+installs the binaries (`/usr/local/bin`, `0755 root:root`), config
+(`/etc/aisudo/aisudo.toml`, `0600`), the `aisudo` group, and the systemd unit.
 
 ### Configure
 

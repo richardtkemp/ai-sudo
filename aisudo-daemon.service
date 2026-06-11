@@ -8,10 +8,17 @@ ExecStart=/usr/local/bin/aisudo-daemon /etc/aisudo/aisudo.toml
 Restart=on-failure
 RestartSec=5
 
-# Runs as root so it can execute approved commands (exec mode)
+# Runs as root so it can execute approved commands (exec mode). Process-sandboxing
+# (NoNewPrivileges/ProtectSystem/etc.) is intentionally omitted — it would block the
+# daemon from exec'ing arbitrary approved root commands. UMask tightens the default
+# creation mode so the socket is created 0660 (closing the window before the daemon
+# chmods it) and the DB/journal are not group/world-readable.
+UMask=0117
+
 # The socket is restricted to group "aisudo" for access control
 
-# Create runtime directory for socket
+# Create runtime directory for socket. 0755 root:root is safe (not group-writable,
+# so group members can traverse to the 0660 socket but cannot unlink/replace it).
 RuntimeDirectory=aisudo
 RuntimeDirectoryMode=0755
 

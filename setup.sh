@@ -26,44 +26,56 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# ── Rust toolchain discovery ─────────────────────────────────────────
-# When running under sudo/aisudo, root may not have a Rust toolchain.
-# Use SUDO_USER's standard ~/.rustup and ~/.cargo unless RUSTUP_HOME
-# or CARGO_HOME are already set in the environment.
-
-if [[ -z "${RUSTUP_HOME:-}" || -z "${CARGO_HOME:-}" ]]; then
-    # Resolve the invoking user's home directory
-    if [[ -n "${SUDO_USER:-}" ]]; then
-        SUDO_USER_HOME=$(eval echo "~$SUDO_USER")
-    else
-        SUDO_USER_HOME="$HOME"
-    fi
-    export RUSTUP_HOME="${RUSTUP_HOME:-$SUDO_USER_HOME/.rustup}"
-    export CARGO_HOME="${CARGO_HOME:-$SUDO_USER_HOME/.cargo}"
+# The build must NOT run as root: cargo executes every dependency's build.rs and
+# proc-macros, and we don't want that running with root privileges. Require sudo
+# from a normal user so we can drop to it for the build.
+if [[ -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
+    error "Run this with sudo from your normal user account (e.g. 'sudo ./setup.sh')."
+    error "The build must run unprivileged — refusing to compile as root."
+    exit 1
+fi
+BUILD_USER="$SUDO_USER"
+USER_HOME=$(getent passwd "$BUILD_USER" | cut -d: -f6)
+if [[ -z "$USER_HOME" || ! -d "$USER_HOME" ]]; then
+    error "Could not resolve a home directory for build user '$BUILD_USER'."
+    exit 1
 fi
 
-# Check for cargo
-if ! command -v cargo &>/dev/null; then
-    if [[ -x "$CARGO_HOME/bin/cargo" ]]; then
-        export PATH="$CARGO_HOME/bin:$PATH"
-    else
-        error "Rust toolchain not found. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-        exit 1
-    fi
+# Refuse to build/install from a world-writable source tree: a world-writable
+# file could be tampered with before it is compiled into the root daemon.
+# Group-writable is allowed (the group is trusted). target/ and .git/ are excluded
+# (target is rebuilt below; .git is not compiled).
+WORLD_WRITABLE=$(find "$SCRIPT_DIR" \
+    \( -path "$SCRIPT_DIR/target" -o -path "$SCRIPT_DIR/.git" \) -prune -o \
+    -perm -0002 -print 2>/dev/null | head -5)
+if [[ -n "$WORLD_WRITABLE" ]]; then
+    error "Refusing to build/install: world-writable files in the source tree:"
+    echo "$WORLD_WRITABLE" | sed 's/^/    /'
+    error "A world-writable source tree could be tampered with before being compiled into the root daemon."
+    error "Fix with: chmod -R o-w '$SCRIPT_DIR'"
+    exit 1
 fi
 
-# Set LD_LIBRARY_PATH so rustc can find librustc_driver when cargo invokes
-# it directly by absolute path (bypassing the rustup proxy).
-TC_DIR=$(ls -1d "$RUSTUP_HOME"/toolchains/*/lib 2>/dev/null | head -1)
-if [[ -n "$TC_DIR" ]]; then
-    export LD_LIBRARY_PATH="${TC_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# ── Rust toolchain discovery (build user's toolchain) ────────────────
+
+RUSTUP_HOME="${RUSTUP_HOME:-$USER_HOME/.rustup}"
+CARGO_HOME="${CARGO_HOME:-$USER_HOME/.cargo}"
+
+if [[ ! -x "$CARGO_HOME/bin/cargo" ]] && ! sudo -u "$BUILD_USER" command -v cargo &>/dev/null; then
+    error "Rust toolchain not found for $BUILD_USER."
+    error "Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    exit 1
 fi
 
-# ── Build ─────────────────────────────────────────────────────────────
+# ── Build (as the unprivileged invoking user) ────────────────────────
 
-info "Building ai-sudo (release)..."
-cd "$SCRIPT_DIR"
-cargo build --release 2>&1 | tail -5
+info "Building ai-sudo (release) as $BUILD_USER..."
+sudo -u "$BUILD_USER" env \
+    HOME="$USER_HOME" \
+    RUSTUP_HOME="$RUSTUP_HOME" \
+    CARGO_HOME="$CARGO_HOME" \
+    PATH="$CARGO_HOME/bin:/usr/local/bin:/usr/bin:/bin" \
+    bash -c "cd '$SCRIPT_DIR' && cargo build --release --locked" 2>&1 | tail -8
 
 DAEMON_BIN="$SCRIPT_DIR/target/release/aisudo-daemon"
 CLI_BIN="$SCRIPT_DIR/target/release/aisudo"
@@ -72,22 +84,22 @@ if [[ ! -f "$DAEMON_BIN" ]]; then
     error "Daemon binary not found at $DAEMON_BIN — build failed?"
     exit 1
 fi
-
 if [[ ! -f "$CLI_BIN" ]]; then
     error "CLI binary not found at $CLI_BIN — build failed?"
     exit 1
 fi
 
-# ── Stop running daemon ──────────────────────────────────────────────
+# ── Install (root, in a transient unit so it survives the daemon restart) ──
 
-# Fork installation into a transient systemd service so it survives daemon restart.
-# setsid alone isn't enough — systemd's KillMode=control-group kills all processes
-# in the daemon's cgroup. systemd-run creates a new transient unit in a separate
-# cgroup, so stopping aisudo-daemon won't kill the install process.
+# Fork installation into a transient systemd service so it survives the daemon
+# restart below. systemd's KillMode=control-group would otherwise kill this
+# process when aisudo-daemon stops; systemd-run runs it in a separate cgroup.
 info "Launching install as transient systemd service..."
 
-# Write the install script to a temp file (avoids quoting issues with systemd-run)
+# Temp install script (avoids quoting issues with systemd-run). It only contains
+# install commands and paths — no secrets — but keep it root-only anyway.
 INSTALL_SCRIPT=$(mktemp /tmp/aisudo-install-XXXXXX.sh)
+chmod 700 "$INSTALL_SCRIPT"
 cat > "$INSTALL_SCRIPT" <<INSTALL_EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -105,19 +117,7 @@ if systemctl is-active --quiet aisudo-daemon 2>/dev/null; then
     systemctl stop aisudo-daemon
 fi
 
-info "Installing daemon binary to /usr/local/bin/aisudo-daemon..."
-cp "$DAEMON_BIN" /usr/local/bin/aisudo-daemon
-chmod 755 /usr/local/bin/aisudo-daemon
-
-info "Installing CLI wrapper to /usr/local/bin/aisudo..."
-cp "$CLI_BIN" /usr/local/bin/aisudo
-chmod 755 /usr/local/bin/aisudo
-
-info "Installing config to /etc/aisudo/aisudo.toml..."
-mkdir -p /etc/aisudo
-cp "$CONFIG_FILE" /etc/aisudo/aisudo.toml
-chmod 600 /etc/aisudo/aisudo.toml
-
+# Create the service group first so install ownership can reference it.
 if ! getent group aisudo &>/dev/null; then
     info "Creating aisudo service group..."
     /usr/sbin/groupadd --system aisudo
@@ -125,16 +125,29 @@ else
     info "aisudo group already exists"
 fi
 
-info "Creating runtime directories..."
-mkdir -p /var/run/aisudo
-chown root:aisudo /var/run/aisudo
-chmod 775 /var/run/aisudo
+# Install binaries root-owned and not group/world-writable (atomic mode set —
+# no world-readable/writable window). Non-root must not be able to swap the
+# root daemon binary.
+info "Installing daemon + CLI binaries to /usr/local/bin..."
+install -o root -g root -m 755 "$DAEMON_BIN" /usr/local/bin/aisudo-daemon
+install -o root -g root -m 755 "$CLI_BIN" /usr/local/bin/aisudo
 
-mkdir -p /var/lib/aisudo
-chmod 750 /var/lib/aisudo
+# Config carries the Telegram token — create it 0600 atomically.
+info "Installing config to /etc/aisudo/aisudo.toml..."
+install -d -o root -g root -m 755 /etc/aisudo
+install -o root -g root -m 600 "$CONFIG_FILE" /etc/aisudo/aisudo.toml
+
+# Socket dir: group-traversable (x) but NOT group-writable, so aisudo members can
+# reach the socket but cannot unlink/replace it. (systemd's RuntimeDirectory
+# recreates this as 0755 root:root at start; this covers non-systemd starts.)
+info "Creating runtime + state directories..."
+install -d -o root -g aisudo -m 750 /var/run/aisudo
+# State dir holds the DB (and transient credentials) — root only. The daemon also
+# enforces 0700 on this dir and 0600 on the DB file.
+install -d -o root -g root -m 700 /var/lib/aisudo
 
 info "Installing systemd service..."
-cp "$SCRIPT_DIR/aisudo-daemon.service" /etc/systemd/system/aisudo-daemon.service
+install -o root -g root -m 644 "$SCRIPT_DIR/aisudo-daemon.service" /etc/systemd/system/aisudo-daemon.service
 systemctl daemon-reload
 
 info "Enabling and starting aisudo-daemon..."
@@ -156,7 +169,6 @@ fi
 
 rm -f "\$0"  # clean up temp script
 INSTALL_EOF
-chmod 755 "$INSTALL_SCRIPT"
 
 systemd-run --unit=aisudo-install --description="aisudo install" \
     --slice=system.slice bash "$INSTALL_SCRIPT"
@@ -165,83 +177,4 @@ echo ""
 echo "Installation launched as transient service (aisudo-install.service)."
 echo "Monitor progress: tail -f /var/log/aisudo-setup.log"
 echo "                  systemctl status aisudo-install"
-echo ""
-exit 0
-
-# ── Install daemon ────────────────────────────────────────────────────
-
-info "Installing daemon binary to /usr/local/bin/aisudo-daemon..."
-cp "$DAEMON_BIN" /usr/local/bin/aisudo-daemon
-chmod 755 /usr/local/bin/aisudo-daemon
-
-# ── Install CLI wrapper ──────────────────────────────────────────────
-
-info "Installing CLI wrapper to /usr/local/bin/aisudo..."
-cp "$CLI_BIN" /usr/local/bin/aisudo
-chmod 755 /usr/local/bin/aisudo
-
-# ── Install config ────────────────────────────────────────────────────
-
-info "Installing config to /etc/aisudo/aisudo.toml..."
-mkdir -p /etc/aisudo
-cp "$CONFIG_FILE" /etc/aisudo/aisudo.toml
-chmod 600 /etc/aisudo/aisudo.toml
-
-# ── Create service group ─────────────────────────────────────────────
-
-if ! getent group aisudo &>/dev/null; then
-    info "Creating aisudo service group..."
-    /usr/sbin/groupadd --system aisudo
-else
-    info "aisudo group already exists"
-fi
-
-# ── Create directories ────────────────────────────────────────────────
-
-info "Creating runtime directories..."
-mkdir -p /var/run/aisudo
-chown root:aisudo /var/run/aisudo
-chmod 775 /var/run/aisudo
-
-mkdir -p /var/lib/aisudo
-chmod 750 /var/lib/aisudo
-
-# ── Install systemd service ──────────────────────────────────────────
-
-info "Installing systemd service..."
-cp "$SCRIPT_DIR/aisudo-daemon.service" /etc/systemd/system/aisudo-daemon.service
-systemctl daemon-reload
-
-# ── Start service ─────────────────────────────────────────────────────
-
-info "Enabling and starting aisudo-daemon..."
-systemctl enable aisudo-daemon
-systemctl restart aisudo-daemon
-
-# Give it a moment
-sleep 2
-
-if systemctl is-active --quiet aisudo-daemon; then
-    info "aisudo-daemon is running!"
-else
-    error "aisudo-daemon failed to start. Check: journalctl -u aisudo-daemon -n 20"
-    exit 1
-fi
-
-# ── Summary ───────────────────────────────────────────────────────────
-
-echo ""
-echo "═══════════════════════════════════════════════════"
-echo -e "${GREEN}  ai-sudo setup complete!${NC}"
-echo "═══════════════════════════════════════════════════"
-echo ""
-echo "  Config:    /etc/aisudo/aisudo.toml"
-echo "  Daemon:    /usr/local/bin/aisudo-daemon"
-echo "  CLI:       /usr/local/bin/aisudo"
-echo "  Service:   aisudo-daemon.service"
-echo "  Database:  /var/lib/aisudo/aisudo.db"
-echo "  Socket:    /var/run/aisudo/aisudo.sock"
-echo "  Logs:      journalctl -u aisudo-daemon -f"
-echo ""
-echo "  Test it:   aisudo whoami"
 echo ""

@@ -706,7 +706,10 @@ async fn handle_sudo_request(
     let effective_timeout = request.timeout_seconds.unwrap_or(timeout_seconds);
     let user = request.user.clone();
 
-    // Normalize command for allowlist/denylist matching (strip shell wrappers if configured)
+    // Whole-command shell-strip, used ONLY as an additional ownership-check hint
+    // (defense-in-depth). The allow/deny/temp DECISIONS below do NOT use this —
+    // they strip per top-level segment so a chain like `bash -c df ; chmod ...`
+    // cannot be collapsed to just `df` (see is_allowed_with_strip).
     let match_command = if limits.strip_shell_prefix {
         strip_shell_wrapper(&command)
     } else {
@@ -714,7 +717,7 @@ async fn handle_sudo_request(
     };
 
     // Check denylist FIRST - deny always takes precedence
-    if is_denied(&match_command, denylist) {
+    if is_denied_with_strip(&command, denylist, limits.strip_shell_prefix) {
         warn!("Command denied via denylist: {}", command);
         let response = SudoResponse {
             request_id: String::new(),
@@ -738,7 +741,7 @@ async fn handle_sudo_request(
     };
 
     // Check allowlist - auto-approved commands skip rate limiting
-    if is_allowed(&match_command, &effective_allowlist) {
+    if is_allowed_with_strip(&command, &effective_allowlist, limits.strip_shell_prefix) {
         // Validate binary ownership before auto-executing
         if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
             deny_ownership(writer, String::new(), &format!("Allowlisted command rejected (ownership): {reason}")).await?;
@@ -781,7 +784,7 @@ async fn handle_sudo_request(
     }
 
     // Check active temp rules - auto-approved commands skip rate limiting
-    if is_temp_rule_allowed(&db, &request.user, &match_command)? {
+    if is_temp_rule_allowed_with_strip(&db, &request.user, &command, limits.strip_shell_prefix)? {
         // Validate binary ownership before auto-executing
         if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
             deny_ownership(writer, String::new(), &format!("Temp-rule command rejected (ownership): {reason}")).await?;
@@ -2212,6 +2215,80 @@ fn is_denied(command: &str, denylist: &[String]) -> bool {
     })
 }
 
+/// Parse `command` into top-level segments and strip a shell wrapper from EACH
+/// segment individually (when `strip` is enabled). Returns the per-segment
+/// normalized command strings, or `None` if the command cannot be parsed.
+///
+/// Stripping per-segment (rather than over the whole command) is what prevents
+/// the H1 bypass: `bash -c df ; chmod 4755 /bin/bash` normalizes to
+/// `["df", "chmod 4755 /bin/bash"]` — both must clear the allowlist — instead of
+/// collapsing to just `"df"` while the `chmod` segment still executes.
+fn normalize_for_match(command: &str, strip: bool) -> Option<Vec<String>> {
+    let segments = parse_command_chain(command).ok()?;
+    Some(
+        segments
+            .into_iter()
+            .map(|seg| {
+                if strip {
+                    strip_shell_wrapper(&seg.command)
+                } else {
+                    seg.command
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Allowlist check with per-segment shell-wrapper stripping. When `strip` is off
+/// this is identical to `is_allowed`. When on, EVERY top-level segment — after
+/// stripping its own wrapper — must itself be fully allowlisted (each normalized
+/// part is re-parsed as a chain, so quoted operators inside `bash -c '...'` are
+/// caught too).
+fn is_allowed_with_strip(command: &str, allowlist: &[String], strip: bool) -> bool {
+    if !strip {
+        return is_allowed(command, allowlist);
+    }
+    match normalize_for_match(command, true) {
+        Some(parts) => !parts.is_empty() && parts.iter().all(|p| is_allowed(p, allowlist)),
+        None => false,
+    }
+}
+
+/// Denylist check with per-segment shell-wrapper stripping. Mirrors
+/// `is_allowed_with_strip`; denies if ANY normalized segment is denylisted.
+fn is_denied_with_strip(command: &str, denylist: &[String], strip: bool) -> bool {
+    if !strip {
+        return is_denied(command, denylist);
+    }
+    match normalize_for_match(command, true) {
+        Some(parts) => parts.iter().any(|p| is_denied(p, denylist)),
+        None => false,
+    }
+}
+
+/// Temp-rule check with per-segment shell-wrapper stripping. When `strip` is off
+/// this is identical to `is_temp_rule_allowed`.
+fn is_temp_rule_allowed_with_strip(
+    db: &Database,
+    user: &str,
+    command: &str,
+    strip: bool,
+) -> Result<bool> {
+    if !strip {
+        return is_temp_rule_allowed(db, user, command);
+    }
+    let parts = match normalize_for_match(command, true) {
+        Some(p) if !p.is_empty() => p,
+        _ => return Ok(false),
+    };
+    for part in &parts {
+        if !is_temp_rule_allowed(db, user, part)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2859,6 +2936,72 @@ mod tests {
 
         // Wrong user
         assert!(!is_temp_rule_allowed(&db, "bob", "apt install vim").unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===== strip_shell_prefix per-segment matching (H1 regression) =====
+
+    #[test]
+    fn strip_allows_legitimate_wrapped_command() {
+        let allow = vec!["systemctl restart".to_string(), "df".to_string()];
+        // The intended use of strip_shell_prefix: a wrapped allowlisted command.
+        assert!(is_allowed_with_strip("bash -c 'systemctl restart foo'", &allow, true));
+        assert!(is_allowed_with_strip("df -h", &allow, true));
+        assert!(is_allowed_with_strip("env bash -c 'df'", &allow, true));
+    }
+
+    #[test]
+    fn strip_blocks_chain_smuggled_after_wrapper() {
+        // H1: `bash -c df ; chmod ...` must NOT auto-approve just because the
+        // whole-command strip would collapse to `df`. The chmod segment is not
+        // allowlisted, so the whole command is rejected.
+        let allow = vec!["df".to_string()];
+        assert!(!is_allowed_with_strip("bash -c df ; chmod 4755 /bin/bash", &allow, true));
+        assert!(!is_allowed_with_strip("bash -c df && rm -rf /tmp/x", &allow, true));
+        assert!(!is_allowed_with_strip("bash -c df | tee /etc/passwd", &allow, true));
+        // Quoted operators inside the wrapper are caught too (inner is re-parsed).
+        assert!(!is_allowed_with_strip("bash -c 'df ; rm -rf /'", &allow, true));
+    }
+
+    #[test]
+    fn strip_off_is_unchanged() {
+        let allow = vec!["df".to_string()];
+        // With the feature off, behaviour is exactly is_allowed: a wrapped command
+        // is matched literally (and `bash -c df` is not allowlisted).
+        assert!(!is_allowed_with_strip("bash -c df ; chmod 4755 /bin/bash", &allow, false));
+        assert!(is_allowed_with_strip("df -h", &allow, false));
+    }
+
+    #[test]
+    fn strip_denylist_inspects_each_segment() {
+        let deny = vec!["chmod".to_string()];
+        // The smuggled chmod segment is now visible to the denylist.
+        assert!(is_denied_with_strip("bash -c df ; chmod 4755 /bin/bash", &deny, true));
+        assert!(!is_denied_with_strip("bash -c df ; ls -la", &deny, true));
+    }
+
+    #[test]
+    fn strip_temp_rule_blocks_smuggled_chain() {
+        let dir = std::env::temp_dir().join(format!(
+            "aisudo-h1-temp-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Database::open(&dir.join("test.db")).unwrap();
+
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["docker ps"]).unwrap();
+        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+
+        // Legitimate wrapped temp-rule command is allowed.
+        assert!(is_temp_rule_allowed_with_strip(&db, "alice", "bash -c 'docker ps'", true).unwrap());
+        // Smuggled extra segment is blocked even though strip would collapse to `docker ps`.
+        assert!(!is_temp_rule_allowed_with_strip(&db, "alice", "bash -c 'docker ps' ; rm -rf /", true).unwrap());
+        // Quoted operator inside the wrapper is caught too.
+        assert!(!is_temp_rule_allowed_with_strip(&db, "alice", "bash -c 'docker ps ; rm -rf /'", true).unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
     }

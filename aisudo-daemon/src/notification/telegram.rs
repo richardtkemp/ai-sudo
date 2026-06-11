@@ -114,7 +114,7 @@ impl TelegramBackend {
             info!("Telegram polling loop started");
             loop {
                 if let Err(e) = this.poll_updates().await {
-                    error!("Telegram poll error (will retry in 5s): {e:#}");
+                    error!("Telegram poll error (will retry in 5s): {}", this.redact(format!("{e:#}")));
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
@@ -144,12 +144,12 @@ impl TelegramBackend {
                         }
                     }
                     Err(e) => {
-                        error!("Telegram getMe: failed to parse response (HTTP {http_status}): {e}");
+                        error!("Telegram getMe: failed to parse response (HTTP {http_status}): {}", self.redact(e));
                     }
                 }
             }
             Err(e) => {
-                error!("Telegram getMe request failed (bot may be unreachable): {e}");
+                error!("Telegram getMe request failed (bot may be unreachable): {}", self.redact(e));
             }
         }
     }
@@ -159,6 +159,14 @@ impl TelegramBackend {
             "https://api.telegram.org/bot{}/{}",
             self.bot_token, method
         )
+    }
+
+    /// Redact the bot token from a string before it is logged or carried in an
+    /// error. The token is embedded in every API URL, and reqwest/anyhow `Display`
+    /// includes the request URL on transport errors — so without this, a single
+    /// network error would write the token to the logs.
+    fn redact(&self, s: impl std::fmt::Display) -> String {
+        s.to_string().replace(&self.bot_token, "<redacted>")
     }
 
     async fn send_message(&self, record: &SudoRequestRecord) -> Result<i64> {
@@ -199,11 +207,11 @@ impl TelegramBackend {
             .json(&main_body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
+            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
 
         let http_status = resp.status();
         let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
+            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
         if !result.ok {
             let desc = result
                 .description
@@ -280,11 +288,11 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
+            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
 
         let http_status = resp.status();
         let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
+            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
         if !result.ok {
             let desc = result
                 .description
@@ -336,11 +344,11 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
+            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
 
         let http_status = resp.status();
         let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
+            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
         if !result.ok {
             let desc = result.description.unwrap_or_else(|| "no description".to_string());
             return Err(anyhow!("Telegram sendMessage failed (HTTP {}): {}", http_status, desc));
@@ -391,11 +399,11 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
+            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
 
         let http_status = resp.status();
         let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
+            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
         if !result.ok {
             let desc = result.description.unwrap_or_else(|| "no description".to_string());
             return Err(anyhow!("Telegram sendMessage failed (HTTP {}): {}", http_status, desc));
@@ -429,11 +437,11 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {e}"))?;
+            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
 
         let http_status = resp.status();
         let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {e}", http_status))?;
+            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
         if !result.ok {
             let desc = result.description.unwrap_or_else(|| "no description".to_string());
             warn!("Telegram scrub notification failed (HTTP {}): {}", http_status, desc);
@@ -458,13 +466,13 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram editMessageText HTTP request failed: {e}"))?;
+            .map_err(|e| anyhow!("Telegram editMessageText HTTP request failed: {}", self.redact(e)))?;
 
         let http_status = resp.status();
         let result: TelegramResponse<serde_json::Value> = resp
             .json()
             .await
-            .map_err(|e| anyhow!("Telegram editMessageText: failed to parse response (HTTP {}): {e}", http_status))?;
+            .map_err(|e| anyhow!("Telegram editMessageText: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
 
         if !result.ok {
             let desc = result
@@ -495,11 +503,11 @@ impl TelegramBackend {
             .timeout(Duration::from_secs(self.poll_timeout_seconds as u64 + 5))
             .send()
             .await
-            .map_err(|e| anyhow!("getUpdates HTTP request failed (offset={}): {e}", offset))?;
+            .map_err(|e| anyhow!("getUpdates HTTP request failed (offset={}): {}", offset, self.redact(e)))?;
 
         let http_status = resp.status();
         let result: TelegramResponse<Vec<Update>> = resp.json().await
-            .map_err(|e| anyhow!("getUpdates: failed to parse response (HTTP {}): {e}", http_status))?;
+            .map_err(|e| anyhow!("getUpdates: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
         if !result.ok {
             return Err(anyhow!(
                 "getUpdates API error (HTTP {}): {}",
@@ -859,7 +867,7 @@ impl NotificationBackend for TelegramBackend {
             .await
         {
             Ok(_) => info!("BW locked notification sent for request {}", record.id),
-            Err(e) => warn!("Failed to send BW locked notification: {e}"),
+            Err(e) => warn!("Failed to send BW locked notification: {}", self.redact(e)),
         }
 
         Ok(())
@@ -898,7 +906,7 @@ impl NotificationBackend for TelegramBackend {
                 .await
             {
                 Ok(_) => info!("Updated completion status for request {}", info.request_id),
-                Err(e) => warn!("Failed to update completion status: {e}"),
+                Err(e) => warn!("Failed to update completion status: {}", self.redact(e)),
             }
         }
     }
@@ -1064,6 +1072,18 @@ chat_id = 1
             backend.api_url("sendMessage"),
             "https://api.telegram.org/botTOKEN123/sendMessage"
         );
+    }
+
+    #[test]
+    fn test_redact_removes_token() {
+        let backend = TelegramBackend::new("SECRET-TOKEN".to_string(), 42, 60, 2048, 30, test_config_holder());
+        // Simulate a reqwest-style error string that embeds the API URL (with token).
+        let err = "error sending request for url (https://api.telegram.org/botSECRET-TOKEN/getUpdates): connection refused";
+        let redacted = backend.redact(err);
+        assert!(!redacted.contains("SECRET-TOKEN"), "token must not survive redaction: {redacted}");
+        assert!(redacted.contains("<redacted>"));
+        // A string without the token is unchanged.
+        assert_eq!(backend.redact("plain message"), "plain message");
     }
 
     #[test]

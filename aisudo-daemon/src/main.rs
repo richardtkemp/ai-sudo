@@ -2,6 +2,7 @@ mod bw_session;
 mod config;
 mod db;
 mod notification;
+mod scrub;
 mod socket;
 mod sudoers;
 mod web;
@@ -104,6 +105,21 @@ async fn main() -> Result<()> {
                 web::run_web_server(web_state, port).await;
             });
             info!("Web UI spawned on port {}", bw_config.web_ui_port);
+
+            // Spawn the credential scrubber: periodically redact released secrets
+            // from the session logs and drop the retained plaintext from the DB.
+            let db_scrub = Arc::clone(&db);
+            let backend_scrub = Arc::clone(&backend);
+            let scrub_interval = bw_config.scrub_interval.max(1) as u64;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(scrub_interval)).await;
+                    if let Err(e) = run_scrub_pass(&db_scrub, backend_scrub.as_ref()).await {
+                        error!("Scrub pass error: {e:#}");
+                    }
+                }
+            });
+            info!("Credential scrubber spawned (interval: {}s)", scrub_interval);
         }
     }
 
@@ -134,5 +150,63 @@ async fn main() -> Result<()> {
     // Run socket listener (blocks)
     socket::run_socket_listener(config_holder, db, backend, bw_session, pending_unlocks).await?;
 
+    Ok(())
+}
+
+/// One scrubber iteration: redact due credentials from the session logs and
+/// clear the retained plaintext. Deferred with backoff on failure, with a hard
+/// retry cap after which the plaintext is dropped regardless.
+async fn run_scrub_pass(
+    db: &Arc<db::Database>,
+    backend: &dyn notification::NotificationBackend,
+) -> Result<()> {
+    const MAX_RETRIES: i32 = 5;
+    const RETRY_BACKOFF_SECS: u32 = 60;
+
+    let now = chrono::Utc::now();
+    for entry in db.get_pending_scrubs()? {
+        // Only act once the scrub delay has elapsed (unparseable time = treat as due).
+        let due = db::parse_datetime(&entry.scrub_at)
+            .map(|t| t <= now)
+            .unwrap_or(true);
+        if !due {
+            continue;
+        }
+
+        db.update_scrub_status(&entry.id, "in_progress").ok();
+
+        match scrub::redact_session_files(&entry.session_files, &entry.credential_value) {
+            Ok(n) => {
+                db.complete_scrub(&entry.id)?;
+                info!(
+                    "Scrubbed credential for request {} ({} file(s) redacted)",
+                    entry.request_id, n
+                );
+                // Best-effort completion notification.
+                if let Ok(Some(req)) = db.get_bw_request(&entry.request_id) {
+                    let item = req.resolved_item_name.unwrap_or(req.item_name);
+                    if let Err(e) = backend.send_scrub_complete(&entry.request_id, &item).await {
+                        warn!("Scrub-complete notification failed for {}: {e}", entry.request_id);
+                    }
+                }
+            }
+            Err(e) => {
+                let attempts = entry.retry_count + 1;
+                if attempts >= MAX_RETRIES {
+                    error!(
+                        "Giving up scrubbing request {} after {} attempts (dropping retained plaintext): {e}",
+                        entry.request_id, attempts
+                    );
+                    db.fail_scrub(&entry.id)?;
+                } else {
+                    warn!(
+                        "Scrub failed for request {} (attempt {}, will retry): {e}",
+                        entry.request_id, attempts
+                    );
+                    db.defer_scrub(&entry.id, RETRY_BACKOFF_SECS)?;
+                }
+            }
+        }
+    }
     Ok(())
 }

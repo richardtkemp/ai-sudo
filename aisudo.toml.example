@@ -28,6 +28,11 @@ hot_reload = false
 
 # Commands that are auto-approved without notification.
 # Matching is prefix-based: "apt list" matches "apt list --installed".
+#
+# SECURITY: only list commands that CANNOT execute arbitrary code or write
+# arbitrary files as root. Do NOT auto-approve things like `apt install`
+# (runs package maintainer scripts / local .deb as root) — route those
+# through Telegram approval instead.
 allowlist = [
     # "systemctl status",
     # "apt list",

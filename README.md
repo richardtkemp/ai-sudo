@@ -66,7 +66,11 @@ socket_path = "/var/run/aisudo/aisudo.sock"
 db_path = "/var/lib/aisudo/aisudo.db"
 timeout_seconds = 900  # 15 minutes
 
-# Commands that auto-approve without notification
+# Commands that auto-approve without notification.
+# Only list commands that cannot execute arbitrary code or write arbitrary
+# files as root. Do NOT auto-approve `apt install` (runs maintainer scripts /
+# local .deb as root) or other code-executing commands — route those through
+# Telegram approval.
 allowlist = [
     "systemctl status",
     "journalctl",
@@ -166,8 +170,10 @@ If you're using [OpenClaw](https://github.com/openclaw/openclaw), add this to yo
     likely to approve if they know why.
 
     **Allowlisted commands** (auto-approved, no Telegram prompt):
-    systemctl status/restart, journalctl, apt search/install/list/show, du, df, lsblk,
+    systemctl status, journalctl, apt search/list/show, du, df, lsblk,
     ss, lsof, cat /etc/*, tail /var/log/*, dmesg, smartctl, and more.
+    (Code-executing commands like `apt install` and `systemctl restart` are NOT
+    auto-approved by default — they require a Telegram prompt.)
     See `/etc/aisudo/aisudo.toml` for the full list.
 
     **Config:** `/etc/aisudo/aisudo.toml` | **Socket:** `/var/run/aisudo/aisudo.sock`

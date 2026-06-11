@@ -49,7 +49,7 @@ pub struct TempRuleRow {
 }
 
 /// Parse a datetime string that may be RFC3339 or SQLite's `datetime('now')` format.
-fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&chrono::Utc));
     }
@@ -65,10 +65,21 @@ pub struct Database {
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The DB stores command history, audit logs, and (with Bitwarden) transient
+        // plaintext credentials. It must be root-only — create the parent 0700 and
+        // the DB file 0600 so other local users / the `aisudo` group cannot read it.
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Best-effort tighten; ignore if the dir is shared/pre-existing with
+            // different intent, but our default (/var/lib/aisudo) is ours.
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
         let conn = Connection::open(path)?;
+        // Default rusqlite journal mode is a transient rollback journal; if WAL is
+        // ever enabled, the -wal/-shm sidecars would also need 0600.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let db = Database {
             conn: Mutex::new(conn),
         };
@@ -659,6 +670,18 @@ impl Database {
         Ok(())
     }
 
+    /// Test-only: read the raw retained credential_value for a scrub entry.
+    #[cfg(test)]
+    fn scrub_value(&self, id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT credential_value FROM bw_scrub_queue WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
     pub fn get_pending_scrubs(&self) -> Result<Vec<ScrubQueueEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -698,8 +721,22 @@ impl Database {
 
     pub fn complete_scrub(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Clear the retained plaintext credential once scrubbing succeeds — it is
+        // only kept so the scrubber can locate the secret in the session logs.
         conn.execute(
-            "UPDATE bw_scrub_queue SET status = 'completed', completed_at = datetime('now') WHERE id = ?1",
+            "UPDATE bw_scrub_queue SET status = 'completed', completed_at = datetime('now'), credential_value = '' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Give up on a scrub after exhausting retries. The session logs may remain
+    /// un-redacted, but we still drop the retained plaintext — keeping it is the
+    /// larger risk.
+    pub fn fail_scrub(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE bw_scrub_queue SET status = 'failed', completed_at = datetime('now'), credential_value = '' WHERE id = ?1",
             params![id],
         )?;
         Ok(())
@@ -1430,6 +1467,44 @@ mod tests {
 
         let pending = db.get_pending_scrubs().unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn complete_scrub_clears_retained_plaintext() {
+        let (_dir, db) = test_db();
+        db.insert_scrub_entry(
+            "scrub-1",
+            "bw-1",
+            "sha256:abc",
+            "secret123",
+            "2026-02-08T12:00:00Z",
+            &["/tmp/session.jsonl".to_string()],
+        )
+        .unwrap();
+        assert_eq!(db.scrub_value("scrub-1").as_deref(), Some("secret123"));
+
+        db.complete_scrub("scrub-1").unwrap();
+        // Plaintext must be wiped once the scrub is done.
+        assert_eq!(db.scrub_value("scrub-1").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn fail_scrub_clears_retained_plaintext() {
+        let (_dir, db) = test_db();
+        db.insert_scrub_entry(
+            "scrub-1",
+            "bw-1",
+            "sha256:abc",
+            "secret123",
+            "2026-02-08T12:00:00Z",
+            &["/tmp/session.jsonl".to_string()],
+        )
+        .unwrap();
+
+        db.fail_scrub("scrub-1").unwrap();
+        assert_eq!(db.scrub_value("scrub-1").as_deref(), Some(""));
+        // Failed entries are no longer pending.
+        assert!(db.get_pending_scrubs().unwrap().is_empty());
     }
 
     #[test]

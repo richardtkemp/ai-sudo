@@ -166,6 +166,23 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Spawn the retention prune task (hourly). 0 = keep forever.
+    let retention_days = config.limits.history_retention_days;
+    if retention_days > 0 {
+        let db_prune = Arc::clone(&db);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                match db_prune.prune_old_records(retention_days) {
+                    Ok(0) => {}
+                    Ok(n) => info!("Pruned {n} records older than {retention_days} days"),
+                    Err(e) => error!("DB prune error: {e}"),
+                }
+            }
+        });
+        info!("DB retention prune spawned (retention: {retention_days} days)");
+    }
+
     // Run socket listener (blocks)
     socket::run_socket_listener(config_holder, db, backend, bw_session, pending_unlocks, web_auth).await?;
 

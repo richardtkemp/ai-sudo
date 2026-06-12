@@ -80,6 +80,17 @@ impl Database {
         // Default rusqlite journal mode is a transient rollback journal; if WAL is
         // ever enabled, the -wal/-shm sidecars would also need 0600.
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+
+        // Enable FULL auto-vacuum so deletes from the retention prune reclaim disk
+        // automatically. For a brand-new DB the mode is set before the tables are
+        // created; an existing DB created without it is converted once via VACUUM
+        // (auto_vacuum mode changes only take effect after a VACUUM).
+        conn.execute_batch("PRAGMA auto_vacuum = FULL;")?;
+        let av_mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        if av_mode != 1 {
+            conn.execute_batch("VACUUM;")?;
+        }
+
         let db = Database {
             conn: Mutex::new(conn),
         };
@@ -160,6 +171,17 @@ impl Database {
                 timestamp TEXT DEFAULT (datetime('now')),
                 details TEXT
             );
+
+            -- Indexes for the rate-limit COUNT hot path and the retention prune.
+            CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_requests_user_timestamp ON requests(user, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
+            CREATE INDEX IF NOT EXISTS idx_bw_requests_user_timestamp ON bw_requests(user, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_bw_requests_timestamp ON bw_requests(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_temp_rules_requested_at ON temp_rules(requested_at);
+            CREATE INDEX IF NOT EXISTS idx_bw_session_events_timestamp ON bw_session_events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_bw_scrub_queue_status ON bw_scrub_queue(status);
             ",
         )?;
         // Migration: add stdin_bytes column to existing databases
@@ -565,6 +587,41 @@ impl Database {
             params![request_id, event, details],
         )?;
         Ok(())
+    }
+
+    /// Delete history/audit records older than `retention_days`. 0 disables
+    /// pruning (keep forever). Returns the number of rows deleted. With FULL
+    /// auto-vacuum (set in `open`), freed pages are reclaimed automatically.
+    pub fn prune_old_records(&self, retention_days: u32) -> Result<u64> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut total: u64 = 0;
+        // `datetime(replace(col,'T',' '))` normalizes both RFC3339 (requests) and
+        // plain `datetime('now')` (audit_log etc.) timestamps. window is bound.
+        let by_age = |conn: &rusqlite::Connection, sql: &str| -> Result<u64> {
+            Ok(conn.execute(sql, params![retention_days])? as u64)
+        };
+        total += by_age(&conn, "DELETE FROM requests WHERE datetime(replace(timestamp,'T',' ')) < datetime('now', '-' || ?1 || ' days')")?;
+        total += by_age(&conn, "DELETE FROM audit_log WHERE datetime(replace(timestamp,'T',' ')) < datetime('now', '-' || ?1 || ' days')")?;
+        total += by_age(&conn, "DELETE FROM bw_requests WHERE datetime(replace(timestamp,'T',' ')) < datetime('now', '-' || ?1 || ' days')")?;
+        total += by_age(&conn, "DELETE FROM bw_session_events WHERE datetime(replace(timestamp,'T',' ')) < datetime('now', '-' || ?1 || ' days')")?;
+        total += by_age(&conn, "DELETE FROM temp_rules WHERE datetime(replace(requested_at,'T',' ')) < datetime('now', '-' || ?1 || ' days')")?;
+        // Only prune finished scrub entries — never a pending/in-progress one.
+        total += by_age(&conn, "DELETE FROM bw_scrub_queue WHERE status NOT IN ('pending','in_progress') AND datetime(replace(scrub_at,'T',' ')) < datetime('now', '-' || ?1 || ' days')")?;
+        Ok(total)
+    }
+
+    /// Test-only: backdate a request's timestamp to simulate an old row.
+    #[cfg(test)]
+    fn backdate_request(&self, id: &str, timestamp: &str) {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE requests SET timestamp = ?1 WHERE id = ?2",
+            params![timestamp, id],
+        )
+        .unwrap();
     }
 
     // --- Bitwarden request methods ---
@@ -1410,6 +1467,52 @@ mod tests {
     fn check_rate_limit_under_limit() {
         let (_dir, db) = test_db();
         assert!(db.check_rate_limit("alice", 5, 60, false).unwrap());
+    }
+
+    fn make_request(id: &str, command: &str) -> aisudo_common::SudoRequestRecord {
+        let mut r = aisudo_common::SudoRequestRecord::new(
+            aisudo_common::SudoRequest {
+                user: "alice".to_string(),
+                command: command.to_string(),
+                cwd: "/".to_string(),
+                pid: 1,
+                mode: aisudo_common::RequestMode::Pam,
+                reason: None,
+                stdin: None,
+                skip_nopasswd: true,
+                timeout_seconds: None,
+                dry_run: false,
+            },
+            60,
+        );
+        r.id = id.to_string();
+        r
+    }
+
+    #[test]
+    fn prune_old_records_deletes_old_keeps_recent() {
+        let (_dir, db) = test_db();
+
+        db.insert_request(&make_request("recent", "ls")).unwrap();
+        db.insert_request(&make_request("old", "df")).unwrap();
+        // Age the "old" request well beyond a 1-year retention.
+        db.backdate_request("old", "2020-01-01T00:00:00+00:00");
+
+        let deleted = db.prune_old_records(365).unwrap();
+        assert!(deleted >= 1, "expected at least the old request pruned, got {deleted}");
+
+        assert!(db.get_request("old").unwrap().is_none(), "old request should be pruned");
+        assert!(db.get_request("recent").unwrap().is_some(), "recent request must be kept");
+    }
+
+    #[test]
+    fn prune_old_records_disabled_when_zero() {
+        let (_dir, db) = test_db();
+        db.insert_request(&make_request("old", "df")).unwrap();
+        db.backdate_request("old", "2020-01-01T00:00:00+00:00");
+
+        assert_eq!(db.prune_old_records(0).unwrap(), 0);
+        assert!(db.get_request("old").unwrap().is_some(), "retention=0 keeps everything");
     }
 
     #[test]

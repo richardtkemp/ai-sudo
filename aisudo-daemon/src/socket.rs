@@ -2444,6 +2444,7 @@ mod tests {
             check_binary_ownership: BinaryOwnershipCheck::Off,
             allowed_binary_owners: Vec::new(),
             strip_shell_prefix: false,
+            history_retention_days: 365,
         };
         let handler = tokio::spawn(async move {
             handle_connection(server, db_clone, backend, sudoers, 60, &[], &[], &std::collections::HashMap::new(), limits, None).await
@@ -2615,6 +2616,7 @@ mod tests {
             check_binary_ownership: BinaryOwnershipCheck::Off,
             allowed_binary_owners: Vec::new(),
             strip_shell_prefix: false,
+            history_retention_days: 365,
         }
     }
 

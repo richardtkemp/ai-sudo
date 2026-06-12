@@ -49,6 +49,10 @@ allowlist = [
 # stdin_preview_bytes = 2048
 # Maximum duration for temporary rules (default: 86400 = 24 hours)
 # max_temp_rule_duration_seconds = 86400
+# Delete request/audit/history records older than this many days. The daemon
+# prunes hourly and reclaims disk automatically (auto_vacuum). 0 = keep forever.
+# (default: 365)
+# history_retention_days = 365
 
 [telegram]
 # Create a bot via @BotFather on Telegram and paste the token here.

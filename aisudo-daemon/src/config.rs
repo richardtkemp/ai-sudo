@@ -156,10 +156,20 @@ pub struct LimitsConfig {
     /// Default: false.
     #[serde(default)]
     pub strip_shell_prefix: bool,
+
+    /// Delete audit/history records older than this many days (requests,
+    /// audit_log, bw_requests, bw_session_events, temp_rules, completed scrubs).
+    /// 0 disables pruning (keep forever). Default: 365.
+    #[serde(default = "default_history_retention_days")]
+    pub history_retention_days: u32,
 }
 
 fn default_rate_limit_requests() -> u32 {
     30
+}
+
+fn default_history_retention_days() -> u32 {
+    365
 }
 
 fn default_rate_limit_window_seconds() -> u32 {
@@ -227,6 +237,7 @@ fn default_limits() -> LimitsConfig {
         check_binary_ownership: BinaryOwnershipCheck::Auto,
         allowed_binary_owners: Vec::new(),
         strip_shell_prefix: false,
+        history_retention_days: default_history_retention_days(),
     }
 }
 

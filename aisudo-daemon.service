@@ -8,12 +8,19 @@ ExecStart=/usr/local/bin/aisudo-daemon /etc/aisudo/aisudo.toml
 Restart=on-failure
 RestartSec=5
 
-# Runs as root so it can execute approved commands (exec mode). Process-sandboxing
-# (NoNewPrivileges/ProtectSystem/etc.) is intentionally omitted — it would block the
-# daemon from exec'ing arbitrary approved root commands. UMask tightens the default
-# creation mode so the socket is created 0660 (closing the window before the daemon
-# chmods it) and the DB/journal are not group/world-readable.
+# Runs as root so it can execute approved commands (exec mode). Most process-
+# sandboxing (NoNewPrivileges/ProtectSystem/RestrictAddressFamilies/SystemCallFilter
+# /etc.) is intentionally omitted — those restrictions are inherited by the exec'd
+# children and would break arbitrary approved root commands (e.g. ss/iptables need
+# AF_NETLINK, writes need a writable filesystem). UMask tightens the default creation
+# mode so the socket is created 0660 (closing the window before the daemon chmods it)
+# and the DB/journal are not group/world-readable.
 UMask=0117
+
+# Refuse non-native syscall ABIs (e.g. 32-bit syscalls on a 64-bit host) — a common
+# exploit-portability trick. This is one of the few kernel-sandbox directives that is
+# safe here because no legitimate native command needs a foreign syscall ABI.
+SystemCallArchitectures=native
 
 # The socket is restricted to group "aisudo" for access control
 

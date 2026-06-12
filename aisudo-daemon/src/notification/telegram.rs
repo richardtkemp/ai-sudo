@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex};
 use chrono::Local;
 use tracing::{debug, error, info, warn};
@@ -29,8 +29,11 @@ pub struct TelegramBackend {
     pending: Arc<DashMap<String, oneshot::Sender<Decision>>>,
     update_offset: Arc<Mutex<i64>>,
     request_timeout: Duration,
-    message_map: Arc<DashMap<String, (i64, String)>>,
-    completion_map: Arc<DashMap<String, (i64, String, String)>>,
+    /// request_id -> (telegram message id, original text, inserted-at). The
+    /// Instant lets a periodic sweep drop entries whose request never produced a
+    /// callback/completion (L9 leak).
+    message_map: Arc<DashMap<String, (i64, String, Instant)>>,
+    completion_map: Arc<DashMap<String, (i64, String, String, Instant)>>,
     stdin_preview_bytes: usize,
     poll_timeout_seconds: u32,
     config_holder: Arc<ConfigHolder>,
@@ -111,6 +114,16 @@ impl TelegramBackend {
     pub fn start_polling(self: &Arc<Self>) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            // Resume from the persisted update offset so a restart doesn't replay
+            // ~24h of buffered Telegram updates (L9).
+            if let Some(db) = &this.db {
+                if let Ok(Some(v)) = db.get_daemon_state("telegram_update_offset") {
+                    if let Ok(off) = v.parse::<i64>() {
+                        *this.update_offset.lock().await = off;
+                        info!("Resumed Telegram update offset at {off}");
+                    }
+                }
+            }
             info!("Telegram polling loop started");
             loop {
                 if let Err(e) = this.poll_updates().await {
@@ -225,7 +238,7 @@ impl TelegramBackend {
 
         let main_message_id = result.result.map(|m| m.message_id).unwrap_or(0);
         self.message_map
-            .insert(record.id.clone(), (main_message_id, text));
+            .insert(record.id.clone(), (main_message_id, text, Instant::now()));
         info!(
             "Telegram main message sent: message_id={}, chat_id={}",
             main_message_id, self.chat_id
@@ -302,7 +315,7 @@ impl TelegramBackend {
 
         let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
         let pending_key = format!("rule:{}", record.id);
-        self.message_map.insert(pending_key, (message_id, text));
+        self.message_map.insert(pending_key, (message_id, text, Instant::now()));
         info!("Telegram temp rule message sent: message_id={}", message_id);
 
         Ok(message_id)
@@ -356,7 +369,7 @@ impl TelegramBackend {
 
         let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
         let pending_key = format!("bw:{}", record.id);
-        self.message_map.insert(pending_key, (message_id, text));
+        self.message_map.insert(pending_key, (message_id, text, Instant::now()));
         info!("BW request Telegram message sent: message_id={}", message_id);
 
         Ok(message_id)
@@ -411,7 +424,7 @@ impl TelegramBackend {
 
         let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
         let pending_key = format!("bw_confirm:{}", record.id);
-        self.message_map.insert(pending_key, (message_id, text));
+        self.message_map.insert(pending_key, (message_id, text, Instant::now()));
         info!("BW confirm Telegram message sent: message_id={}", message_id);
 
         Ok(message_id)
@@ -489,7 +502,20 @@ impl TelegramBackend {
         Ok(())
     }
 
+    /// Drop message/completion map entries older than `ttl` — a backstop for
+    /// requests that never produced a callback or completion (L9 leak). The TTL
+    /// is the approval timeout plus an execution margin, so a legitimately-slow
+    /// approval is never swept early.
+    fn sweep_stale_entries(&self, ttl: Duration) {
+        let now = Instant::now();
+        self.message_map.retain(|_, v| now.duration_since(v.2) <= ttl);
+        self.completion_map.retain(|_, v| now.duration_since(v.3) <= ttl);
+    }
+
     async fn poll_updates(&self) -> Result<()> {
+        // Bound the bookkeeping maps every poll cycle.
+        self.sweep_stale_entries(self.request_timeout + Duration::from_secs(600));
+
         let offset = *self.update_offset.lock().await;
 
         let resp = self
@@ -517,6 +543,7 @@ impl TelegramBackend {
         }
 
         if let Some(updates) = result.result {
+            let had_updates = !updates.is_empty();
             for update in updates {
                 // Always advance offset past this update
                 let new_offset = update.update_id + 1;
@@ -533,6 +560,17 @@ impl TelegramBackend {
 
                 if let Some(msg) = update.message {
                     self.handle_message(msg).await;
+                }
+            }
+
+            // Persist the advanced offset so a restart doesn't replay ~24h of
+            // buffered updates (L9). One write per non-empty poll batch.
+            if had_updates {
+                if let Some(db) = &self.db {
+                    let off = *self.update_offset.lock().await;
+                    if let Err(e) = db.set_daemon_state("telegram_update_offset", &off.to_string()) {
+                        warn!("Failed to persist Telegram update offset: {e}");
+                    }
                 }
             }
         }
@@ -651,11 +689,11 @@ impl TelegramBackend {
             Decision::Denied => format!("\u{274c} Denied at {time}"),
             _ => format!("{decision:?} at {time}"),
         };
-        if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
+        if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
             if decision == Decision::Approved {
                 self.completion_map.insert(
                     pending_key.clone(),
-                    (msg_id, original_text.clone(), status_line.clone()),
+                    (msg_id, original_text.clone(), status_line.clone(), Instant::now()),
                 );
             }
             let _ = self
@@ -706,7 +744,7 @@ impl NotificationBackend for TelegramBackend {
 
                 let time = Local::now().format("%H:%M:%S");
                 let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
-                if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
+                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
                     let _ = self
                         .edit_message_status(msg_id, &original_text, &status_line)
                         .await;
@@ -747,7 +785,7 @@ impl NotificationBackend for TelegramBackend {
 
                 let time = Local::now().format("%H:%M:%S");
                 let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
-                if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
+                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
                     let _ = self
                         .edit_message_status(msg_id, &original_text, &status_line)
                         .await;
@@ -788,7 +826,7 @@ impl NotificationBackend for TelegramBackend {
 
                 let time = Local::now().format("%H:%M:%S");
                 let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
-                if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
+                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
                     let _ = self
                         .edit_message_status(msg_id, &original_text, &status_line)
                         .await;
@@ -829,7 +867,7 @@ impl NotificationBackend for TelegramBackend {
 
                 let time = Local::now().format("%H:%M:%S");
                 let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
-                if let Some((_, (msg_id, original_text))) = self.message_map.remove(&pending_key) {
+                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
                     let _ = self
                         .edit_message_status(msg_id, &original_text, &status_line)
                         .await;
@@ -908,7 +946,7 @@ impl NotificationBackend for TelegramBackend {
     }
 
     async fn update_completion_status(&self, info: &CompletionInfo) {
-        if let Some((_, (msg_id, original_text, approved_status))) = self.completion_map.remove(&info.request_id) {
+        if let Some((_, (msg_id, original_text, approved_status, _))) = self.completion_map.remove(&info.request_id) {
             let completion_text = if info.exit_code == 0 {
                 format!("{} \u{2192} Exit 0", approved_status)
             } else {
@@ -1145,6 +1183,32 @@ chat_id = 1
             backend.api_url("sendMessage"),
             "https://api.telegram.org/botTOKEN123/sendMessage"
         );
+    }
+
+    #[test]
+    fn test_sweep_stale_entries() {
+        let backend = TelegramBackend::new("tok".to_string(), 1, 60, 2048, 30, test_config_holder());
+
+        backend.message_map.insert("a".to_string(), (10, "x".to_string(), Instant::now()));
+        backend.completion_map.insert(
+            "b".to_string(),
+            (11, "x".to_string(), "ok".to_string(), Instant::now()),
+        );
+
+        // A zero TTL drops anything inserted before now → both swept.
+        backend.sweep_stale_entries(Duration::from_secs(0));
+        assert!(backend.message_map.is_empty(), "stale message entry should be swept");
+        assert!(backend.completion_map.is_empty(), "stale completion entry should be swept");
+
+        // Fresh entries with a generous TTL are kept.
+        backend.message_map.insert("c".to_string(), (12, "y".to_string(), Instant::now()));
+        backend.completion_map.insert(
+            "d".to_string(),
+            (13, "y".to_string(), "ok".to_string(), Instant::now()),
+        );
+        backend.sweep_stale_entries(Duration::from_secs(3600));
+        assert_eq!(backend.message_map.len(), 1, "fresh message entry must be kept");
+        assert_eq!(backend.completion_map.len(), 1, "fresh completion entry must be kept");
     }
 
     #[test]

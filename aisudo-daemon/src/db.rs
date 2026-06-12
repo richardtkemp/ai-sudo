@@ -172,6 +172,11 @@ impl Database {
                 details TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS daemon_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             -- Indexes for the rate-limit COUNT hot path and the retention prune.
             CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
             CREATE INDEX IF NOT EXISTS idx_requests_user_timestamp ON requests(user, timestamp);
@@ -611,6 +616,31 @@ impl Database {
         // Only prune finished scrub entries — never a pending/in-progress one.
         total += by_age(&conn, "DELETE FROM bw_scrub_queue WHERE status NOT IN ('pending','in_progress') AND datetime(replace(scrub_at,'T',' ')) < datetime('now', '-' || ?1 || ' days')")?;
         Ok(total)
+    }
+
+    /// Get a persisted daemon-state value (e.g. the Telegram update offset).
+    pub fn get_daemon_state(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        match conn.query_row(
+            "SELECT value FROM daemon_state WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist a daemon-state value (upsert).
+    pub fn set_daemon_state(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO daemon_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     /// Test-only: backdate a request's timestamp to simulate an old row.
@@ -1503,6 +1533,26 @@ mod tests {
 
         assert!(db.get_request("old").unwrap().is_none(), "old request should be pruned");
         assert!(db.get_request("recent").unwrap().is_some(), "recent request must be kept");
+    }
+
+    #[test]
+    fn daemon_state_persists_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let db = Database::open(&path).unwrap();
+            assert_eq!(db.get_daemon_state("telegram_update_offset").unwrap(), None);
+            db.set_daemon_state("telegram_update_offset", "42").unwrap();
+            // Upsert overwrites.
+            db.set_daemon_state("telegram_update_offset", "99").unwrap();
+        }
+        // Reopen at the same path (simulating a daemon restart).
+        let db2 = Database::open(&path).unwrap();
+        assert_eq!(
+            db2.get_daemon_state("telegram_update_offset").unwrap().as_deref(),
+            Some("99")
+        );
+        assert_eq!(db2.get_daemon_state("missing").unwrap(), None);
     }
 
     #[test]

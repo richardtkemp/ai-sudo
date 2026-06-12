@@ -203,6 +203,7 @@ If you're using [OpenClaw](https://github.com/openclaw/openclaw), add this to yo
 - All requests and decisions are logged to SQLite for audit
 - Telegram notifications are not E2E encrypted — suitable for personal servers, not high-security environments
 - Rate limiting prevents abuse (10 requests/minute/user)
+- **Single root process (no privilege separation):** splitting into an unprivileged front-end + a minimal root executor was evaluated and judged not worth the complexity here. The front-end *is* the approval authority, so compromising it already lets an attacker authorize arbitrary root execution regardless of any split — privsep would only shrink the blast radius of memory-safety/dependency bugs, a modest gain in a Rust codebase for this personal-server threat model.
 
 ## Bitwarden Web Unlock (optional)
 

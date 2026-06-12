@@ -56,26 +56,19 @@ if [[ -n "$WORLD_WRITABLE" ]]; then
     exit 1
 fi
 
-# ── Rust toolchain discovery (build user's toolchain) ────────────────
+# ── Build (as the unprivileged invoking user) ────────────────────────
+# Run through the user's LOGIN shell (`bash -lc`) so we use whatever cargo/rustup
+# setup they actually have (system rustup in /usr/bin, ~/.cargo/bin, a custom
+# CARGO_HOME in their profile, etc.) rather than guessing install paths.
 
-RUSTUP_HOME="${RUSTUP_HOME:-$USER_HOME/.rustup}"
-CARGO_HOME="${CARGO_HOME:-$USER_HOME/.cargo}"
-
-if [[ ! -x "$CARGO_HOME/bin/cargo" ]] && ! sudo -u "$BUILD_USER" command -v cargo &>/dev/null; then
-    error "Rust toolchain not found for $BUILD_USER."
+if ! sudo -u "$BUILD_USER" bash -lc 'command -v cargo' &>/dev/null; then
+    error "Rust toolchain ('cargo') not found in ${BUILD_USER}'s login PATH."
     error "Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
     exit 1
 fi
 
-# ── Build (as the unprivileged invoking user) ────────────────────────
-
 info "Building ai-sudo (release) as $BUILD_USER..."
-sudo -u "$BUILD_USER" env \
-    HOME="$USER_HOME" \
-    RUSTUP_HOME="$RUSTUP_HOME" \
-    CARGO_HOME="$CARGO_HOME" \
-    PATH="$CARGO_HOME/bin:/usr/local/bin:/usr/bin:/bin" \
-    bash -c "cd '$SCRIPT_DIR' && cargo build --release --locked" 2>&1 | tail -8
+sudo -u "$BUILD_USER" bash -lc "cd '$SCRIPT_DIR' && cargo build --release --locked" 2>&1 | tail -8
 
 DAEMON_BIN="$SCRIPT_DIR/target/release/aisudo-daemon"
 CLI_BIN="$SCRIPT_DIR/target/release/aisudo"

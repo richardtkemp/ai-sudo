@@ -965,17 +965,53 @@ fn render_template(template: &str, record: &SudoRequestRecord, stdin_preview_byt
         None => String::new(),
     };
 
-    template
-        .replace("{{user}}", &escape_html(&record.user))
-        .replace("{{command}}", &escape_html(&record.command))
-        .replace("{{directory}}", &escape_html(&record.cwd))
-        .replace("{{hostname}}", &escape_html(&hostname))
-        .replace("{{timestamp}}", &escape_html(&timestamp))
-        .replace("{{reason}}", &reason_val)
-        .replace("{{pid}}", &record.pid.to_string())
-        .replace("{{request_id}}", &escape_html(&record.id))
-        .replace("{{timeout}}", &record.timeout_seconds.to_string())
-        .replace("{{stdin}}", &stdin_val)
+    // Single-pass substitution: each {{key}} is replaced once with its value and
+    // substituted values are NEVER re-scanned. This prevents a placeholder
+    // embedded in an attacker-controlled value (command/cwd/reason/stdin) from
+    // being expanded by a later pass (M5). Unknown keys are left literal.
+    let lookup = |key: &str| -> Option<String> {
+        Some(match key {
+            "user" => escape_html(&record.user),
+            "command" => escape_html(&record.command),
+            "directory" => escape_html(&record.cwd),
+            "hostname" => escape_html(&hostname),
+            "timestamp" => escape_html(&timestamp),
+            "reason" => reason_val.clone(),
+            "pid" => record.pid.to_string(),
+            "request_id" => escape_html(&record.id),
+            "timeout" => record.timeout_seconds.to_string(),
+            "stdin" => stdin_val.clone(),
+            _ => return None,
+        })
+    };
+
+    let mut out = String::with_capacity(template.len() + 64);
+    let mut rest = template;
+    while let Some(i) = rest.find("{{") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        match after.find("}}") {
+            Some(j) => {
+                let key = &after[..j];
+                match lookup(key) {
+                    Some(v) => out.push_str(&v),
+                    None => {
+                        out.push_str("{{");
+                        out.push_str(key);
+                        out.push_str("}}");
+                    }
+                }
+                rest = &after[j + 2..];
+            }
+            None => {
+                // No closing braces — emit the remainder verbatim.
+                out.push_str("{{");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Format a base64-encoded stdin payload for display in a Telegram message.
@@ -1216,6 +1252,42 @@ chat_id = 1
         assert!(!result.contains("{{hostname}}"));
         assert!(!result.contains("{{timestamp}}"));
         assert!(result.contains("deploying web server"));
+    }
+
+    #[test]
+    fn test_render_template_no_placeholder_injection_via_command() {
+        // M5: a placeholder embedded in an attacker-controlled value (here the
+        // command) must NOT be expanded by a later substitution pass.
+        let mut record = make_test_record();
+        record.command = "x {{stdin}}".to_string();
+        record.stdin = Some(base64::engine::general_purpose::STANDARD.encode("SECRET"));
+
+        let result = render_template("{{command}}", &record, 2048);
+
+        // The injected {{stdin}} stays literal; no Stdin block is forged.
+        assert!(result.contains("{{stdin}}"), "injected placeholder should remain literal: {result}");
+        assert!(!result.contains("<b>Stdin:</b>"), "command must not forge a Stdin section: {result}");
+        assert!(!result.contains("SECRET"), "attacker stdin must not appear via command injection: {result}");
+    }
+
+    #[test]
+    fn test_render_template_no_reason_injection_via_command() {
+        // Same class via {{reason}}: a command containing {{reason}} must not
+        // expand into the trusted "Reason:" block.
+        let mut record = make_test_record();
+        record.command = "y {{reason}}".to_string();
+        record.reason = Some("attacker reason".to_string());
+
+        let result = render_template("{{command}}", &record, 2048);
+        assert!(result.contains("{{reason}}"));
+        assert!(!result.contains("<b>Reason:</b>"), "command must not forge a Reason section: {result}");
+    }
+
+    #[test]
+    fn test_render_template_unknown_placeholder_left_literal() {
+        let record = make_test_record();
+        let result = render_template("a {{nope}} b {{command}}", &record, 2048);
+        assert_eq!(result, "a {{nope}} b apt install nginx");
     }
 
     #[test]

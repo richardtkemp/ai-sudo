@@ -1,0 +1,10 @@
+# Build configuration for aisudo-cli
+# This file is not committed to git - copy and customize locally
+#
+# binary_name: Override the binary name shown in help messages
+# Default: "aisudo"
+#
+# Example to build with name "sudo":
+# binary_name = "sudo"
+
+binary_name = "aisudo"

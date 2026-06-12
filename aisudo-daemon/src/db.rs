@@ -201,6 +201,68 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically check the rate limit and, if under it, insert the request.
+    /// Returns Ok(true) if recorded, Ok(false) if rate-limited (not recorded).
+    ///
+    /// The count and the insert happen under a SINGLE hold of the connection
+    /// mutex, so concurrent connections can't all observe a sub-limit count and
+    /// then all insert past it (M2 TOCTOU). `window_seconds` is bound, not
+    /// interpolated, into the SQL (L8).
+    pub fn try_insert_request_rate_limited(
+        &self,
+        record: &SudoRequestRecord,
+        max_requests: u32,
+        window_seconds: u32,
+        global: bool,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: u32 = if global {
+            conn.query_row(
+                "SELECT COUNT(*) FROM requests
+                 WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?1 || ' seconds')",
+                params![window_seconds],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM requests
+                 WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?2 || ' seconds')",
+                params![record.user, window_seconds],
+                |row| row.get(0),
+            )?
+        };
+        if count >= max_requests {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO requests (id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, stdin_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.id,
+                record.user,
+                record.command,
+                record.cwd,
+                record.pid,
+                record.timestamp.to_rfc3339(),
+                record.status.as_str(),
+                record.timeout_seconds,
+                record.nonce,
+                record.stdin_bytes.map(|n| n as i64),
+            ],
+        )?;
+        drop(conn); // release before audit_log (which also locks)
+        let stdin_info = match record.stdin_bytes {
+            Some(n) => format!(" stdin_bytes={n}"),
+            None => String::new(),
+        };
+        self.audit_log(
+            &record.id,
+            "request_created",
+            &format!("user={} command={}{}", record.user, record.command, stdin_info),
+        )?;
+        Ok(true)
+    }
+
     pub fn update_decision(
         &self,
         request_id: &str,
@@ -528,6 +590,42 @@ impl Database {
             &format!("user={user} item={item_name} field={field}"),
         )?;
         Ok(())
+    }
+
+    /// Atomically check the BW per-minute rate limit and, if under it, insert the
+    /// request — count and insert under one lock hold (M2 TOCTOU). Returns
+    /// Ok(true) if recorded, Ok(false) if rate-limited.
+    pub fn try_insert_bw_request_rate_limited(
+        &self,
+        id: &str,
+        user: &str,
+        item_name: &str,
+        field: &str,
+        nonce: &str,
+        max_per_minute: u32,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM bw_requests
+             WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 minute')",
+            params![user],
+            |row| row.get(0),
+        )?;
+        if count >= max_per_minute {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO bw_requests (id, user, item_name, field, nonce)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, user, item_name, field, nonce],
+        )?;
+        drop(conn);
+        self.audit_log(
+            id,
+            "bw_request_created",
+            &format!("user={user} item={item_name} field={field}"),
+        )?;
+        Ok(true)
     }
 
     pub fn update_bw_request_status(
@@ -1317,6 +1415,123 @@ mod tests {
     fn check_rate_limit_under_limit() {
         let (_dir, db) = test_db();
         assert!(db.check_rate_limit("alice", 5, 60, false).unwrap());
+    }
+
+    #[test]
+    fn try_insert_request_rate_limited_is_atomic_under_concurrency() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::open(&dir.path().join("test.db")).unwrap());
+        let limit = 5u32;
+        let threads = 50;
+
+        // Barrier so all threads reach the call together, maximizing contention.
+        let barrier = Arc::new(Barrier::new(threads));
+        let admitted = Arc::new(AtomicU32::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..threads {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let admitted = Arc::clone(&admitted);
+            handles.push(std::thread::spawn(move || {
+                let req = aisudo_common::SudoRequest {
+                    user: "alice".to_string(),
+                    command: "x".to_string(),
+                    cwd: "/".to_string(),
+                    pid: 1,
+                    mode: aisudo_common::RequestMode::Pam,
+                    reason: None,
+                    stdin: None,
+                    skip_nopasswd: true,
+                    timeout_seconds: None,
+                    dry_run: false,
+                };
+                let record = aisudo_common::SudoRequestRecord::new(req, 60);
+                barrier.wait();
+                // Large window so only concurrency (not time) decides the count.
+                if db
+                    .try_insert_request_rate_limited(&record, limit, 3600, false)
+                    .unwrap()
+                {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly `limit` requests must be admitted, regardless of how many
+        // connections raced — and exactly `limit` rows recorded.
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            limit,
+            "more than the limit slipped past the rate limiter (TOCTOU)"
+        );
+        assert!(!db.check_rate_limit("alice", limit, 3600, false).unwrap());
+    }
+
+    #[test]
+    fn naive_check_then_insert_overadmits_under_concurrency() {
+        // Demonstrates WHY try_insert_request_rate_limited exists: doing the rate
+        // check and the insert as two separate steps (the old pattern) lets every
+        // racing connection pass. A barrier between the steps makes the race
+        // deterministic — all threads read count=0, then all insert.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::open(&dir.path().join("test.db")).unwrap());
+        let limit = 5u32;
+        let threads = 20;
+
+        let check_barrier = Arc::new(Barrier::new(threads));
+        let admitted = Arc::new(AtomicU32::new(0));
+        let mut handles = Vec::new();
+
+        for i in 0..threads {
+            let db = Arc::clone(&db);
+            let check_barrier = Arc::clone(&check_barrier);
+            let admitted = Arc::clone(&admitted);
+            handles.push(std::thread::spawn(move || {
+                // Step 1: everyone checks (all see 0 < limit).
+                let under = db.check_rate_limit("alice", limit, 3600, false).unwrap();
+                // Force all checks to complete before any insert.
+                check_barrier.wait();
+                // Step 2: everyone who passed inserts.
+                if under {
+                    let req = aisudo_common::SudoRequest {
+                        user: "alice".to_string(),
+                        command: format!("cmd-{i}"),
+                        cwd: "/".to_string(),
+                        pid: i as u32,
+                        mode: aisudo_common::RequestMode::Pam,
+                        reason: None,
+                        stdin: None,
+                        skip_nopasswd: true,
+                        timeout_seconds: None,
+                        dry_run: false,
+                    };
+                    let record = aisudo_common::SudoRequestRecord::new(req, 60);
+                    db.insert_request(&record).unwrap();
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The naive two-step pattern admits far more than the limit — this is the
+        // bug the atomic method fixes.
+        assert!(
+            admitted.load(Ordering::SeqCst) > limit,
+            "expected the naive pattern to over-admit (got {})",
+            admitted.load(Ordering::SeqCst)
+        );
     }
 
     #[test]

@@ -895,10 +895,42 @@ async fn handle_sudo_request(
         }
     }
 
-    // Rate limiting with configurable settings
+    // Rate limiting with configurable settings.
     let global_rate_limit = limits.rate_limit_mode == RateLimitMode::Global;
-    if !db.check_rate_limit(
-        &request.user,
+
+    // Create request record - use request-specific timeout if provided
+    let record = SudoRequestRecord::new(request.clone(), effective_timeout);
+
+    // Dry-run: report whether it would require approval (or be rate-limited)
+    // without inserting or notifying. The check is read-only here — nothing is
+    // recorded or executed, so its TOCTOU is harmless.
+    if dry_run {
+        let under_limit = db.check_rate_limit(
+            &request.user,
+            limits.rate_limit_requests,
+            limits.rate_limit_window_seconds,
+            global_rate_limit,
+        )?;
+        let response = SudoResponse {
+            request_id: String::new(),
+            decision: Decision::Denied,
+            error: Some(if under_limit {
+                "dry-run: would require approval".to_string()
+            } else {
+                "rate limit exceeded".to_string()
+            }),
+        };
+        let resp_json = serde_json::to_string(&response)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    // Real path: atomically check the rate limit AND record the request under one
+    // lock, so concurrent connections can't all slip past the limit (M2 TOCTOU).
+    if !db.try_insert_request_rate_limited(
+        &record,
         limits.rate_limit_requests,
         limits.rate_limit_window_seconds,
         global_rate_limit,
@@ -919,26 +951,6 @@ async fn handle_sudo_request(
         writer.flush().await?;
         return Ok(());
     }
-
-    // Create request record - use request-specific timeout if provided
-    let record = SudoRequestRecord::new(request.clone(), effective_timeout);
-    
-    // For dry-run mode, we don't insert into DB or send notifications
-    // We just return that it would require approval
-    if dry_run {
-        let response = SudoResponse {
-            request_id: String::new(),
-            decision: Decision::Denied,
-            error: Some("dry-run: would require approval".to_string()),
-        };
-        let resp_json = serde_json::to_string(&response)?;
-        writer.write_all(resp_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
-        return Ok(());
-    }
-    
-    db.insert_request(&record)?;
 
     // Send notification and wait for response
     let (decision, error_msg) = match backend.send_and_wait(&record).await {
@@ -1238,8 +1250,18 @@ async fn handle_bw_get(
         return Ok(());
     }
 
-    // Rate limit check
-    if !db.check_bw_rate_limit(&request.user, bw_ctx.max_rpm)? {
+    // Create request record with an atomic rate-limit check + insert (M2 TOCTOU):
+    // concurrent connections can't all pass a separate check before any insert.
+    let id = uuid::Uuid::new_v4().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    if !db.try_insert_bw_request_rate_limited(
+        &id,
+        &request.user,
+        &request.item_name,
+        &request.field,
+        &nonce,
+        bw_ctx.max_rpm,
+    )? {
         let resp = BwGetResponse {
             request_id: String::new(),
             decision: Decision::Denied,
@@ -1254,11 +1276,6 @@ async fn handle_bw_get(
         writer.flush().await?;
         return Ok(());
     }
-
-    // Create request record
-    let id = uuid::Uuid::new_v4().to_string();
-    let nonce = uuid::Uuid::new_v4().to_string();
-    db.insert_bw_request(&id, &request.user, &request.item_name, &request.field, &nonce)?;
 
     // Phase 1: Get approval (different paths for locked vs unlocked vault)
     let session_active = bw_ctx.session.is_session_active().await;

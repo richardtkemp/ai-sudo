@@ -1438,9 +1438,11 @@ async fn handle_bw_get(
         }
     }
 
-    // Extract field (M4)
+    // Extract field. Held in Zeroizing so the daemon's local copy is wiped on
+    // drop (M7). The value is still serialized to the requesting client and queued
+    // for the scrub (those copies are bounded by the scrubber, see C1).
     let field_value = match BwSessionManager::extract_field(&item_json, &request.field) {
-        Ok(v) => v,
+        Ok(v) => zeroize::Zeroizing::new(v),
         Err(e) => {
             error!("Field extraction failed for BW request {id}: {e:#}");
             let resp = BwGetResponse {
@@ -1468,7 +1470,7 @@ async fn handle_bw_get(
     let resp = BwGetResponse {
         request_id: id.clone(),
         decision: Decision::Approved,
-        value: Some(field_value.clone()),
+        value: Some(field_value.to_string()),
         error: None,
         resolved_item_name: Some(resolved_name.clone()),
         awaiting_confirmation: false,

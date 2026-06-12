@@ -368,6 +368,10 @@ async fn unlock_submit(
     };
 
     let req_id = clean_request_id(form.request_id.as_deref());
+    // M7: take ownership of the password into a Zeroizing wrapper so this copy is
+    // wiped on drop rather than left on the heap. (The raw request-body buffer
+    // axum decoded is a separate transient we don't control here.)
+    let password = zeroize::Zeroizing::new(form.password);
 
     // M3: per-session attempt window — never a shared/global bucket, and it
     // recovers after the window rather than locking out permanently.
@@ -400,7 +404,7 @@ async fn unlock_submit(
         }
     }
 
-    match state.bw_session.unlock(&form.password).await {
+    match state.bw_session.unlock(&password).await {
         Ok(()) => {
             info!("Vault unlocked via web UI");
             state.db.log_bw_session_event("unlock", "via web_ui").ok();

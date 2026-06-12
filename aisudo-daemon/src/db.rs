@@ -332,6 +332,21 @@ impl Database {
         nonce: &str,
         reason: Option<&str>,
     ) -> Result<()> {
+        // Defense-in-depth hard ceiling on rule lifetime, independent of the
+        // handler's config-driven clamp. If exceeded, clamp the duration and
+        // re-derive expires_at from requested_at so the two stay consistent.
+        const MAX_TEMP_RULE_SECONDS: u32 = 30 * 24 * 3600; // 30 days
+        let (duration_seconds, expires_at) = if duration_seconds > MAX_TEMP_RULE_SECONDS {
+            let expires = parse_datetime(requested_at)
+                .map(|t| {
+                    (t + chrono::Duration::seconds(MAX_TEMP_RULE_SECONDS as i64)).to_rfc3339()
+                })
+                .unwrap_or_else(|| expires_at.to_string());
+            (MAX_TEMP_RULE_SECONDS, expires)
+        } else {
+            (duration_seconds, expires_at.to_string())
+        };
+
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO temp_rules (id, user, patterns, duration_seconds, requested_at, expires_at, nonce, reason)
@@ -929,6 +944,45 @@ mod tests {
         assert_eq!(rule.user, "alice");
         assert_eq!(rule.status, "pending");
         assert_eq!(rule.reason.as_deref(), Some("need deps"));
+    }
+
+    #[test]
+    fn insert_temp_rule_clamps_excessive_duration() {
+        // Defense-in-depth: the storage layer hard-caps the rule lifetime even if
+        // the handler's config clamp is bypassed/buggy, and re-derives expires_at.
+        let (_dir, db) = test_db();
+        let now = chrono::Utc::now();
+        let far_future = (now + chrono::Duration::days(365 * 50)).to_rfc3339();
+        let patterns = serde_json::to_string(&vec!["apt list"]).unwrap();
+
+        db.insert_temp_rule(
+            "rule-huge",
+            "alice",
+            &patterns,
+            u32::MAX, // ~136 years requested
+            &now.to_rfc3339(),
+            &far_future,
+            "nonce-h",
+            None,
+        )
+        .unwrap();
+
+        let rule = db.get_temp_rule("rule-huge").unwrap().unwrap();
+        let cap = 30 * 24 * 3600;
+        assert!(
+            rule.duration_seconds <= cap,
+            "duration not clamped: {}",
+            rule.duration_seconds
+        );
+        // expires_at must be re-derived to within the cap, not 50 years out.
+        let expires = chrono::DateTime::parse_from_rfc3339(&rule.expires_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(
+            expires <= now + chrono::Duration::days(31),
+            "expires_at not re-derived: {}",
+            rule.expires_at
+        );
     }
 
     #[test]

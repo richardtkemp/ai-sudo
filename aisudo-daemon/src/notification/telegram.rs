@@ -993,9 +993,16 @@ fn format_stdin_preview(stdin_b64: &str, max_preview_bytes: usize) -> String {
     if text.len() <= max_preview_bytes {
         text.to_string()
     } else {
+        // Truncate at the largest char boundary <= max_preview_bytes so we never
+        // slice through a multibyte character (attacker-controlled stdin could
+        // otherwise straddle the boundary and panic).
+        let mut end = max_preview_bytes.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
         format!(
             "{}... ({} bytes total, truncated)",
-            &text[..max_preview_bytes],
+            &text[..end],
             decoded.len()
         )
     }
@@ -1147,6 +1154,18 @@ chat_id = 1
         let b64 = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
         let preview = format_stdin_preview(&b64, 2048);
         assert!(preview.contains("truncated"));
+    }
+
+    #[test]
+    fn test_format_stdin_preview_multibyte_boundary_no_panic() {
+        // The truncation point falls in the middle of a 2-byte char (é = 0xC3 0xA9).
+        // Slicing at a non-char-boundary byte must not panic.
+        let data = format!("{}{}", "a".repeat(3), "é"); // 5 bytes; é occupies bytes [3,4]
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
+        let preview = format_stdin_preview(&b64, 4); // byte 4 is mid-é
+        assert!(preview.contains("truncated"));
+        // Truncated to the largest char boundary <= 4, i.e. "aaa".
+        assert!(preview.starts_with("aaa"), "unexpected preview: {preview}");
     }
 
     #[test]

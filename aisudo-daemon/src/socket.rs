@@ -528,6 +528,27 @@ async fn handle_connection(
         .map(|cred| cred.uid());
 
     let (reader, mut writer) = stream.into_split();
+
+    // L1: refuse the connection if kernel peer credentials are unavailable. We
+    // must never fall back to trusting the client-supplied `user` field — that
+    // would allow identity spoofing for rate limits, temp rules, and NOPASSWD.
+    let peer_uid = match peer_uid {
+        Some(uid) => uid,
+        None => {
+            warn!("Rejecting connection: SO_PEERCRED unavailable (no peer credentials)");
+            let response = SudoResponse {
+                request_id: String::new(),
+                decision: Decision::Denied,
+                error: Some("authentication failed".to_string()),
+            };
+            if let Ok(resp_json) = serde_json::to_string(&response) {
+                let _ = writer.write_all(resp_json.as_bytes()).await;
+                let _ = writer.write_all(b"\n").await;
+            }
+            return Ok(());
+        }
+    };
+
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
     buf_reader.read_line(&mut line).await?;
@@ -636,22 +657,19 @@ async fn handle_connection(
     result
 }
 
-/// Override the user field with the real username from peer credentials.
-/// If peer credentials are available, the client-supplied value is replaced;
-/// if the UID cannot be resolved, we use the numeric UID as a string.
-/// This prevents identity spoofing via $USER environment variable.
-fn override_user_from_peer(user: &mut String, peer_uid: Option<u32>) {
-    if let Some(uid) = peer_uid {
-        let real_user = resolve_username(uid)
-            .unwrap_or_else(|| format!("uid:{uid}"));
-        if *user != real_user {
-            warn!(
-                "Peer credential mismatch: client claimed user='{}', actual uid={} ('{}')",
-                user, uid, real_user
-            );
-        }
-        *user = real_user;
+/// Override the user field with the real username from the kernel-provided peer
+/// UID (always present — the connection is rejected earlier if SO_PEERCRED is
+/// unavailable). If the UID can't be resolved to a name, we use the numeric UID.
+/// This prevents identity spoofing via the client-supplied `user` field.
+fn override_user_from_peer(user: &mut String, peer_uid: u32) {
+    let real_user = resolve_username(peer_uid).unwrap_or_else(|| format!("uid:{peer_uid}"));
+    if *user != real_user {
+        warn!(
+            "Peer credential mismatch: client claimed user='{}', actual uid={} ('{}')",
+            user, peer_uid, real_user
+        );
     }
+    *user = real_user;
 }
 
 async fn handle_sudo_request(

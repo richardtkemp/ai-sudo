@@ -88,7 +88,7 @@ impl Database {
     }
 
     fn init_tables(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS requests (
@@ -168,7 +168,7 @@ impl Database {
     }
 
     pub fn insert_request(&self, record: &SudoRequestRecord) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO requests (id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, stdin_bytes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -215,7 +215,7 @@ impl Database {
         window_seconds: u32,
         global: bool,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let count: u32 = if global {
             conn.query_row(
                 "SELECT COUNT(*) FROM requests
@@ -269,7 +269,7 @@ impl Database {
         decision: Decision,
         decided_by: &str,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let changed = conn.execute(
             "UPDATE requests SET status = ?1, decided_at = datetime('now'), decided_by = ?2
              WHERE id = ?3 AND status = 'pending'",
@@ -287,7 +287,7 @@ impl Database {
     }
 
     pub fn get_request(&self, request_id: &str) -> Result<Option<SudoRequestRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, decided_at, decided_by, stdin_bytes
              FROM requests WHERE id = ?1",
@@ -320,7 +320,7 @@ impl Database {
     }
 
     pub fn get_pending_requests(&self) -> Result<Vec<SudoRequestRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, decided_at, decided_by, stdin_bytes
              FROM requests WHERE status = 'pending' ORDER BY timestamp ASC",
@@ -355,7 +355,7 @@ impl Database {
     }
 
     pub fn expire_timed_out_requests(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id FROM requests
              WHERE status = 'pending'
@@ -409,7 +409,7 @@ impl Database {
             (duration_seconds, expires_at.to_string())
         };
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO temp_rules (id, user, patterns, duration_seconds, requested_at, expires_at, nonce, reason)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -430,7 +430,7 @@ impl Database {
         decision: Decision,
         decided_by: &str,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let changed = conn.execute(
             "UPDATE temp_rules SET status = ?1, decided_at = datetime('now'), decided_by = ?2
              WHERE id = ?3 AND status = 'pending'",
@@ -448,7 +448,7 @@ impl Database {
     }
 
     pub fn get_temp_rule(&self, id: &str) -> Result<Option<TempRuleRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, user, patterns, duration_seconds, requested_at, expires_at, status, nonce, decided_at, decided_by, reason
              FROM temp_rules WHERE id = ?1",
@@ -474,7 +474,7 @@ impl Database {
     }
 
     pub fn get_active_temp_rules(&self, user: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT patterns FROM temp_rules
              WHERE user = ?1 AND status = 'approved'
@@ -489,7 +489,7 @@ impl Database {
 
     /// Get active temp rules with their patterns and expiry time (for --list-rules).
     pub fn get_active_temp_rules_detailed(&self, user: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT patterns, expires_at FROM temp_rules
              WHERE user = ?1 AND status = 'approved'
@@ -503,7 +503,7 @@ impl Database {
     }
 
     pub fn get_all_temp_rules(&self) -> Result<Vec<TempRuleRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, user, patterns, duration_seconds, requested_at, expires_at, status, nonce, decided_at, decided_by, reason
              FROM temp_rules ORDER BY requested_at DESC",
@@ -530,7 +530,7 @@ impl Database {
     }
 
     pub fn expire_temp_rules(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id FROM temp_rules
              WHERE status = 'approved'
@@ -559,7 +559,7 @@ impl Database {
     }
 
     fn audit_log(&self, request_id: &str, event: &str, details: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO audit_log (request_id, event, details) VALUES (?1, ?2, ?3)",
             params![request_id, event, details],
@@ -577,7 +577,7 @@ impl Database {
         field: &str,
         nonce: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO bw_requests (id, user, item_name, field, nonce)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -604,7 +604,7 @@ impl Database {
         nonce: &str,
         max_per_minute: u32,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM bw_requests
              WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 minute')",
@@ -634,7 +634,7 @@ impl Database {
         status: &str,
         decided_by: &str,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let changed = conn.execute(
             "UPDATE bw_requests SET status = ?1, decided_at = datetime('now'), decided_by = ?2
              WHERE id = ?3",
@@ -652,7 +652,7 @@ impl Database {
     }
 
     pub fn set_bw_resolved_name(&self, id: &str, resolved_name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE bw_requests SET resolved_item_name = ?1 WHERE id = ?2",
             params![resolved_name, id],
@@ -661,7 +661,7 @@ impl Database {
     }
 
     pub fn set_bw_credential_hash(&self, id: &str, credential_hash: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE bw_requests SET credential_hash = ?1 WHERE id = ?2",
             params![credential_hash, id],
@@ -670,7 +670,7 @@ impl Database {
     }
 
     pub fn get_bw_request(&self, id: &str) -> Result<Option<BwRequestRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, user, item_name, field, timestamp, status, decided_at, decided_by, nonce, resolved_item_name, credential_hash
              FROM bw_requests WHERE id = ?1",
@@ -697,7 +697,7 @@ impl Database {
 
     /// Get all pending BW requests (for the web dashboard).
     pub fn get_pending_bw_requests(&self) -> Result<Vec<BwRequestRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, user, item_name, field, timestamp, status, decided_at, decided_by, nonce, resolved_item_name, credential_hash
              FROM bw_requests WHERE status = 'pending' ORDER BY timestamp ASC",
@@ -726,7 +726,7 @@ impl Database {
 
     /// Get recently decided BW requests (for the web dashboard history).
     pub fn get_recent_bw_requests(&self, limit: u32) -> Result<Vec<BwRequestRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, user, item_name, field, timestamp, status, decided_at, decided_by, nonce, resolved_item_name, credential_hash
              FROM bw_requests WHERE status != 'pending' ORDER BY timestamp DESC LIMIT ?1",
@@ -765,7 +765,7 @@ impl Database {
         session_files: &[String],
     ) -> Result<()> {
         let files_json = serde_json::to_string(session_files)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO bw_scrub_queue (id, request_id, credential_hash, credential_value, scrub_at, session_files)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -786,7 +786,7 @@ impl Database {
     /// Test-only: read the raw retained credential_value for a scrub entry.
     #[cfg(test)]
     fn scrub_value(&self, id: &str) -> Option<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT credential_value FROM bw_scrub_queue WHERE id = ?1",
             params![id],
@@ -796,7 +796,7 @@ impl Database {
     }
 
     pub fn get_pending_scrubs(&self) -> Result<Vec<ScrubQueueEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, request_id, credential_hash, credential_value, scrub_at, session_files, status, completed_at, retry_count
              FROM bw_scrub_queue WHERE status IN ('pending', 'in_progress') ORDER BY scrub_at ASC",
@@ -824,7 +824,7 @@ impl Database {
     }
 
     pub fn update_scrub_status(&self, id: &str, status: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE bw_scrub_queue SET status = ?1 WHERE id = ?2",
             params![status, id],
@@ -833,7 +833,7 @@ impl Database {
     }
 
     pub fn complete_scrub(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // Clear the retained plaintext credential once scrubbing succeeds — it is
         // only kept so the scrubber can locate the secret in the session logs.
         conn.execute(
@@ -847,7 +847,7 @@ impl Database {
     /// un-redacted, but we still drop the retained plaintext — keeping it is the
     /// larger risk.
     pub fn fail_scrub(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE bw_scrub_queue SET status = 'failed', completed_at = datetime('now'), credential_value = '' WHERE id = ?1",
             params![id],
@@ -856,7 +856,7 @@ impl Database {
     }
 
     pub fn defer_scrub(&self, id: &str, delay_secs: u32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE bw_scrub_queue SET status = 'pending', scrub_at = datetime('now', '+' || ?1 || ' seconds'), retry_count = retry_count + 1 WHERE id = ?2",
             params![delay_secs, id],
@@ -867,7 +867,7 @@ impl Database {
     /// Extend scrub timer for existing entry with matching credential_hash.
     /// Returns true if an existing entry was extended.
     pub fn extend_scrub_timer(&self, credential_hash: &str, new_scrub_at: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let changed = conn.execute(
             "UPDATE bw_scrub_queue SET scrub_at = ?1 WHERE credential_hash = ?2 AND status IN ('pending', 'in_progress')",
             params![new_scrub_at, credential_hash],
@@ -878,7 +878,7 @@ impl Database {
     // --- Session event logging ---
 
     pub fn log_bw_session_event(&self, event: &str, details: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO bw_session_events (event, details) VALUES (?1, ?2)",
             params![event, details],
@@ -888,7 +888,7 @@ impl Database {
 
     /// Rate limit check for BW requests (separate from sudo rate limit).
     pub fn check_bw_rate_limit(&self, user: &str, max_per_minute: u32) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM bw_requests
              WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 minute')",
@@ -911,25 +911,20 @@ impl Database {
         window_seconds: u32,
         global: bool,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // window_seconds is bound, not interpolated, into the SQL (L8).
         let count: u32 = if global {
             conn.query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM requests
-                     WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-{} seconds')",
-                    window_seconds
-                ),
-                [],
+                "SELECT COUNT(*) FROM requests
+                 WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?1 || ' seconds')",
+                params![window_seconds],
                 |row| row.get(0),
             )?
         } else {
             conn.query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM requests
-                     WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-{} seconds')",
-                    window_seconds
-                ),
-                params![user],
+                "SELECT COUNT(*) FROM requests
+                 WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?2 || ' seconds')",
+                params![user, window_seconds],
                 |row| row.get(0),
             )?
         };
@@ -943,7 +938,7 @@ impl Database {
 
     /// Get the number of pending approval requests.
     pub fn get_pending_count(&self) -> Result<u32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM requests WHERE status = 'pending'",
             [],
@@ -954,7 +949,7 @@ impl Database {
 
     /// Get the number of requests in the last hour.
     pub fn get_requests_last_hour(&self) -> Result<u32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM requests WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 hour')",
             [],
@@ -965,7 +960,7 @@ impl Database {
 
     /// Get the approval rate in the last hour (0.0 - 1.0).
     pub fn get_approval_rate_last_hour(&self) -> Result<f64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let total: u32 = conn.query_row(
             "SELECT COUNT(*) FROM requests WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 hour')",
             [],
@@ -984,7 +979,7 @@ impl Database {
 
     /// Get recent request history for a user.
     pub fn get_history(&self, user: &str, limit: u32) -> Result<Vec<HistoryEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, command, timestamp, status, decided_by FROM requests
              WHERE user = ?1

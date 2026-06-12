@@ -27,7 +27,10 @@ timeout_seconds = 60
 hot_reload = false
 
 # Commands that are auto-approved without notification.
-# Matching is prefix-based: "apt list" matches "apt list --installed".
+# Matching is prefix-based at a whitespace boundary: an entry matches the command
+# exactly, or the command with more arguments after a space. "apt list" matches
+# "apt list --installed" but NOT "apt listsomething". It does NOT match sub-paths:
+# "cat /etc" does NOT allow "cat /etc/shadow" — list the exact commands you mean.
 #
 # SECURITY: only list commands that CANNOT execute arbitrary code or write
 # arbitrary files as root. Do NOT auto-approve things like `apt install`

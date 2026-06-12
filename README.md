@@ -106,9 +106,11 @@ aisudo df -h          # no notification needed
 aisudo journalctl -n 50
 ```
 
-## Shell Operators in Auto-Approved Commands
+## Shell Operators
 
-Auto-approved commands (via allowlist or temp rules) support shell operators like pipes and chaining. Each sub-command is validated individually against the allowlist — all must match for the command to be auto-approved.
+Commands support chaining operators like pipes and `&&`. For auto-approved
+commands, each sub-command is validated individually against the allowlist — all
+must match.
 
 ```bash
 # Both 'apt list' and 'grep' must be in the allowlist:
@@ -123,15 +125,28 @@ aisudo 'apt list && echo ok || echo fail'
 
 **Supported operators:** `;` (sequential), `&&` (and), `||` (or), `|` (pipe)
 
-**Rejected syntax** (denied immediately if found unquoted):
+**Rejected syntax** (the request is denied immediately if found unquoted, for
+**both** auto-approved and human-approved commands):
 - `$`, `` ` `` — variable expansion, command substitution
 - `(`, `)` — subshells
 - `>`, `<` — redirections
 - Bare `&` — background execution
 
-Quoting (single or double) suppresses operator detection, so `echo "hello; world"` is treated as a single command.
+This is a hard rule: a command with unquoted metacharacters never runs, even if
+you would approve it — it can't reach a shell, which closes a class of bypasses
+where a denylisted command is slipped through by appending e.g. `$(true)`.
 
-Commands approved via Telegram (human-approved) continue to use `sh -c` and support all shell syntax — this restriction only applies to auto-approved commands.
+To run a genuine shell one-liner (redirects, substitutions, subshells), wrap it
+explicitly so the metacharacters are quoted — it then parses as a single command
+and the full text is shown in the approval prompt:
+
+```bash
+aisudo bash -c 'echo "deb …" > /etc/apt/sources.list.d/foo.list'
+aisudo bash -c 'kill $(pidof nginx)'
+```
+
+Quoting (single or double) suppresses operator detection, so `echo "hello; world"`
+is treated as a single command.
 
 ## Hot-Reload
 

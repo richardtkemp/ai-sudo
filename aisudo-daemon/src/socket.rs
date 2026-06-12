@@ -720,6 +720,32 @@ async fn handle_sudo_request(
         command.clone()
     };
 
+    // Parse the command once, up front, and reject anything with unquoted shell
+    // metacharacters ($, `, (, ), <, >, &, newline). Such commands can't be
+    // auto-approved (argv exec) and must not reach `sh -c` via the human-approved
+    // path either — that was the denylist fail-open (M1): a denylisted command
+    // could be slipped past the denylist by appending e.g. `$(true)`. To run a
+    // shell one-liner with redirects/substitutions, wrap it explicitly in
+    // `bash -c '...'` (the metacharacters are then quoted and parse cleanly).
+    let parsed_segments = match parse_command_chain(&command) {
+        Ok(segs) => segs,
+        Err(reason) => {
+            warn!("Rejected command with unsupported shell syntax (user={user}): {reason}");
+            let response = SudoResponse {
+                request_id: String::new(),
+                decision: Decision::Denied,
+                error: Some(format!(
+                    "unsupported shell syntax ({reason}); wrap in bash -c '...' to run as a shell"
+                )),
+            };
+            let resp_json = serde_json::to_string(&response)?;
+            writer.write_all(resp_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+    };
+
     // Check denylist FIRST - deny always takes precedence
     if is_denied_with_strip(&command, denylist, limits.strip_shell_prefix) {
         warn!("Command denied via denylist: {}", command);
@@ -780,9 +806,7 @@ async fn handle_sudo_request(
         writer.write_all(b"\n").await?;
 
         if mode == RequestMode::Exec {
-            let segments = parse_command_chain(&command)
-                .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
-            exec_command_chain(&segments, &cwd, stdin_bytes, writer, &user).await?;
+            exec_command_chain(&parsed_segments, &cwd, stdin_bytes, writer, &user).await?;
         }
         return Ok(());
     }
@@ -823,9 +847,7 @@ async fn handle_sudo_request(
         writer.write_all(b"\n").await?;
 
         if mode == RequestMode::Exec {
-            let segments = parse_command_chain(&command)
-                .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
-            exec_command_chain(&segments, &cwd, stdin_bytes, writer, &user).await?;
+            exec_command_chain(&parsed_segments, &cwd, stdin_bytes, writer, &user).await?;
         }
         return Ok(());
     }
@@ -2632,6 +2654,102 @@ mod tests {
             db, backend, &json,
             &["apt list".to_string()], &[], &std::collections::HashMap::new(), test_limits(),
         ).await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+    }
+
+    /// Build a PAM-mode SudoRequest JSON for a command (no execution).
+    fn pam_req(command: &str) -> String {
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: command.to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
+        };
+        serde_json::to_string(&request).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unparseable_command_rejected_before_approval() {
+        // M1: a denylisted command must not be slippable past the denylist by
+        // appending an unquoted metacharacter. Even with a human that approves
+        // everything AND the exact denylist pattern present, the command is
+        // rejected at the parse gate before either is consulted.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &pam_req("rm -rf / $(true)"),
+            &[],
+            &["rm -rf /".to_string()],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        assert!(
+            response.error.as_deref().unwrap_or("").contains("unsupported shell syntax"),
+            "expected unsupported-syntax error, got: {:?}",
+            response.error
+        );
+    }
+
+    #[tokio::test]
+    async fn top_level_metacharacters_rejected() {
+        // Each of these contains an unquoted metacharacter and must be rejected,
+        // even though the backend would approve them.
+        let cases = [
+            "echo $HOME",               // variable expansion
+            "cat a > b",                // redirection
+            "tee x < y",                // input redirection
+            "kill $(pidof nginx)",      // command substitution
+            "echo `whoami`",            // backtick substitution
+            "(cd /tmp && ls)",          // subshell
+            "sleep 1 &",                // background
+        ];
+        for cmd in cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+            let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+            let resp_line = send_and_receive(
+                db, backend, &pam_req(cmd), &[], &[], &std::collections::HashMap::new(), test_limits(),
+            )
+            .await;
+            let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+            assert_eq!(response.decision, Decision::Denied, "command should be rejected: {cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn quoted_metacharacters_in_bash_c_still_approvable() {
+        // The workaround: wrapping shell syntax in `bash -c '...'` quotes the
+        // metacharacters, so it parses and can be human-approved as normal.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &pam_req("bash -c 'echo $HOME > /tmp/x'"),
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);

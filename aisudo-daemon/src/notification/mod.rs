@@ -80,4 +80,3 @@ pub trait NotificationBackend: Send + Sync {
     /// Backend name for logging/audit.
     fn name(&self) -> &'static str;
 }
-

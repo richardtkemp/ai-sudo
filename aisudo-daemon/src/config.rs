@@ -177,7 +177,9 @@ fn default_rate_limit_window_seconds() -> u32 {
 }
 
 /// Deserialize `check_binary_ownership` from either a bool (backward compat) or a string enum.
-fn deserialize_binary_ownership_check<'de, D>(deserializer: D) -> Result<BinaryOwnershipCheck, D::Error>
+fn deserialize_binary_ownership_check<'de, D>(
+    deserializer: D,
+) -> Result<BinaryOwnershipCheck, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

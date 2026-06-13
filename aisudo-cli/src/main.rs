@@ -465,7 +465,10 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost (request_rule): {e}", BINARY_NAME);
+            eprintln!(
+                "{}: connection to daemon lost (request_rule): {e}",
+                BINARY_NAME
+            );
             return ExitCode::from(1);
         }
         None => {
@@ -565,7 +568,10 @@ fn handle_list_rules() -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost (list_rules): {e}", BINARY_NAME);
+            eprintln!(
+                "{}: connection to daemon lost (list_rules): {e}",
+                BINARY_NAME
+            );
             return ExitCode::from(1);
         }
         None => {
@@ -976,7 +982,10 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost (retry_approval): {e}", BINARY_NAME);
+            eprintln!(
+                "{}: connection to daemon lost (retry_approval): {e}",
+                BINARY_NAME
+            );
             return ExitCode::from(1);
         }
         None => {
@@ -1152,24 +1161,45 @@ mod tests {
         assert_eq!(shell_escape_command(&args), "ls -la");
 
         // Test command with pipe character (the bug we're fixing)
-        let args = vec!["sed".to_string(), "-i".to_string(), "s/foo|bar/baz/".to_string(), "file".to_string()];
+        let args = vec![
+            "sed".to_string(),
+            "-i".to_string(),
+            "s/foo|bar/baz/".to_string(),
+            "file".to_string(),
+        ];
         let result = shell_escape_command(&args);
-        assert!(result.contains("'s/foo|bar/baz/'"), "Pipe character should be escaped: {}", result);
+        assert!(
+            result.contains("'s/foo|bar/baz/'"),
+            "Pipe character should be escaped: {}",
+            result
+        );
 
         // Test command with shell metacharacters
         let args = vec!["echo".to_string(), "hello; rm -rf /".to_string()];
         let result = shell_escape_command(&args);
-        assert!(result.contains("'hello; rm -rf /'"), "Semicolon should be escaped: {}", result);
+        assert!(
+            result.contains("'hello; rm -rf /'"),
+            "Semicolon should be escaped: {}",
+            result
+        );
 
         // Test command with spaces
         let args = vec!["echo".to_string(), "hello world".to_string()];
         let result = shell_escape_command(&args);
-        assert!(result.contains("'hello world'"), "Spaces should be escaped: {}", result);
+        assert!(
+            result.contains("'hello world'"),
+            "Spaces should be escaped: {}",
+            result
+        );
 
         // Test command with dollar signs (variable expansion)
         let args = vec!["echo".to_string(), "$HOME/test".to_string()];
         let result = shell_escape_command(&args);
-        assert!(result.contains("'$HOME/test'"), "Dollar sign should be escaped: {}", result);
+        assert!(
+            result.contains("'$HOME/test'"),
+            "Dollar sign should be escaped: {}",
+            result
+        );
 
         // Test empty args
         let args: Vec<String> = vec![];

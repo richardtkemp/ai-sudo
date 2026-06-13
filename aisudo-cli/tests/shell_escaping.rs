@@ -33,11 +33,11 @@ fn test_pipe_character_escaping() {
 #[test]
 fn test_shell_metacharacter_escaping() {
     let test_cases = vec![
-        ("echo", "hello; rm -rf /"), // semicolon
-        ("echo", "$HOME/test"),      // dollar sign
-        ("echo", "hello world"),     // space
-        ("sed", "s/foo|bar/baz/"),   // pipe character
-        ("echo", "$(whoami)"),       // command substitution
+        ("echo", "hello; rm -rf /"),     // semicolon
+        ("echo", "$HOME/test"),          // dollar sign
+        ("echo", "hello world"),         // space
+        ("sed", "s/foo|bar/baz/"),       // pipe character
+        ("echo", "$(whoami)"),           // command substitution
         ("echo", "hello && echo world"), // logical AND
     ];
 
@@ -54,7 +54,8 @@ fn test_shell_metacharacter_escaping() {
         assert!(
             stderr.contains(arg) || stderr.contains(cmd),
             "Command should contain the original argument '{}', got: {}",
-            arg, stderr
+            arg,
+            stderr
         );
     }
 }

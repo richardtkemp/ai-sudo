@@ -60,7 +60,10 @@ impl WebState {
 
 pub fn router(state: WebState) -> Router {
     Router::new()
-        .route("/aibw", get(|| async { axum::response::Redirect::permanent("/aibw/") }))
+        .route(
+            "/aibw",
+            get(|| async { axum::response::Redirect::permanent("/aibw/") }),
+        )
         .route("/aibw/", get(dashboard))
         .route("/aibw/request-code", axum::routing::post(request_code))
         .route("/aibw/unlock", get(unlock_get).post(unlock_submit))
@@ -106,9 +109,15 @@ async fn security_headers(req: Request, next: Next) -> Response {
             "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         ),
     );
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert(
         HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("DENY"),
@@ -188,9 +197,7 @@ fn html_escape(s: &str) -> String {
 
 /// Accept only UUID-shaped identifiers before reflecting them into HTML/links.
 fn is_uuidish(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 /// Sanitize a reflected request id: return it only if it is UUID-shaped.
@@ -215,11 +222,18 @@ async fn dashboard(State(state): State<WebState>, headers: HeaderMap) -> Html<St
     let recent = state.db.get_recent_bw_requests(10).unwrap_or_default();
 
     let status_class = if session_active { "unlocked" } else { "locked" };
-    let status_icon = if session_active { "&#x1f513;" } else { "&#x1f512;" };
+    let status_icon = if session_active {
+        "&#x1f513;"
+    } else {
+        "&#x1f512;"
+    };
     let status_text = if session_active { "Unlocked" } else { "Locked" };
 
     let locked_info = match locked_since {
-        Some(since) => format!("<br><small>Since: {}</small>", since.format("%Y-%m-%d %H:%M:%S UTC")),
+        Some(since) => format!(
+            "<br><small>Since: {}</small>",
+            since.format("%Y-%m-%d %H:%M:%S UTC")
+        ),
         None => String::new(),
     };
     let last_used_info = match last_used {
@@ -335,8 +349,10 @@ async fn unlock_get(
                 return redirect_with_cookie(&location, &cookie);
             }
             None => {
-                return Html(login_page(Some("That access code is invalid or has expired.")))
-                    .into_response();
+                return Html(login_page(Some(
+                    "That access code is invalid or has expired.",
+                )))
+                .into_response();
             }
         }
     }
@@ -363,8 +379,10 @@ async fn unlock_submit(
 ) -> Response {
     let Some(session_id) = session_cookie(&headers).filter(|s| state.web_auth.is_session_valid(s))
     else {
-        return Html(login_page(Some("Your session has expired. Request a new access code.")))
-            .into_response();
+        return Html(login_page(Some(
+            "Your session has expired. Request a new access code.",
+        )))
+        .into_response();
     };
 
     let req_id = clean_request_id(form.request_id.as_deref());
@@ -392,14 +410,21 @@ async fn unlock_submit(
             Ok(Some(r)) => {
                 return Html(error_page(
                     "Request expired",
-                    &format!("Request is no longer pending (status: {}).", html_escape(&r.status)),
+                    &format!(
+                        "Request is no longer pending (status: {}).",
+                        html_escape(&r.status)
+                    ),
                     None,
                 ))
                 .into_response();
             }
             _ => {
-                return Html(error_page("Request not found", "The specified request was not found.", None))
-                    .into_response();
+                return Html(error_page(
+                    "Request not found",
+                    "The specified request was not found.",
+                    None,
+                ))
+                .into_response();
             }
         }
     }
@@ -417,7 +442,9 @@ async fn unlock_submit(
                             true
                         }
                         Err(()) => {
-                            warn!("Failed to signal pending BW request {req_id} (receiver dropped)");
+                            warn!(
+                                "Failed to signal pending BW request {req_id} (receiver dropped)"
+                            );
                             false
                         }
                     }
@@ -433,8 +460,12 @@ async fn unlock_submit(
         }
         Err(e) => {
             warn!("Vault unlock failed via web UI: {e}");
-            Html(error_page("Unlock failed", "Incorrect master password. Please try again.", req_id.as_deref()))
-                .into_response()
+            Html(error_page(
+                "Unlock failed",
+                "Incorrect master password. Please try again.",
+                req_id.as_deref(),
+            ))
+            .into_response()
         }
     }
 }
@@ -463,25 +494,43 @@ async fn request_code(
         Some(url) => {
             if let Err(e) = state.backend.send_access_link(&url).await {
                 error!("Failed to send access link: {e:#}");
-                return Html(info_page("Send failed", "Could not deliver the access link. Check the daemon logs."));
+                return Html(info_page(
+                    "Send failed",
+                    "Could not deliver the access link. Check the daemon logs.",
+                ));
             }
             Html(info_page(
                 "Code sent",
                 "An access link has been sent to your Telegram. Tap it to open the vault dashboard.",
             ))
         }
-        None => Html(info_page("Link delivery not configured", "No public URL is configured.")),
+        None => Html(info_page(
+            "Link delivery not configured",
+            "No public URL is configured.",
+        )),
     }
 }
 
 async fn status_json(State(state): State<WebState>, headers: HeaderMap) -> Response {
     if !has_session(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthenticated"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthenticated"})),
+        )
+            .into_response();
     }
     let session_active = state.bw_session.is_session_active().await;
-    let locked_since = state.bw_session.locked_since().await.map(|dt| dt.to_rfc3339());
+    let locked_since = state
+        .bw_session
+        .locked_since()
+        .await
+        .map(|dt| dt.to_rfc3339());
     let last_used = state.bw_session.last_used_time().await;
-    let pending_count = state.db.get_pending_bw_requests().map(|v| v.len()).unwrap_or(0);
+    let pending_count = state
+        .db
+        .get_pending_bw_requests()
+        .map(|v| v.len())
+        .unwrap_or(0);
 
     Json(serde_json::json!({
         "session_active": session_active,
@@ -612,7 +661,12 @@ async fn unlock_form_page(state: &WebState, request_id: Option<&str>) -> String 
     };
 
     let hidden = request_id
-        .map(|id| format!(r#"<input type="hidden" name="request_id" value="{}">"#, html_escape(id)))
+        .map(|id| {
+            format!(
+                r#"<input type="hidden" name="request_id" value="{}">"#,
+                html_escape(id)
+            )
+        })
         .unwrap_or_default();
 
     let session_active = state.bw_session.is_session_active().await;
@@ -758,19 +812,34 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NotificationBackend for GateMockBackend {
-        async fn send_and_wait(&self, _r: &aisudo_common::SudoRequestRecord) -> anyhow::Result<aisudo_common::Decision> {
+        async fn send_and_wait(
+            &self,
+            _r: &aisudo_common::SudoRequestRecord,
+        ) -> anyhow::Result<aisudo_common::Decision> {
             Ok(aisudo_common::Decision::Denied)
         }
-        async fn send_temp_rule_and_wait(&self, _r: &crate::notification::TempRuleRecord) -> anyhow::Result<aisudo_common::Decision> {
+        async fn send_temp_rule_and_wait(
+            &self,
+            _r: &crate::notification::TempRuleRecord,
+        ) -> anyhow::Result<aisudo_common::Decision> {
             Ok(aisudo_common::Decision::Denied)
         }
-        async fn send_bw_request_and_wait(&self, _r: &crate::notification::BwRequestRecord) -> anyhow::Result<aisudo_common::Decision> {
+        async fn send_bw_request_and_wait(
+            &self,
+            _r: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<aisudo_common::Decision> {
             Ok(aisudo_common::Decision::Denied)
         }
-        async fn send_bw_confirm_and_wait(&self, _r: &crate::notification::BwConfirmRecord) -> anyhow::Result<aisudo_common::Decision> {
+        async fn send_bw_confirm_and_wait(
+            &self,
+            _r: &crate::notification::BwConfirmRecord,
+        ) -> anyhow::Result<aisudo_common::Decision> {
             Ok(aisudo_common::Decision::Denied)
         }
-        async fn send_bw_locked_notification(&self, _r: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+        async fn send_bw_locked_notification(
+            &self,
+            _r: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
@@ -788,7 +857,10 @@ mod tests {
     fn test_state() -> (tempfile::TempDir, WebState) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open(&dir.path().join("t.db")).unwrap());
-        let bw = Arc::new(BwSessionManager::new(std::path::PathBuf::from("/usr/bin/bw"), 3600));
+        let bw = Arc::new(BwSessionManager::new(
+            std::path::PathBuf::from("/usr/bin/bw"),
+            3600,
+        ));
         let web_auth = Arc::new(WebAuth::new(Some("https://h".to_string()), 600, 900, 30));
         let state = WebState::new(
             bw,
@@ -803,7 +875,10 @@ mod tests {
 
     fn cookie_headers(sid: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(header::COOKIE, format!("{SESSION_COOKIE}={sid}").parse().unwrap());
+        h.insert(
+            header::COOKIE,
+            format!("{SESSION_COOKIE}={sid}").parse().unwrap(),
+        );
         h
     }
 
@@ -816,7 +891,14 @@ mod tests {
 
         // Valid session → 200.
         let url = state.web_auth.issue_link(None).unwrap();
-        let code = url.split("c=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let code = url
+            .split("c=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap()
+            .to_string();
         let (sid, _) = state.web_auth.redeem(&code).unwrap();
         let resp = status_json(State(state.clone()), cookie_headers(&sid)).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -832,9 +914,18 @@ mod tests {
 
         // Valid session → real dashboard.
         let url = state.web_auth.issue_link(None).unwrap();
-        let code = url.split("c=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let code = url
+            .split("c=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap()
+            .to_string();
         let (sid, _) = state.web_auth.redeem(&code).unwrap();
-        let html = dashboard(State(state.clone()), cookie_headers(&sid)).await.0;
+        let html = dashboard(State(state.clone()), cookie_headers(&sid))
+            .await
+            .0;
         assert!(html.contains("Pending Requests"));
     }
 }

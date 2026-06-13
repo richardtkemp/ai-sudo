@@ -138,9 +138,7 @@ fn strip_tags(s: &str) -> String {
         // Tags are uppercase letters followed by a colon
         if let Some(colon_pos) = trimmed.find(':') {
             let prefix = &trimmed[..colon_pos];
-            if !prefix.is_empty()
-                && prefix.chars().all(|c| c.is_ascii_uppercase() || c == '_')
-            {
+            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
                 result = trimmed[colon_pos + 1..].to_string();
                 continue;
             }
@@ -218,10 +216,7 @@ mod tests {
     #[test]
     fn test_strip_tags() {
         assert_eq!(strip_tags(" SETENV: /usr/bin/apt"), " /usr/bin/apt");
-        assert_eq!(
-            strip_tags(" SETENV: NOEXEC: /usr/bin/apt"),
-            " /usr/bin/apt"
-        );
+        assert_eq!(strip_tags(" SETENV: NOEXEC: /usr/bin/apt"), " /usr/bin/apt");
         assert_eq!(strip_tags(" /usr/bin/apt"), " /usr/bin/apt");
         assert_eq!(strip_tags(" ALL"), " ALL");
     }
@@ -235,7 +230,10 @@ mod tests {
     #[test]
     fn test_matches_exact_binary() {
         // Bare binary path means any args
-        assert!(matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/apt install vim"));
+        assert!(matches_nopasswd_rule(
+            "/usr/bin/apt",
+            "/usr/bin/apt install vim"
+        ));
         assert!(matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/apt"));
         assert!(!matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/dpkg -l"));
     }
@@ -273,7 +271,10 @@ mod tests {
     fn test_matches_empty_args_rule() {
         // Rule with "" args means no args allowed
         assert!(matches_nopasswd_rule("/usr/bin/apt ", "/usr/bin/apt"));
-        assert!(!matches_nopasswd_rule("/usr/bin/apt ", "/usr/bin/apt install vim"));
+        assert!(!matches_nopasswd_rule(
+            "/usr/bin/apt ",
+            "/usr/bin/apt install vim"
+        ));
     }
 
     #[test]
@@ -317,7 +318,13 @@ mod tests {
     #[test]
     fn test_bare_binary_allows_any_args() {
         assert!(matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/apt"));
-        assert!(matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/apt install vim"));
-        assert!(matches_nopasswd_rule("/usr/bin/apt", "/usr/bin/apt remove --purge"));
+        assert!(matches_nopasswd_rule(
+            "/usr/bin/apt",
+            "/usr/bin/apt install vim"
+        ));
+        assert!(matches_nopasswd_rule(
+            "/usr/bin/apt",
+            "/usr/bin/apt remove --purge"
+        ));
     }
 }

@@ -285,7 +285,10 @@ impl Database {
         self.audit_log(
             &record.id,
             "request_created",
-            &format!("user={} command={}{}", record.user, record.command, stdin_info),
+            &format!(
+                "user={} command={}{}",
+                record.user, record.command, stdin_info
+            ),
         )?;
         Ok(true)
     }
@@ -427,9 +430,7 @@ impl Database {
         const MAX_TEMP_RULE_SECONDS: u32 = 30 * 24 * 3600; // 30 days
         let (duration_seconds, expires_at) = if duration_seconds > MAX_TEMP_RULE_SECONDS {
             let expires = parse_datetime(requested_at)
-                .map(|t| {
-                    (t + chrono::Duration::seconds(MAX_TEMP_RULE_SECONDS as i64)).to_rfc3339()
-                })
+                .map(|t| (t + chrono::Duration::seconds(MAX_TEMP_RULE_SECONDS as i64)).to_rfc3339())
                 .unwrap_or_else(|| expires_at.to_string());
             (MAX_TEMP_RULE_SECONDS, expires)
         } else {
@@ -1529,10 +1530,19 @@ mod tests {
         db.backdate_request("old", "2020-01-01T00:00:00+00:00");
 
         let deleted = db.prune_old_records(365).unwrap();
-        assert!(deleted >= 1, "expected at least the old request pruned, got {deleted}");
+        assert!(
+            deleted >= 1,
+            "expected at least the old request pruned, got {deleted}"
+        );
 
-        assert!(db.get_request("old").unwrap().is_none(), "old request should be pruned");
-        assert!(db.get_request("recent").unwrap().is_some(), "recent request must be kept");
+        assert!(
+            db.get_request("old").unwrap().is_none(),
+            "old request should be pruned"
+        );
+        assert!(
+            db.get_request("recent").unwrap().is_some(),
+            "recent request must be kept"
+        );
     }
 
     #[test]
@@ -1549,7 +1559,9 @@ mod tests {
         // Reopen at the same path (simulating a daemon restart).
         let db2 = Database::open(&path).unwrap();
         assert_eq!(
-            db2.get_daemon_state("telegram_update_offset").unwrap().as_deref(),
+            db2.get_daemon_state("telegram_update_offset")
+                .unwrap()
+                .as_deref(),
             Some("99")
         );
         assert_eq!(db2.get_daemon_state("missing").unwrap(), None);
@@ -1562,7 +1574,10 @@ mod tests {
         db.backdate_request("old", "2020-01-01T00:00:00+00:00");
 
         assert_eq!(db.prune_old_records(0).unwrap(), 0);
-        assert!(db.get_request("old").unwrap().is_some(), "retention=0 keeps everything");
+        assert!(
+            db.get_request("old").unwrap().is_some(),
+            "retention=0 keeps everything"
+        );
     }
 
     #[test]

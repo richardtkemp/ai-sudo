@@ -147,7 +147,10 @@ impl BwSessionManager {
 
     /// Extract the item name from BW item JSON (for resolved name comparison).
     pub fn extract_item_name(item_json: &serde_json::Value) -> Option<String> {
-        item_json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+        item_json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 
     /// Lock the vault, clearing the session key (zeroized).
@@ -201,7 +204,9 @@ impl BwSessionManager {
         // No shell — direct exec (H1)
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let child = cmd.spawn().map_err(|e| anyhow!("failed to spawn bw: {e}"))?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("failed to spawn bw: {e}"))?;
         drop(session_key); // release mutex while waiting
         child.wait_with_output().await.map_err(Into::into)
     }

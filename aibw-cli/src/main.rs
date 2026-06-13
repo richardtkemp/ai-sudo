@@ -12,7 +12,11 @@ fn main() -> ExitCode {
 
     if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
-        return ExitCode::from(if args.iter().any(|a| a == "--help" || a == "-h") { 0 } else { 1 });
+        return ExitCode::from(if args.iter().any(|a| a == "--help" || a == "-h") {
+            0
+        } else {
+            1
+        });
     }
 
     match args[1].as_str() {
@@ -106,9 +110,7 @@ fn handle_get(args: &[String]) -> ExitCode {
     };
 
     // Generous timeout — daemon handles its own approval timeout
-    stream
-        .set_read_timeout(Some(Duration::from_secs(300)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -269,9 +271,7 @@ fn handle_lock() -> ExitCode {
         }
     };
 
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -352,9 +352,7 @@ fn handle_status() -> ExitCode {
         }
     };
 
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,

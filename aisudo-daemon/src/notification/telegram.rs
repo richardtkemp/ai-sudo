@@ -1,16 +1,18 @@
-use super::{BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord};
+use super::{
+    BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord,
+};
 use crate::config::ConfigHolder;
 use crate::db::Database;
 use aisudo_common::{Decision, SudoRequestRecord};
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
+use chrono::Local;
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex};
-use chrono::Local;
 use tracing::{debug, error, info, warn};
 
 /// Default message template matching the original hardcoded format (HTML).
@@ -127,7 +129,10 @@ impl TelegramBackend {
             info!("Telegram polling loop started");
             loop {
                 if let Err(e) = this.poll_updates().await {
-                    error!("Telegram poll error (will retry in 5s): {}", this.redact(format!("{e:#}")));
+                    error!(
+                        "Telegram poll error (will retry in 5s): {}",
+                        this.redact(format!("{e:#}"))
+                    );
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
@@ -157,21 +162,24 @@ impl TelegramBackend {
                         }
                     }
                     Err(e) => {
-                        error!("Telegram getMe: failed to parse response (HTTP {http_status}): {}", self.redact(e));
+                        error!(
+                            "Telegram getMe: failed to parse response (HTTP {http_status}): {}",
+                            self.redact(e)
+                        );
                     }
                 }
             }
             Err(e) => {
-                error!("Telegram getMe request failed (bot may be unreachable): {}", self.redact(e));
+                error!(
+                    "Telegram getMe request failed (bot may be unreachable): {}",
+                    self.redact(e)
+                );
             }
         }
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!(
-            "https://api.telegram.org/bot{}/{}",
-            self.bot_token, method
-        )
+        format!("https://api.telegram.org/bot{}/{}", self.bot_token, method)
     }
 
     /// Redact the bot token from a string before it is logged or carried in an
@@ -183,9 +191,15 @@ impl TelegramBackend {
     }
 
     async fn send_message(&self, record: &SudoRequestRecord) -> Result<i64> {
-        info!("Attempting to send Telegram message for request {}", record.id);
+        info!(
+            "Attempting to send Telegram message for request {}",
+            record.id
+        );
         let config = self.config_holder.config();
-        let custom_template = config.telegram.as_ref().and_then(|tg| tg.message_template.as_deref());
+        let custom_template = config
+            .telegram
+            .as_ref()
+            .and_then(|tg| tg.message_template.as_deref());
         let template = match custom_template {
             Some(tmpl) if tmpl.contains("{{user}}") && tmpl.contains("{{command}}") => tmpl,
             Some(_) => {
@@ -220,19 +234,33 @@ impl TelegramBackend {
             .json(&main_body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Telegram sendMessage HTTP request failed: {}",
+                    self.redact(e)
+                )
+            })?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
+        let result: TelegramResponse<TelegramMessage> = resp.json().await.map_err(|e| {
+            anyhow!(
+                "Telegram sendMessage: failed to parse response (HTTP {}): {}",
+                http_status,
+                self.redact(e)
+            )
+        })?;
         if !result.ok {
             let desc = result
                 .description
                 .unwrap_or_else(|| "no description".to_string());
-            error!("Telegram sendMessage API error (HTTP {}): {}", http_status, desc);
+            error!(
+                "Telegram sendMessage API error (HTTP {}): {}",
+                http_status, desc
+            );
             return Err(anyhow!(
                 "Telegram sendMessage failed (HTTP {}): {}",
-                http_status, desc
+                http_status,
+                desc
             ));
         }
 
@@ -301,30 +329,52 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Telegram sendMessage HTTP request failed: {}",
+                    self.redact(e)
+                )
+            })?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
+        let result: TelegramResponse<TelegramMessage> = resp.json().await.map_err(|e| {
+            anyhow!(
+                "Telegram sendMessage: failed to parse response (HTTP {}): {}",
+                http_status,
+                self.redact(e)
+            )
+        })?;
         if !result.ok {
             let desc = result
                 .description
                 .unwrap_or_else(|| "no description".to_string());
-            return Err(anyhow!("Telegram sendMessage failed (HTTP {}): {}", http_status, desc));
+            return Err(anyhow!(
+                "Telegram sendMessage failed (HTTP {}): {}",
+                http_status,
+                desc
+            ));
         }
 
         let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
         let pending_key = format!("rule:{}", record.id);
-        self.message_map.insert(pending_key, (message_id, text, Instant::now()));
+        self.message_map
+            .insert(pending_key, (message_id, text, Instant::now()));
         info!("Telegram temp rule message sent: message_id={}", message_id);
 
         Ok(message_id)
     }
 
     async fn send_bw_request_message(&self, record: &BwRequestRecord) -> Result<i64> {
-        info!("Sending BW request Telegram message for request {}", record.id);
+        info!(
+            "Sending BW request Telegram message for request {}",
+            record.id
+        );
 
-        let session_status = if record.session_active { "unlocked" } else { "locked" };
+        let session_status = if record.session_active {
+            "unlocked"
+        } else {
+            "locked"
+        };
         let text = format!(
             "\u{1f511} <b>Bitwarden Request</b>\n\n\
              <b>User:</b> <code>{}</code>\n\
@@ -332,8 +382,11 @@ impl TelegramBackend {
              <b>Field:</b> <code>{}</code>\n\
              <b>Vault:</b> {}\n\
              <b>Request ID:</b> <code>{}</code>",
-            escape_html(&record.user), escape_html(&record.item_name),
-            escape_html(&record.field), session_status, escape_html(&record.id),
+            escape_html(&record.user),
+            escape_html(&record.item_name),
+            escape_html(&record.field),
+            session_status,
+            escape_html(&record.id),
         );
 
         let approve_data = format!("approve_bw:{}", record.id);
@@ -357,26 +410,49 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Telegram sendMessage HTTP request failed: {}",
+                    self.redact(e)
+                )
+            })?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
+        let result: TelegramResponse<TelegramMessage> = resp.json().await.map_err(|e| {
+            anyhow!(
+                "Telegram sendMessage: failed to parse response (HTTP {}): {}",
+                http_status,
+                self.redact(e)
+            )
+        })?;
         if !result.ok {
-            let desc = result.description.unwrap_or_else(|| "no description".to_string());
-            return Err(anyhow!("Telegram sendMessage failed (HTTP {}): {}", http_status, desc));
+            let desc = result
+                .description
+                .unwrap_or_else(|| "no description".to_string());
+            return Err(anyhow!(
+                "Telegram sendMessage failed (HTTP {}): {}",
+                http_status,
+                desc
+            ));
         }
 
         let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
         let pending_key = format!("bw:{}", record.id);
-        self.message_map.insert(pending_key, (message_id, text, Instant::now()));
-        info!("BW request Telegram message sent: message_id={}", message_id);
+        self.message_map
+            .insert(pending_key, (message_id, text, Instant::now()));
+        info!(
+            "BW request Telegram message sent: message_id={}",
+            message_id
+        );
 
         Ok(message_id)
     }
 
     async fn send_bw_confirm_message(&self, record: &BwConfirmRecord) -> Result<i64> {
-        info!("Sending BW confirm Telegram message for request {}", record.id);
+        info!(
+            "Sending BW confirm Telegram message for request {}",
+            record.id
+        );
 
         let text = format!(
             "\u{1f50d} <b>Bitwarden Confirmation</b>\n\n\
@@ -386,9 +462,11 @@ impl TelegramBackend {
              <b>Field:</b> <code>{}</code>\n\
              <b>Request ID:</b> <code>{}</code>\n\n\
              \u{26a0}\u{fe0f} Names differ \u{2014} please confirm.",
-            escape_html(&record.user), escape_html(&record.requested_item_name),
+            escape_html(&record.user),
+            escape_html(&record.requested_item_name),
             escape_html(&record.resolved_item_name),
-            escape_html(&record.field), escape_html(&record.id),
+            escape_html(&record.field),
+            escape_html(&record.id),
         );
 
         let confirm_data = format!("confirm_bw:{}", record.id);
@@ -412,30 +490,55 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Telegram sendMessage HTTP request failed: {}",
+                    self.redact(e)
+                )
+            })?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
+        let result: TelegramResponse<TelegramMessage> = resp.json().await.map_err(|e| {
+            anyhow!(
+                "Telegram sendMessage: failed to parse response (HTTP {}): {}",
+                http_status,
+                self.redact(e)
+            )
+        })?;
         if !result.ok {
-            let desc = result.description.unwrap_or_else(|| "no description".to_string());
-            return Err(anyhow!("Telegram sendMessage failed (HTTP {}): {}", http_status, desc));
+            let desc = result
+                .description
+                .unwrap_or_else(|| "no description".to_string());
+            return Err(anyhow!(
+                "Telegram sendMessage failed (HTTP {}): {}",
+                http_status,
+                desc
+            ));
         }
 
         let message_id = result.result.map(|m| m.message_id).unwrap_or(0);
         let pending_key = format!("bw_confirm:{}", record.id);
-        self.message_map.insert(pending_key, (message_id, text, Instant::now()));
-        info!("BW confirm Telegram message sent: message_id={}", message_id);
+        self.message_map
+            .insert(pending_key, (message_id, text, Instant::now()));
+        info!(
+            "BW confirm Telegram message sent: message_id={}",
+            message_id
+        );
 
         Ok(message_id)
     }
 
-    async fn send_bw_scrub_complete_message(&self, request_id: &str, item_name: &str) -> Result<()> {
+    async fn send_bw_scrub_complete_message(
+        &self,
+        request_id: &str,
+        item_name: &str,
+    ) -> Result<()> {
         let text = format!(
             "\u{1f9f9} <b>Credential Scrubbed</b>\n\n\
              <b>Item:</b> <code>{}</code>\n\
              <b>Request ID:</b> <code>{}</code>",
-            escape_html(item_name), escape_html(request_id),
+            escape_html(item_name),
+            escape_html(request_id),
         );
 
         let body = serde_json::json!({
@@ -450,21 +553,44 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram sendMessage HTTP request failed: {}", self.redact(e)))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Telegram sendMessage HTTP request failed: {}",
+                    self.redact(e)
+                )
+            })?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<TelegramMessage> = resp.json().await
-            .map_err(|e| anyhow!("Telegram sendMessage: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
+        let result: TelegramResponse<TelegramMessage> = resp.json().await.map_err(|e| {
+            anyhow!(
+                "Telegram sendMessage: failed to parse response (HTTP {}): {}",
+                http_status,
+                self.redact(e)
+            )
+        })?;
         if !result.ok {
-            let desc = result.description.unwrap_or_else(|| "no description".to_string());
-            warn!("Telegram scrub notification failed (HTTP {}): {}", http_status, desc);
+            let desc = result
+                .description
+                .unwrap_or_else(|| "no description".to_string());
+            warn!(
+                "Telegram scrub notification failed (HTTP {}): {}",
+                http_status, desc
+            );
         }
 
         Ok(())
     }
 
-    async fn edit_message_status(&self, message_id: i64, original_text: &str, status_line: &str) -> Result<()> {
-        info!("Editing Telegram message {} to show: {}", message_id, status_line);
+    async fn edit_message_status(
+        &self,
+        message_id: i64,
+        original_text: &str,
+        status_line: &str,
+    ) -> Result<()> {
+        info!(
+            "Editing Telegram message {} to show: {}",
+            message_id, status_line
+        );
 
         let body = serde_json::json!({
             "chat_id": self.chat_id,
@@ -479,13 +605,21 @@ impl TelegramBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow!("Telegram editMessageText HTTP request failed: {}", self.redact(e)))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Telegram editMessageText HTTP request failed: {}",
+                    self.redact(e)
+                )
+            })?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<serde_json::Value> = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("Telegram editMessageText: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
+        let result: TelegramResponse<serde_json::Value> = resp.json().await.map_err(|e| {
+            anyhow!(
+                "Telegram editMessageText: failed to parse response (HTTP {}): {}",
+                http_status,
+                self.redact(e)
+            )
+        })?;
 
         if !result.ok {
             let desc = result
@@ -508,8 +642,10 @@ impl TelegramBackend {
     /// approval is never swept early.
     fn sweep_stale_entries(&self, ttl: Duration) {
         let now = Instant::now();
-        self.message_map.retain(|_, v| now.duration_since(v.2) <= ttl);
-        self.completion_map.retain(|_, v| now.duration_since(v.3) <= ttl);
+        self.message_map
+            .retain(|_, v| now.duration_since(v.2) <= ttl);
+        self.completion_map
+            .retain(|_, v| now.duration_since(v.3) <= ttl);
     }
 
     async fn poll_updates(&self) -> Result<()> {
@@ -524,21 +660,37 @@ impl TelegramBackend {
             .query(&[
                 ("offset", offset.to_string()),
                 ("timeout", self.poll_timeout_seconds.to_string()),
-                ("allowed_updates", "[\"callback_query\", \"message\"]".to_string()),
+                (
+                    "allowed_updates",
+                    "[\"callback_query\", \"message\"]".to_string(),
+                ),
             ])
             .timeout(Duration::from_secs(self.poll_timeout_seconds as u64 + 5))
             .send()
             .await
-            .map_err(|e| anyhow!("getUpdates HTTP request failed (offset={}): {}", offset, self.redact(e)))?;
+            .map_err(|e| {
+                anyhow!(
+                    "getUpdates HTTP request failed (offset={}): {}",
+                    offset,
+                    self.redact(e)
+                )
+            })?;
 
         let http_status = resp.status();
-        let result: TelegramResponse<Vec<Update>> = resp.json().await
-            .map_err(|e| anyhow!("getUpdates: failed to parse response (HTTP {}): {}", http_status, self.redact(e)))?;
+        let result: TelegramResponse<Vec<Update>> = resp.json().await.map_err(|e| {
+            anyhow!(
+                "getUpdates: failed to parse response (HTTP {}): {}",
+                http_status,
+                self.redact(e)
+            )
+        })?;
         if !result.ok {
             return Err(anyhow!(
                 "getUpdates API error (HTTP {}): {}",
                 http_status,
-                result.description.unwrap_or_else(|| "no description".to_string())
+                result
+                    .description
+                    .unwrap_or_else(|| "no description".to_string())
             ));
         }
 
@@ -568,7 +720,8 @@ impl TelegramBackend {
             if had_updates {
                 if let Some(db) = &self.db {
                     let off = *self.update_offset.lock().await;
-                    if let Err(e) = db.set_daemon_state("telegram_update_offset", &off.to_string()) {
+                    if let Err(e) = db.set_daemon_state("telegram_update_offset", &off.to_string())
+                    {
                         warn!("Failed to persist Telegram update offset: {e}");
                     }
                 }
@@ -607,13 +760,15 @@ impl TelegramBackend {
                 let pending = db.get_pending_count().unwrap_or(0);
                 let last_hour = db.get_requests_last_hour().unwrap_or(0);
                 let approval_rate = db.get_approval_rate_last_hour().unwrap_or(0.0);
-                
+
                 format!(
                     "📊 <b>aisudo stats</b>\n\n\
                      <b>Pending:</b> {}\n\
                      <b>Requests (1h):</b> {}\n\
                      <b>Approval rate:</b> {:.1}%",
-                    pending, last_hour, approval_rate * 100.0
+                    pending,
+                    last_hour,
+                    approval_rate * 100.0
                 )
             }
             None => "Stats unavailable (no database)".to_string(),
@@ -693,7 +848,12 @@ impl TelegramBackend {
             if decision == Decision::Approved {
                 self.completion_map.insert(
                     pending_key.clone(),
-                    (msg_id, original_text.clone(), status_line.clone(), Instant::now()),
+                    (
+                        msg_id,
+                        original_text.clone(),
+                        status_line.clone(),
+                        Instant::now(),
+                    ),
                 );
             }
             let _ = self
@@ -727,7 +887,11 @@ impl NotificationBackend for TelegramBackend {
             record.id, msg_id
         );
 
-        info!("Waiting for Telegram callback for request {} (timeout: {}s)", record.id, self.request_timeout.as_secs());
+        info!(
+            "Waiting for Telegram callback for request {} (timeout: {}s)",
+            record.id,
+            self.request_timeout.as_secs()
+        );
         let timeout = self.request_timeout;
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(decision)) => {
@@ -744,7 +908,8 @@ impl NotificationBackend for TelegramBackend {
 
                 let time = Local::now().format("%H:%M:%S");
                 let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
-                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
+                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key)
+                {
                     let _ = self
                         .edit_message_status(msg_id, &original_text, &status_line)
                         .await;
@@ -785,7 +950,8 @@ impl NotificationBackend for TelegramBackend {
 
                 let time = Local::now().format("%H:%M:%S");
                 let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
-                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
+                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key)
+                {
                     let _ = self
                         .edit_message_status(msg_id, &original_text, &status_line)
                         .await;
@@ -813,7 +979,10 @@ impl NotificationBackend for TelegramBackend {
         let timeout = self.request_timeout;
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(decision)) => {
-                info!("Received decision {decision:?} for BW request {}", record.id);
+                info!(
+                    "Received decision {decision:?} for BW request {}",
+                    record.id
+                );
                 Ok(decision)
             }
             Ok(Err(_)) => {
@@ -826,7 +995,8 @@ impl NotificationBackend for TelegramBackend {
 
                 let time = Local::now().format("%H:%M:%S");
                 let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
-                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
+                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key)
+                {
                     let _ = self
                         .edit_message_status(msg_id, &original_text, &status_line)
                         .await;
@@ -854,7 +1024,10 @@ impl NotificationBackend for TelegramBackend {
         let timeout = self.request_timeout;
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(decision)) => {
-                info!("Received decision {decision:?} for BW confirm {}", record.id);
+                info!(
+                    "Received decision {decision:?} for BW confirm {}",
+                    record.id
+                );
                 Ok(decision)
             }
             Ok(Err(_)) => {
@@ -867,7 +1040,8 @@ impl NotificationBackend for TelegramBackend {
 
                 let time = Local::now().format("%H:%M:%S");
                 let status_line = format!("\u{23f1}\u{fe0f} Timed out at {time}");
-                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
+                if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key)
+                {
                     let _ = self
                         .edit_message_status(msg_id, &original_text, &status_line)
                         .await;
@@ -894,8 +1068,10 @@ impl NotificationBackend for TelegramBackend {
              <b>Vault:</b> \u{1f512} locked\n\
              <b>Request ID:</b> <code>{}</code>\n\n\
              {action}",
-            escape_html(&record.user), escape_html(&record.item_name),
-            escape_html(&record.field), escape_html(&record.id),
+            escape_html(&record.user),
+            escape_html(&record.item_name),
+            escape_html(&record.field),
+            escape_html(&record.id),
         );
 
         let body = serde_json::json!({
@@ -905,7 +1081,8 @@ impl NotificationBackend for TelegramBackend {
         });
 
         // Fire and forget — no buttons, no waiting
-        match self.client
+        match self
+            .client
             .post(self.api_url("sendMessage"))
             .json(&body)
             .send()
@@ -929,7 +1106,8 @@ impl NotificationBackend for TelegramBackend {
             "text": text,
             "parse_mode": "HTML"
         });
-        match self.client
+        match self
+            .client
             .post(self.api_url("sendMessage"))
             .json(&body)
             .send()
@@ -942,23 +1120,29 @@ impl NotificationBackend for TelegramBackend {
     }
 
     async fn send_scrub_complete(&self, request_id: &str, item_name: &str) -> Result<()> {
-        self.send_bw_scrub_complete_message(request_id, item_name).await
+        self.send_bw_scrub_complete_message(request_id, item_name)
+            .await
     }
 
     async fn update_completion_status(&self, info: &CompletionInfo) {
-        if let Some((_, (msg_id, original_text, approved_status, _))) = self.completion_map.remove(&info.request_id) {
+        if let Some((_, (msg_id, original_text, approved_status, _))) =
+            self.completion_map.remove(&info.request_id)
+        {
             let completion_text = if info.exit_code == 0 {
                 format!("{} \u{2192} Exit 0", approved_status)
             } else {
                 let error_indicator = "\u{274c}";
-                let base = format!("{} \u{2192} {} Exit {}", approved_status, error_indicator, info.exit_code);
+                let base = format!(
+                    "{} \u{2192} {} Exit {}",
+                    approved_status, error_indicator, info.exit_code
+                );
                 if let Some(ref last_lines) = info.last_lines {
                     format!("{}\n<pre>{}</pre>", base, escape_html(last_lines))
                 } else {
                     base
                 }
             };
-            
+
             let body = serde_json::json!({
                 "chat_id": self.chat_id,
                 "message_id": msg_id,
@@ -985,10 +1169,12 @@ impl NotificationBackend for TelegramBackend {
 }
 
 /// Render a message template by replacing {{variable}} placeholders with values from the record.
-fn render_template(template: &str, record: &SudoRequestRecord, stdin_preview_bytes: usize) -> String {
-    let hostname = gethostname::gethostname()
-        .to_string_lossy()
-        .to_string();
+fn render_template(
+    template: &str,
+    record: &SudoRequestRecord,
+    stdin_preview_bytes: usize,
+) -> String {
+    let hostname = gethostname::gethostname().to_string_lossy().to_string();
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let reason_val = match &record.reason {
@@ -1109,15 +1295,19 @@ mod tests {
 
     /// Create a minimal ConfigHolder for tests.
     fn test_config_holder() -> Arc<ConfigHolder> {
-        use tempfile::TempDir;
         use std::fs;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("aisudo.toml");
-        fs::write(&path, r#"
+        fs::write(
+            &path,
+            r#"
 [telegram]
 bot_token = "tok"
 chat_id = 1
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         // Leak TempDir so it lives long enough for all tests
         let holder = Arc::new(ConfigHolder::new(path.to_str().unwrap()).unwrap());
         std::mem::forget(tmp);
@@ -1174,7 +1364,14 @@ chat_id = 1
 
     #[test]
     fn test_api_url() {
-        let backend = TelegramBackend::new("TOKEN123".to_string(), 42, 60, 2048, 30, test_config_holder());
+        let backend = TelegramBackend::new(
+            "TOKEN123".to_string(),
+            42,
+            60,
+            2048,
+            30,
+            test_config_holder(),
+        );
         assert_eq!(
             backend.api_url("getMe"),
             "https://api.telegram.org/botTOKEN123/getMe"
@@ -1187,9 +1384,12 @@ chat_id = 1
 
     #[test]
     fn test_sweep_stale_entries() {
-        let backend = TelegramBackend::new("tok".to_string(), 1, 60, 2048, 30, test_config_holder());
+        let backend =
+            TelegramBackend::new("tok".to_string(), 1, 60, 2048, 30, test_config_holder());
 
-        backend.message_map.insert("a".to_string(), (10, "x".to_string(), Instant::now()));
+        backend
+            .message_map
+            .insert("a".to_string(), (10, "x".to_string(), Instant::now()));
         backend.completion_map.insert(
             "b".to_string(),
             (11, "x".to_string(), "ok".to_string(), Instant::now()),
@@ -1197,27 +1397,53 @@ chat_id = 1
 
         // A zero TTL drops anything inserted before now → both swept.
         backend.sweep_stale_entries(Duration::from_secs(0));
-        assert!(backend.message_map.is_empty(), "stale message entry should be swept");
-        assert!(backend.completion_map.is_empty(), "stale completion entry should be swept");
+        assert!(
+            backend.message_map.is_empty(),
+            "stale message entry should be swept"
+        );
+        assert!(
+            backend.completion_map.is_empty(),
+            "stale completion entry should be swept"
+        );
 
         // Fresh entries with a generous TTL are kept.
-        backend.message_map.insert("c".to_string(), (12, "y".to_string(), Instant::now()));
+        backend
+            .message_map
+            .insert("c".to_string(), (12, "y".to_string(), Instant::now()));
         backend.completion_map.insert(
             "d".to_string(),
             (13, "y".to_string(), "ok".to_string(), Instant::now()),
         );
         backend.sweep_stale_entries(Duration::from_secs(3600));
-        assert_eq!(backend.message_map.len(), 1, "fresh message entry must be kept");
-        assert_eq!(backend.completion_map.len(), 1, "fresh completion entry must be kept");
+        assert_eq!(
+            backend.message_map.len(),
+            1,
+            "fresh message entry must be kept"
+        );
+        assert_eq!(
+            backend.completion_map.len(),
+            1,
+            "fresh completion entry must be kept"
+        );
     }
 
     #[test]
     fn test_redact_removes_token() {
-        let backend = TelegramBackend::new("SECRET-TOKEN".to_string(), 42, 60, 2048, 30, test_config_holder());
+        let backend = TelegramBackend::new(
+            "SECRET-TOKEN".to_string(),
+            42,
+            60,
+            2048,
+            30,
+            test_config_holder(),
+        );
         // Simulate a reqwest-style error string that embeds the API URL (with token).
         let err = "error sending request for url (https://api.telegram.org/botSECRET-TOKEN/getUpdates): connection refused";
         let redacted = backend.redact(err);
-        assert!(!redacted.contains("SECRET-TOKEN"), "token must not survive redaction: {redacted}");
+        assert!(
+            !redacted.contains("SECRET-TOKEN"),
+            "token must not survive redaction: {redacted}"
+        );
         assert!(redacted.contains("<redacted>"));
         // A string without the token is unchanged.
         assert_eq!(backend.redact("plain message"), "plain message");
@@ -1225,7 +1451,8 @@ chat_id = 1
 
     #[test]
     fn test_backend_creation() {
-        let backend = TelegramBackend::new("TOK".to_string(), 99, 120, 4096, 45, test_config_holder());
+        let backend =
+            TelegramBackend::new("TOK".to_string(), 99, 120, 4096, 45, test_config_holder());
         assert_eq!(backend.request_timeout, Duration::from_secs(120));
         assert_eq!(backend.stdin_preview_bytes, 4096);
         assert_eq!(backend.poll_timeout_seconds, 45);
@@ -1234,8 +1461,12 @@ chat_id = 1
 
     #[test]
     fn test_telegram_name() {
-        let backend = TelegramBackend::new("TOK".to_string(), 1, 60, 2048, 30, test_config_holder());
-        assert_eq!(<TelegramBackend as super::NotificationBackend>::name(&backend), "telegram");
+        let backend =
+            TelegramBackend::new("TOK".to_string(), 1, 60, 2048, 30, test_config_holder());
+        assert_eq!(
+            <TelegramBackend as super::NotificationBackend>::name(&backend),
+            "telegram"
+        );
     }
 
     #[test]
@@ -1298,7 +1529,10 @@ chat_id = 1
         let record = make_test_record();
         let tmpl = "User: {{user}}, Cmd: {{command}}, Dir: {{directory}}";
         let result = render_template(tmpl, &record, 2048);
-        assert_eq!(result, "User: alice, Cmd: apt install nginx, Dir: /home/alice");
+        assert_eq!(
+            result,
+            "User: alice, Cmd: apt install nginx, Dir: /home/alice"
+        );
     }
 
     #[test]
@@ -1329,9 +1563,18 @@ chat_id = 1
         let result = render_template("{{command}}", &record, 2048);
 
         // The injected {{stdin}} stays literal; no Stdin block is forged.
-        assert!(result.contains("{{stdin}}"), "injected placeholder should remain literal: {result}");
-        assert!(!result.contains("<b>Stdin:</b>"), "command must not forge a Stdin section: {result}");
-        assert!(!result.contains("SECRET"), "attacker stdin must not appear via command injection: {result}");
+        assert!(
+            result.contains("{{stdin}}"),
+            "injected placeholder should remain literal: {result}"
+        );
+        assert!(
+            !result.contains("<b>Stdin:</b>"),
+            "command must not forge a Stdin section: {result}"
+        );
+        assert!(
+            !result.contains("SECRET"),
+            "attacker stdin must not appear via command injection: {result}"
+        );
     }
 
     #[test]
@@ -1344,7 +1587,10 @@ chat_id = 1
 
         let result = render_template("{{command}}", &record, 2048);
         assert!(result.contains("{{reason}}"));
-        assert!(!result.contains("<b>Reason:</b>"), "command must not forge a Reason section: {result}");
+        assert!(
+            !result.contains("<b>Reason:</b>"),
+            "command must not forge a Reason section: {result}"
+        );
     }
 
     #[test]
@@ -1398,7 +1644,10 @@ chat_id = 1
         let record = make_test_record();
         let tmpl = "Line1: {{user}}\nLine2: {{command}}\nLine3: {{directory}}";
         let result = render_template(tmpl, &record, 2048);
-        assert_eq!(result, "Line1: alice\nLine2: apt install nginx\nLine3: /home/alice");
+        assert_eq!(
+            result,
+            "Line1: alice\nLine2: apt install nginx\nLine3: /home/alice"
+        );
     }
 
     #[test]
@@ -1406,9 +1655,11 @@ chat_id = 1
         let record = make_test_record();
         let tmpl = "<b>Bold</b> <code>{{command}}</code> <i>italic</i> {{user}}";
         let result = render_template(tmpl, &record, 2048);
-        assert_eq!(result, "<b>Bold</b> <code>apt install nginx</code> <i>italic</i> alice");
+        assert_eq!(
+            result,
+            "<b>Bold</b> <code>apt install nginx</code> <i>italic</i> alice"
+        );
     }
-
 
     #[test]
     fn test_escape_html() {
@@ -1439,19 +1690,23 @@ chat_id = 1
     #[test]
     fn test_config_message_template_deserialization() {
         use crate::config::Config;
-        use tempfile::TempDir;
         use std::fs;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("aisudo.toml");
-        fs::write(&path, r#"
+        fs::write(
+            &path,
+            r#"
 [telegram]
 bot_token = "tok"
 chat_id = 1
 message_template = """
 Request: {{user}} {{command}}
 """
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let config = Config::load(path.to_str().unwrap()).unwrap();
         let tg = config.telegram.unwrap();
         assert!(tg.message_template.is_some());
@@ -1463,16 +1718,20 @@ Request: {{user}} {{command}}
     #[test]
     fn test_config_message_template_default_none() {
         use crate::config::Config;
-        use tempfile::TempDir;
         use std::fs;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("aisudo.toml");
-        fs::write(&path, r#"
+        fs::write(
+            &path,
+            r#"
 [telegram]
 bot_token = "tok"
 chat_id = 1
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let config = Config::load(path.to_str().unwrap()).unwrap();
         let tg = config.telegram.unwrap();
         assert!(tg.message_template.is_none());

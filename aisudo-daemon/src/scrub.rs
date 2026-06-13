@@ -43,13 +43,21 @@ pub fn redact_session_files(files: &[String], plaintext: &str) -> std::io::Resul
         let redacted = content.replace(plaintext, REDACTION_PLACEHOLDER);
 
         // Preserve the original mode on the replacement; fall back to 0600.
-        let mode = fs::metadata(path).map(|m| m.permissions().mode()).unwrap_or(0o600);
+        let mode = fs::metadata(path)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o600);
 
         // Temp file in the SAME directory so `rename` is atomic on one filesystem.
         // The name is hidden and does not end in `.jsonl`, so the log-discovery
         // filter will not pick it up if the daemon is interrupted mid-write.
-        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-        let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("session");
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let base = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("session");
         let tmp = dir.join(format!(".{base}.scrub.tmp"));
 
         {
@@ -73,7 +81,10 @@ mod tests {
     fn tmpdir() -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         // Unique-ish without Math.random/time: use the test thread name.
-        let uniq = std::thread::current().name().unwrap_or("scrub").replace("::", "_");
+        let uniq = std::thread::current()
+            .name()
+            .unwrap_or("scrub")
+            .replace("::", "_");
         p.push(format!("aisudo_scrub_test_{uniq}"));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
@@ -84,13 +95,21 @@ mod tests {
     fn redacts_secret_and_preserves_other_content() {
         let dir = tmpdir();
         let file = dir.join("session1.jsonl");
-        fs::write(&file, "{\"line\":1}\nsecret-value-123 appears here\n{\"line\":3}\n").unwrap();
+        fs::write(
+            &file,
+            "{\"line\":1}\nsecret-value-123 appears here\n{\"line\":3}\n",
+        )
+        .unwrap();
 
-        let n = redact_session_files(&[file.to_string_lossy().to_string()], "secret-value-123").unwrap();
+        let n = redact_session_files(&[file.to_string_lossy().to_string()], "secret-value-123")
+            .unwrap();
         assert_eq!(n, 1);
 
         let mut out = String::new();
-        fs::File::open(&file).unwrap().read_to_string(&mut out).unwrap();
+        fs::File::open(&file)
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
         assert!(!out.contains("secret-value-123"));
         assert!(out.contains(REDACTION_PLACEHOLDER));
         assert!(out.contains("{\"line\":1}"));
@@ -126,8 +145,14 @@ mod tests {
 
         // Second pass after a successful redaction is a no-op.
         fs::write(&file, "secretX").unwrap();
-        assert_eq!(redact_session_files(&[file.to_string_lossy().to_string()], "secretX").unwrap(), 1);
-        assert_eq!(redact_session_files(&[file.to_string_lossy().to_string()], "secretX").unwrap(), 0);
+        assert_eq!(
+            redact_session_files(&[file.to_string_lossy().to_string()], "secretX").unwrap(),
+            1
+        );
+        assert_eq!(
+            redact_session_files(&[file.to_string_lossy().to_string()], "secretX").unwrap(),
+            0
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

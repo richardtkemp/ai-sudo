@@ -177,7 +177,14 @@ mod tests {
     fn code_redeems_exactly_once() {
         let a = auth();
         let url = a.issue_link(Some("req-7")).unwrap();
-        let code = url.split("c=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let code = url
+            .split("c=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap()
+            .to_string();
 
         let (session, req) = a.redeem(&code).expect("first redeem works");
         assert_eq!(req.as_deref(), Some("req-7"));
@@ -227,8 +234,14 @@ mod tests {
         // No per-identity cooldown so only the global cap applies.
         let a = WebAuth::new(Some("https://h".to_string()), 600, 900, 0);
         for i in 0..GLOBAL_MAX_PER_WINDOW {
-            assert!(a.allow_code_request(&format!("id-{i}")), "request {i} should be allowed");
+            assert!(
+                a.allow_code_request(&format!("id-{i}")),
+                "request {i} should be allowed"
+            );
         }
-        assert!(!a.allow_code_request("id-overflow"), "global cap should block");
+        assert!(
+            !a.allow_code_request("id-overflow"),
+            "global cap should block"
+        );
     }
 }

@@ -33,28 +33,32 @@ async fn main() -> Result<()> {
     let db = Arc::new(db::Database::open(&config.db_path)?);
 
     // Set up notification backend
-    let backend: Arc<dyn notification::NotificationBackend> =
-        if let Some(ref tg_config) = config.telegram {
-            if tg_config.chat_id == 0 {
-                warn!("Telegram chat_id is 0 — this is almost certainly wrong. Set chat_id in config.");
-            }
-            let mut tg = TelegramBackend::new(
-                tg_config.bot_token.clone(),
-                tg_config.chat_id,
-                config.timeout_seconds,
-                config.limits.stdin_preview_bytes,
-                tg_config.poll_timeout_seconds,
-                Arc::clone(&config_holder),
-            );
-            tg.set_db(Arc::clone(&db));
-            let telegram = Arc::new(tg);
-            telegram.validate_bot_token().await;
-            telegram.start_polling();
-            info!("Telegram notification backend enabled (chat_id: {})", tg_config.chat_id);
-            telegram
-        } else {
-            anyhow::bail!("No approval mechanism configured. Set [telegram] in config.");
-        };
+    let backend: Arc<dyn notification::NotificationBackend> = if let Some(ref tg_config) =
+        config.telegram
+    {
+        if tg_config.chat_id == 0 {
+            warn!("Telegram chat_id is 0 — this is almost certainly wrong. Set chat_id in config.");
+        }
+        let mut tg = TelegramBackend::new(
+            tg_config.bot_token.clone(),
+            tg_config.chat_id,
+            config.timeout_seconds,
+            config.limits.stdin_preview_bytes,
+            tg_config.poll_timeout_seconds,
+            Arc::clone(&config_holder),
+        );
+        tg.set_db(Arc::clone(&db));
+        let telegram = Arc::new(tg);
+        telegram.validate_bot_token().await;
+        telegram.start_polling();
+        info!(
+            "Telegram notification backend enabled (chat_id: {})",
+            tg_config.chat_id
+        );
+        telegram
+    } else {
+        anyhow::bail!("No approval mechanism configured. Set [telegram] in config.");
+    };
 
     // Set up BW session manager (if configured)
     let bw_session = if let Some(ref bw_config) = config.bitwarden {
@@ -138,7 +142,10 @@ async fn main() -> Result<()> {
                     }
                 }
             });
-            info!("Credential scrubber spawned (interval: {}s)", scrub_interval);
+            info!(
+                "Credential scrubber spawned (interval: {}s)",
+                scrub_interval
+            );
         }
     }
 
@@ -184,7 +191,15 @@ async fn main() -> Result<()> {
     }
 
     // Run socket listener (blocks)
-    socket::run_socket_listener(config_holder, db, backend, bw_session, pending_unlocks, web_auth).await?;
+    socket::run_socket_listener(
+        config_holder,
+        db,
+        backend,
+        bw_session,
+        pending_unlocks,
+        web_auth,
+    )
+    .await?;
 
     Ok(())
 }
@@ -222,7 +237,10 @@ async fn run_scrub_pass(
                 if let Ok(Some(req)) = db.get_bw_request(&entry.request_id) {
                     let item = req.resolved_item_name.unwrap_or(req.item_name);
                     if let Err(e) = backend.send_scrub_complete(&entry.request_id, &item).await {
-                        warn!("Scrub-complete notification failed for {}: {e}", entry.request_id);
+                        warn!(
+                            "Scrub-complete notification failed for {}: {e}",
+                            entry.request_id
+                        );
                     }
                 }
             }

@@ -190,6 +190,25 @@ fn check_ownership_with_strip(
     Ok(())
 }
 
+/// True if `command` passes the binary-ownership/writability gate. On failure it
+/// logs the reason (server-side only) and returns false, so an auto-approve caller
+/// (allowlist or temp rule) can fall through to the human-approval path instead of
+/// denying outright. `via` labels the source ("Allowlisted" / "Temp-rule") in the log.
+fn ownership_ok_or_log(
+    command: &str,
+    match_command: &str,
+    limits: &LimitsConfig,
+    via: &str,
+) -> bool {
+    match check_ownership_with_strip(command, match_command, limits) {
+        Ok(()) => true,
+        Err(reason) => {
+            warn!("{via} command failed ownership check, routing to human approval: {reason}");
+            false
+        }
+    }
+}
+
 /// Send a generic ownership-check denial to the client.
 ///
 /// The detailed reason is logged server-side only; the client receives a
@@ -863,18 +882,16 @@ async fn handle_sudo_request(
             allowlist.to_vec()
         };
 
-    // Check allowlist - auto-approved commands skip rate limiting
-    if is_allowed_with_strip(&command, &effective_allowlist, limits.strip_shell_prefix) {
-        // Validate binary ownership before auto-executing
-        if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
-            deny_ownership(
-                writer,
-                String::new(),
-                &format!("Allowlisted command rejected (ownership): {reason}"),
-            )
-            .await?;
-            return Ok(());
-        }
+    // Check allowlist - auto-approved commands skip rate limiting.
+    // An allowlisted command is auto-approved ONLY if it also passes the binary
+    // ownership/writability gate. If the gate fails we do NOT deny outright;
+    // instead we fall through to the human-approval path below, so the command
+    // can still run with explicit Telegram approval. A tamperable binary must
+    // never be auto-run unattended, but a human in the loop is an acceptable gate.
+    // (`&&` short-circuits, so ownership is only checked for allowlisted commands.)
+    if is_allowed_with_strip(&command, &effective_allowlist, limits.strip_shell_prefix)
+        && ownership_ok_or_log(&command, &match_command, &limits, "Allowlisted")
+    {
         info!("Command auto-approved via allowlist: {}", command);
 
         // For dry-run, just return approved without executing or logging
@@ -909,18 +926,12 @@ async fn handle_sudo_request(
         return Ok(());
     }
 
-    // Check active temp rules - auto-approved commands skip rate limiting
-    if is_temp_rule_allowed_with_strip(&db, &request.user, &command, limits.strip_shell_prefix)? {
-        // Validate binary ownership before auto-executing
-        if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
-            deny_ownership(
-                writer,
-                String::new(),
-                &format!("Temp-rule command rejected (ownership): {reason}"),
-            )
-            .await?;
-            return Ok(());
-        }
+    // Check active temp rules - auto-approved commands skip rate limiting.
+    // As with the allowlist, a temp-rule match that fails the ownership gate
+    // falls through to human approval rather than being denied outright.
+    if is_temp_rule_allowed_with_strip(&db, &request.user, &command, limits.strip_shell_prefix)?
+        && ownership_ok_or_log(&command, &match_command, &limits, "Temp-rule")
+    {
         info!("Command auto-approved via temp rule: {}", command);
 
         // For dry-run, just return approved without executing or logging
@@ -2912,6 +2923,63 @@ mod tests {
 
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Approved);
+    }
+
+    #[tokio::test]
+    async fn allowlist_ownership_failure_routes_to_human_approval() {
+        // An allowlisted command whose binary fails the ownership gate must NOT be
+        // denied outright — it falls through to the human-approval path. Here the
+        // mock backend approves, so a successful fall-through yields Approved.
+        // (Under the old behavior this returned Denied with "ownership check failed".)
+        if nix::unistd::getuid().as_raw() == 0 {
+            return; // running as root: ownership check always passes, test N/A
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // Temp file is owned by the current (non-root) user → fails the owner gate.
+        let bin = dir.path().join("deploy.sh");
+        std::fs::write(&bin, "#!/bin/sh\ntrue\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin_str = bin.to_str().unwrap().to_string();
+
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockApproveBackend);
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: bin_str.clone(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[bin_str.clone()],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits_ownership_on(), // Auto mode: human-approved commands skip the check
+        )
+        .await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        // Fell through to human approval (mock approves) rather than ownership-denied.
+        assert_eq!(response.decision, Decision::Approved);
+        assert!(
+            response.error.is_none(),
+            "expected clean approval, got error: {:?}",
+            response.error
+        );
     }
 
     /// Build a PAM-mode SudoRequest JSON for a command (no execution).

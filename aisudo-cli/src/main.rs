@@ -123,7 +123,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let command = shell_escape_command(&args[cmd_start..]);
+    let command = build_command(&args[cmd_start..]);
     let user = get_current_user();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -1141,6 +1141,28 @@ fn capture_stdin() -> Result<Option<String>, String> {
     Ok(Some(encoded))
 }
 
+/// Build the command string sent to the daemon from the positional args.
+///
+/// Two cases:
+///   * Exactly one argument — the user handed us a complete command line as a
+///     single (shell-quoted) blob, e.g. `sudo 'cp a b && chown x b'`. Forward it
+///     VERBATIM so the daemon's chain parser can split and validate the operators
+///     (`&&`, `||`, `;`, `|`). Escaping here would re-quote the whole blob and the
+///     daemon suppresses operator detection inside quotes, so the compound would
+///     never run. This is safe: the daemon validates every chain segment against
+///     approval and rejects dangerous metacharacters ($, backtick, (), <>, bare &,
+///     newline) itself — the CLI escaping was a transport convenience, not the
+///     security boundary.
+///   * Multiple arguments — escape each to preserve argument boundaries; any
+///     operator passed as its own arg stays literal.
+fn build_command(args: &[String]) -> String {
+    if args.len() == 1 {
+        args[0].clone()
+    } else {
+        shell_escape_command(args)
+    }
+}
+
 /// Shell-escape individual arguments and join them with spaces.
 /// This prevents shell metacharacters in arguments from being interpreted as shell operators.
 fn shell_escape_command(args: &[String]) -> String {
@@ -1208,6 +1230,39 @@ mod tests {
         // Test single argument
         let args = vec!["ls".to_string()];
         assert_eq!(shell_escape_command(&args), "ls");
+    }
+
+    #[test]
+    fn test_build_command() {
+        // Single arg (a quoted blob) is forwarded verbatim so the daemon can
+        // split/validate operators — NOT re-quoted.
+        let args = vec!["cp a b && chown x b".to_string()];
+        assert_eq!(build_command(&args), "cp a b && chown x b");
+
+        // Single arg with no operators is also verbatim (no surrounding quotes).
+        let args = vec!["rm -rf /tmp/x".to_string()];
+        assert_eq!(build_command(&args), "rm -rf /tmp/x");
+
+        // A bare single-word command is unchanged.
+        let args = vec!["systemctl".to_string()];
+        assert_eq!(build_command(&args), "systemctl");
+
+        // Multiple args: per-arg escaping preserves boundaries; an operator
+        // passed as its own arg stays literal (quoted).
+        let args = vec![
+            "echo".to_string(),
+            "hello && rm -rf /".to_string(),
+        ];
+        let result = build_command(&args);
+        assert!(
+            result.contains("'hello && rm -rf /'"),
+            "Embedded operator in a multi-arg invocation must stay escaped: {}",
+            result
+        );
+
+        // Multiple args with no specials: plain join.
+        let args = vec!["cp".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(build_command(&args), "cp a b");
     }
 
     #[test]

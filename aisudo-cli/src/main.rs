@@ -166,6 +166,10 @@ fn main() -> ExitCode {
         );
     } else {
         eprintln!("{}: requesting approval for: {command}", BINARY_NAME);
+        eprintln!(
+            "{}: approval is asynchronous — a human must tap approve/deny and may take minutes or longer. Waiting; do not retry or assume failure.",
+            BINARY_NAME
+        );
     }
 
     let stream = match UnixStream::connect(&socket_path) {

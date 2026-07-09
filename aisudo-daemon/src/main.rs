@@ -10,6 +10,7 @@ mod web_auth;
 
 use anyhow::Result;
 use dashmap::DashMap;
+use notification::askgw::AskgwBackend;
 use notification::telegram::TelegramBackend;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -33,9 +34,22 @@ async fn main() -> Result<()> {
     let db = Arc::new(db::Database::open(&config.db_path)?);
 
     // Set up notification backend
-    let backend: Arc<dyn notification::NotificationBackend> = if let Some(ref tg_config) =
-        config.telegram
+    let backend: Arc<dyn notification::NotificationBackend> = if let Some(ref askgw_config) =
+        config.askgw
     {
+        let askgw = AskgwBackend::new(
+            askgw_config.socket_path.clone(),
+            askgw_config.gateway_uid,
+            std::time::Duration::from_secs(config.timeout_seconds as u64),
+            askgw_config.agent.clone(),
+        );
+        info!(
+            "askgw notification backend enabled (socket: {}, gateway_uid: {})",
+            askgw_config.socket_path.display(),
+            askgw_config.gateway_uid
+        );
+        Arc::new(askgw)
+    } else if let Some(ref tg_config) = config.telegram {
         if tg_config.chat_id == 0 {
             warn!("Telegram chat_id is 0 — this is almost certainly wrong. Set chat_id in config.");
         }
@@ -57,7 +71,7 @@ async fn main() -> Result<()> {
         );
         telegram
     } else {
-        anyhow::bail!("No approval mechanism configured. Set [telegram] in config.");
+        anyhow::bail!("No approval mechanism configured. Set [askgw] or [telegram] in config.");
     };
 
     // Set up BW session manager (if configured)

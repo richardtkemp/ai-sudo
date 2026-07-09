@@ -31,6 +31,8 @@ pub struct Config {
 
     pub telegram: Option<TelegramConfig>,
 
+    pub askgw: Option<AskgwConfig>,
+
     #[serde(default = "default_limits")]
     pub limits: LimitsConfig,
 
@@ -54,6 +56,22 @@ pub struct TelegramConfig {
     /// Must include at least {{user}} and {{command}}.
     #[serde(default)]
     pub message_template: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AskgwConfig {
+    /// Path to the askgw Unix socket (typically foci's data dir / askgw.sock).
+    pub socket_path: PathBuf,
+
+    /// Expected owner UID of the socket file. Before connecting, the backend
+    /// stats the socket and refuses to proceed if the owner doesn't match.
+    /// Required — protocol §3.2 mandates this check.
+    pub gateway_uid: u32,
+
+    /// Optional agent name to route asks to (e.g. "clutch"). If unset, the
+    /// gateway uses its default routing.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 fn default_socket_path() -> PathBuf {

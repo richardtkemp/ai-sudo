@@ -54,6 +54,23 @@ allowlist = [
 # (default: 365)
 # history_retention_days = 365
 
+# Approval backend. Configure EITHER [askgw] or [telegram] (or both — [askgw]
+# takes precedence when present). If neither is set, the daemon refuses to start.
+
+# ask-gateway backend: routes approval prompts through foci's interactive button
+# surface over a local Unix socket instead of Telegram.
+# [askgw]
+# Path to the askgw socket (typically foci's data dir / askgw.sock).
+# socket_path = "/run/foci/askgw.sock"
+#
+# Expected owner of the socket, as a username ("foci") or numeric uid ("994").
+# Before connecting, the backend stats the socket and refuses to proceed if the
+# owner doesn't match. An unknown username is a fatal startup error (fail closed).
+# gateway_uid = "foci"
+#
+# Optional agent name to route asks to. If unset, the gateway uses its default.
+# agent = "clutch"
+
 [telegram]
 # Create a bot via @BotFather on Telegram and paste the token here.
 bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"

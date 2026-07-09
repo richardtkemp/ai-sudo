@@ -87,6 +87,13 @@ allowlist = [
 bot_token = "your-bot-token"
 chat_id = 123456789
 
+# Alternative to [telegram]: route approvals through foci's interactive button
+# surface over a local Unix socket. Takes precedence over [telegram] when set.
+# [askgw]
+# socket_path = "/run/foci/askgw.sock"
+# gateway_uid = "foci"   # socket owner, as username or numeric uid (fail-closed check)
+# agent = "clutch"       # optional: route asks to a specific agent
+
 [limits]
 check_binary_ownership = "auto"  # "off", "auto" (allowlist/temp rules only), or "all" (including Telegram-approved)
 allowed_binary_owners = []       # additional trusted UIDs beyond root (default: root only)

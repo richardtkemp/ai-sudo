@@ -63,10 +63,10 @@ pub struct AskgwConfig {
     /// Path to the askgw Unix socket (typically foci's data dir / askgw.sock).
     pub socket_path: PathBuf,
 
-    /// Expected owner UID of the socket file. Before connecting, the backend
-    /// stats the socket and refuses to proceed if the owner doesn't match.
-    /// Required — protocol §3.2 mandates this check.
-    pub gateway_uid: u32,
+    /// Expected owner of the socket file — either a username ("foci") or a
+    /// numeric uid ("994"). Before connecting, the backend stats the socket
+    /// and refuses to proceed if the owner doesn't match. Protocol §3.2.
+    pub gateway_uid: String,
 
     /// Optional agent name to route asks to (e.g. "clutch"). If unset, the
     /// gateway uses its default routing.

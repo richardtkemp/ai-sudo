@@ -21,6 +21,20 @@ const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const CHANNEL_BUFFER: usize = 64;
 
+/// Resolve a configured `gateway_uid` (a numeric uid or a username) to a uid.
+/// Fails closed: an unresolvable value is a startup error rather than silently
+/// defaulting to a uid, so a typo can't mask the socket ownership check (§3.2).
+fn resolve_uid(s: &str) -> Result<u32> {
+    if let Ok(n) = s.parse::<u32>() {
+        return Ok(n);
+    }
+    match nix::unistd::User::from_name(s) {
+        Ok(Some(user)) => Ok(user.uid.as_raw()),
+        Ok(None) => Err(anyhow!("askgw: unknown user {s:?} for gateway_uid")),
+        Err(e) => Err(anyhow!("askgw: failed to resolve gateway_uid {s:?}: {e}")),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct AskFrame<'a> {
     protocol: &'a str,
@@ -106,27 +120,23 @@ pub struct AskgwBackend {
 impl AskgwBackend {
     pub fn new(
         socket_path: PathBuf,
-        gateway_uid: u32,
+        gateway_uid: String,
         timeout: Duration,
         agent: Option<String>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let uid = resolve_uid(&gateway_uid)?;
+        debug!("askgw: gateway_uid {gateway_uid:?} resolved to uid {uid}");
         let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
-        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> =
-            Arc::new(DashMap::new());
+        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> = Arc::new(DashMap::new());
 
-        tokio::spawn(connection_loop(
-            socket_path,
-            gateway_uid,
-            rx,
-            Arc::clone(&pending),
-        ));
+        tokio::spawn(connection_loop(socket_path, uid, rx, Arc::clone(&pending)));
 
-        Self {
+        Ok(Self {
             timeout,
             agent,
             outbox: tx,
             pending,
-        }
+        })
     }
 
     async fn ask_and_wait(
@@ -167,9 +177,14 @@ impl AskgwBackend {
         };
 
         let json = serde_json::to_string(&frame)?;
-        if self.outbox.send(json).await.is_err() {
+        // try_send (not send().await) so a disconnected backend with a full
+        // outbox fails immediately instead of blocking the caller for the whole
+        // outage; the Err maps to Decision::Denied at the call site (fail closed).
+        if self.outbox.try_send(json).is_err() {
             self.pending.remove(&id);
-            return Err(anyhow!("askgw connection closed"));
+            return Err(anyhow!(
+                "askgw backend unavailable (queue full or disconnected)"
+            ));
         }
 
         let result = match tokio::time::timeout(self.timeout, rx).await {
@@ -186,8 +201,7 @@ impl AskgwBackend {
                     id,
                     reason: "timeout",
                 };
-                let _ = serde_json::to_string(&cancel)
-                    .map(|j| self.outbox.try_send(j));
+                let _ = serde_json::to_string(&cancel).map(|j| self.outbox.try_send(j));
                 Ok(Decision::Timeout)
             }
         };
@@ -212,14 +226,18 @@ impl AskgwBackend {
             text,
         };
         let json = serde_json::to_string(&frame)?;
-        let _ = self.outbox.send(json).await;
+        // Notifications are best-effort: drop rather than block if the outbox is
+        // full/disconnected (try_send, not send().await).
+        let _ = self.outbox.try_send(json);
         Ok(())
     }
 }
 
 fn map_answer(frame: GatewayFrame, approve_label: &str) -> Result<Decision> {
     match frame {
-        GatewayFrame::Answer { status, answers, .. } => match status.as_str() {
+        GatewayFrame::Answer {
+            status, answers, ..
+        } => match status.as_str() {
             "answered" => {
                 let label = answers
                     .get("decision")
@@ -238,7 +256,7 @@ fn map_answer(frame: GatewayFrame, approve_label: &str) -> Result<Decision> {
         GatewayFrame::Error { code, message, .. } => {
             warn!("askgw error: code={code} message={message:?}");
             Ok(Decision::Denied)
-        },
+        }
         _ => Ok(Decision::Denied),
     }
 }
@@ -418,7 +436,11 @@ impl NotificationBackend for AskgwBackend {
     }
 
     async fn send_bw_request_and_wait(&self, record: &BwRequestRecord) -> Result<Decision> {
-        let vault = if record.session_active { "unlocked" } else { "locked" };
+        let vault = if record.session_active {
+            "unlocked"
+        } else {
+            "locked"
+        };
         let question = format!(
             "Retrieve Bitwarden credential?\n\nUser: {}\nItem: {}\nField: {}\nVault: {}",
             record.user, record.item_name, record.field, vault
@@ -506,6 +528,27 @@ impl NotificationBackend for AskgwBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_uid_numeric() {
+        assert_eq!(resolve_uid("994").unwrap(), 994);
+        assert_eq!(resolve_uid("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_resolve_uid_username() {
+        // root is present on every system this runs on and always maps to 0.
+        assert_eq!(resolve_uid("root").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_resolve_uid_unknown_user_errors() {
+        let err = resolve_uid("definitely-not-a-real-user-xyz").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown user"),
+            "error should name the unknown user: {err}"
+        );
+    }
 
     #[test]
     fn test_serialize_ask_frame() {
@@ -602,7 +645,9 @@ mod tests {
         let raw = r#"{"protocol":"askgw/1","type":"answer","id":"x","status":"answered","answers":{"decision":"Approve"}}"#;
         let frame: GatewayFrame = serde_json::from_str(raw).unwrap();
         match frame {
-            GatewayFrame::Answer { status, answers, .. } => {
+            GatewayFrame::Answer {
+                status, answers, ..
+            } => {
                 assert_eq!(status, "answered");
                 assert_eq!(
                     answers.get("decision").and_then(|v| v.as_str()),
@@ -635,7 +680,8 @@ mod tests {
 
     #[test]
     fn test_deserialize_error() {
-        let raw = r#"{"protocol":"askgw/1","type":"error","id":"x","code":"malformed","message":"bad"}"#;
+        let raw =
+            r#"{"protocol":"askgw/1","type":"error","id":"x","code":"malformed","message":"bad"}"#;
         let frame: GatewayFrame = serde_json::from_str(raw).unwrap();
         match frame {
             GatewayFrame::Error { code, message, .. } => {
@@ -671,7 +717,10 @@ mod tests {
         let frame = GatewayFrame::Answer {
             id: "x".into(),
             status: "answered".into(),
-            answers: HashMap::from([("decision".into(), serde_json::Value::String("Approve".into()))]),
+            answers: HashMap::from([(
+                "decision".into(),
+                serde_json::Value::String("Approve".into()),
+            )]),
         };
         assert_eq!(map_answer(frame, "Approve").unwrap(), Decision::Approved);
     }
@@ -728,8 +777,7 @@ mod tests {
 
     #[test]
     fn test_handle_gateway_frame_dispatches_to_pending() {
-        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> =
-            Arc::new(DashMap::new());
+        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> = Arc::new(DashMap::new());
         let (tx, rx) = oneshot::channel();
         pending.insert("abc".into(), tx);
 
@@ -745,8 +793,7 @@ mod tests {
 
     #[test]
     fn test_handle_gateway_frame_no_waiter() {
-        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> =
-            Arc::new(DashMap::new());
+        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> = Arc::new(DashMap::new());
         let raw = r#"{"protocol":"askgw/1","type":"answer","id":"nope","status":"answered"}"#;
         handle_gateway_frame(raw, &pending);
         assert!(pending.is_empty());
@@ -754,8 +801,7 @@ mod tests {
 
     #[test]
     fn test_handle_gateway_frame_ack_does_not_consume() {
-        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> =
-            Arc::new(DashMap::new());
+        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> = Arc::new(DashMap::new());
         let (tx, _rx) = oneshot::channel();
         pending.insert("abc".into(), tx);
 
@@ -767,8 +813,7 @@ mod tests {
 
     #[test]
     fn test_fail_pending_sends_error() {
-        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> =
-            Arc::new(DashMap::new());
+        let pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>> = Arc::new(DashMap::new());
         let (tx, rx) = oneshot::channel();
         pending.insert("k1".into(), tx);
 
@@ -803,6 +848,9 @@ mod tests {
         let result = verify_and_connect(&path, 0).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("not a socket"), "error should mention socket: {msg}");
+        assert!(
+            msg.contains("not a socket"),
+            "error should mention socket: {msg}"
+        );
     }
 }

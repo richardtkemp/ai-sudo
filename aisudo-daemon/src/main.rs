@@ -39,10 +39,10 @@ async fn main() -> Result<()> {
     {
         let askgw = AskgwBackend::new(
             askgw_config.socket_path.clone(),
-            askgw_config.gateway_uid,
+            askgw_config.gateway_uid.clone(),
             std::time::Duration::from_secs(config.timeout_seconds as u64),
             askgw_config.agent.clone(),
-        );
+        )?;
         info!(
             "askgw notification backend enabled (socket: {}, gateway_uid: {})",
             askgw_config.socket_path.display(),

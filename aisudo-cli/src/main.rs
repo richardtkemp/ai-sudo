@@ -123,11 +123,14 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let command = build_command(&args[cmd_start..]);
-    let user = get_current_user();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "/".to_string());
+
+    let mut cmd_args = args[cmd_start..].to_vec();
+    resolve_cwd_script(&mut cmd_args, &cwd);
+    let command = build_command(&cmd_args);
+    let user = get_current_user();
     let pid = std::process::id();
 
     // Capture stdin if piped/redirected (not a terminal)
@@ -1159,6 +1162,26 @@ fn capture_stdin() -> Result<Option<String>, String> {
 ///     security boundary.
 ///   * Multiple arguments — escape each to preserve argument boundaries; any
 ///     operator passed as its own arg stays literal.
+/// When the first argument is a bare filename (no path separator) that exists
+/// in the current directory, prepend `./` so the daemon's `sh -c` / `Command::new`
+/// finds it. Without this, `aisudo script.sh` fails because the shell only
+/// searches PATH for bare names — the user must type `aisudo ./script.sh`.
+fn resolve_cwd_script(args: &mut [String], cwd: &str) {
+    if args.is_empty() {
+        return;
+    }
+    let first = &args[0];
+    // Only resolve bare names — anything with a path separator is already
+    // a relative or absolute path.
+    if first.contains('/') {
+        return;
+    }
+    let candidate = std::path::Path::new(cwd).join(first);
+    if candidate.exists() {
+        args[0] = format!("./{}", first);
+    }
+}
+
 fn build_command(args: &[String]) -> String {
     if args.len() == 1 {
         args[0].clone()
@@ -1267,6 +1290,49 @@ mod tests {
         // Multiple args with no specials: plain join.
         let args = vec!["cp".to_string(), "a".to_string(), "b".to_string()];
         assert_eq!(build_command(&args), "cp a b");
+    }
+
+    #[test]
+    fn test_resolve_cwd_script() {
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_str = cwd.to_string_lossy();
+
+        // Bare filename that exists in cwd → prepended with ./
+        // (using this source file as the existing file)
+        let existing = cwd.join("Cargo.toml").to_string_lossy().to_string();
+        let dir = std::path::Path::new(&existing)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut args = vec!["Cargo.toml".to_string()];
+        resolve_cwd_script(&mut args, &dir);
+        assert_eq!(args[0], "./Cargo.toml");
+
+        // Bare filename that doesn't exist → unchanged (PATH command like systemctl)
+        let mut args = vec!["systemctl".to_string(), "restart".to_string()];
+        resolve_cwd_script(&mut args, &cwd_str);
+        assert_eq!(args[0], "systemctl");
+
+        // Already has a path separator → unchanged
+        let mut args = vec!["./script.sh".to_string()];
+        resolve_cwd_script(&mut args, &cwd_str);
+        assert_eq!(args[0], "./script.sh");
+
+        let mut args = vec!["/usr/bin/ls".to_string()];
+        resolve_cwd_script(&mut args, &cwd_str);
+        assert_eq!(args[0], "/usr/bin/ls");
+
+        // Empty args → no-op
+        let mut args: Vec<String> = vec![];
+        resolve_cwd_script(&mut args, &cwd_str);
+        assert!(args.is_empty());
+
+        // Args after the first are never touched
+        let mut args = vec!["Cargo.toml".to_string(), "Cargo.toml".to_string()];
+        resolve_cwd_script(&mut args, &dir);
+        assert_eq!(args[0], "./Cargo.toml");
+        assert_eq!(args[1], "Cargo.toml");
     }
 
     #[test]

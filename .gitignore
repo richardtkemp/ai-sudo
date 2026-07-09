@@ -2,3 +2,4 @@ aisudo.toml
 target/
 *.md
 .build-config.toml
+.claude/

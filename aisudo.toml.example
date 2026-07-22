@@ -99,7 +99,9 @@ allowlist = [
 # ssh-forwarding it. Requires foci's [askgw] http_enabled = true (foci-side
 # todo #1463 — the exact wire shape may still be settling; see
 # notification::askgw_http module doc in this repo for what this backend
-# currently assumes).
+# currently assumes). Also POSTs Bitwarden-unlock/access-link/scrub-complete/
+# command-completion notifications to foci's HTTP notify endpoint (foci-side
+# todo #1466, also assumed pending that landing — see the module doc).
 # [askgw_http]
 # Base URL of foci's HTTP server. No trailing slash.
 # endpoint = "https://foci.example.ts.net"

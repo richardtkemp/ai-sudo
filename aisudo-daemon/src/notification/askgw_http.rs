@@ -25,22 +25,29 @@
 //!
 //! # Adjustable interaction model
 //!
-//! The [`Transport`] trait isolates the wire shape (submit / poll / cancel)
-//! from the ask-and-wait orchestration in [`AskgwHttpBackend`]. If foci #1463
-//! lands a different shape (e.g. a single held-open call, or submit-returns-
-//! id-then-webhook), only a new `Transport` impl is needed — the
-//! `NotificationBackend` impl and the rest of this file are unaffected.
+//! The [`Transport`] trait isolates the wire shape (submit / poll / cancel /
+//! notify) from the ask-and-wait orchestration in [`AskgwHttpBackend`]. If
+//! foci #1463 lands a different shape (e.g. a single held-open call, or
+//! submit-returns-id-then-webhook), only a new `Transport` impl is needed —
+//! the `NotificationBackend` impl and the rest of this file are unaffected.
 //!
-//! # Known gap: fire-and-forget notifications
+//! # Fire-and-forget notifications (#1467) — ASSUMED, RECONCILE against foci #1466
 //!
-//! The assumed contract only covers the `ask` flow (submit/poll/cancel) — it
-//! has no equivalent of the socket transport's `notify` frame (used for
-//! Bitwarden-locked notices, access links, scrub-complete, and command
-//! completion status). Those four `NotificationBackend` methods are
-//! implemented as local-log no-ops here (see `log_unsupported_notify`) rather
-//! than silently dropped or hacked onto the `ask` endpoint. Flagged in
-//! `notes-1464.md` for reconciliation: if #1463 wants these delivered
-//! remotely too, foci's HTTP transport needs its own notify endpoint.
+//! The four `NotificationBackend` methods that don't wait for a decision
+//! (Bitwarden-locked notices, access links, scrub-complete, and command
+//! completion status) POST a `notify` frame to `{endpoint}/askgw/notify`
+//! (Bearer-auth'd the same as `ask`, fire-and-forget — no id/poll, unlike the
+//! `ask` flow). foci's HTTP notify endpoint (todo #1466) was unbuilt when this
+//! was written, so the body shape below is this side's assumption — mirrors
+//! the socket transport's `notify` frame ([`super::askgw::AskgwBackend`]'s
+//! `NotifyFrame`: `protocol`, `type`, `id`, `kind`, `level`, `title`, `text`)
+//! plus `source` and `agent` (present on `ask` but absent from the socket
+//! transport's notify, since HTTP has no persistent per-agent connection to
+//! carry that context implicitly). See `notes-1467.md` (repo root) for the
+//! exact JSON, prominently, for reconciliation. A delivery failure (network
+//! error or non-2xx) is logged and swallowed, never propagated to the
+//! caller — these are informational, same as the socket backend's
+//! `try_send`-and-drop.
 
 use super::{
     BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord,
@@ -81,6 +88,27 @@ struct Question<'a> {
 struct QuestionOption<'a> {
     label: &'a str,
     description: String,
+}
+
+/// Body for `POST /askgw/notify` — the ASSUMED fire-and-forget contract (see
+/// module doc). Mirrors the socket transport's `NotifyFrame` fields, plus
+/// `source`/`agent` to carry routing context HTTP has no other way to convey.
+#[derive(Debug, Serialize)]
+struct NotifyFrame<'a> {
+    protocol: &'a str,
+    #[serde(rename = "type")]
+    frame_type: &'a str,
+    id: String,
+    source: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    text: String,
 }
 
 /// Terminal or in-progress answer, as returned by `GET /askgw/ask/{id}`.
@@ -128,6 +156,11 @@ trait Transport: Send + Sync {
     /// Errors are logged, not propagated — cancellation is a courtesy to free
     /// server-side state, not required for correctness on this side.
     async fn cancel(&self, id: &str, reason: &str);
+
+    /// Deliver a fire-and-forget `notify` frame. `Err` means delivery failed
+    /// (network error or non-2xx) — the caller logs and swallows it, same
+    /// convention as `cancel`.
+    async fn notify(&self, frame: &NotifyFrame<'_>) -> Result<()>;
 }
 
 /// [`Transport`] impl for the ASSUMED contract: `POST /askgw/ask`, `GET
@@ -213,6 +246,25 @@ impl Transport for LongPollTransport {
                 warn!("askgw_http: cancel {id} request failed: {e}");
             }
         }
+    }
+
+    async fn notify(&self, frame: &NotifyFrame<'_>) -> Result<()> {
+        let resp = self
+            .client
+            .post(self.url("/askgw/notify"))
+            .bearer_auth(&self.api_key)
+            .json(frame)
+            .send()
+            .await
+            .map_err(|e| anyhow!("askgw_http: notify request failed: {e}"))?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "askgw_http: notify rejected: HTTP {}",
+            resp.status()
+        ))
     }
 }
 
@@ -342,15 +394,32 @@ impl AskgwHttpBackend {
         }
     }
 
-    /// The assumed contract has no `notify`-equivalent endpoint (see module
-    /// doc "Known gap"). Log locally so the operator isn't silently left
-    /// without ANY record of the event, rather than pretending it was
-    /// delivered.
-    fn log_unsupported_notify(&self, what: &str, text: &str) {
-        warn!(
-            "askgw_http: {what} not delivered — HTTP askgw has no notify endpoint in the \
-             assumed contract (see notification::askgw_http module doc, notes-1464.md): {text}"
-        );
+    /// Build and POST a `notify` frame (see module doc "Fire-and-forget
+    /// notifications"). Always returns `Ok(())` — delivery failure is
+    /// logged, not propagated, matching the socket backend's
+    /// try_send-and-drop semantics (see `askgw::AskgwBackend::send_notify`).
+    async fn send_notify(
+        &self,
+        kind: Option<&str>,
+        level: Option<&str>,
+        title: Option<&str>,
+        text: String,
+    ) -> Result<()> {
+        let frame = NotifyFrame {
+            protocol: PROTOCOL,
+            frame_type: "notify",
+            id: Uuid::new_v4().to_string(),
+            source: "aisudo",
+            agent: self.agent.as_deref(),
+            kind,
+            level,
+            title,
+            text,
+        };
+        if let Err(e) = self.transport.notify(&frame).await {
+            warn!("askgw_http: notify delivery failed: {e:#}");
+        }
+        Ok(())
     }
 }
 
@@ -432,31 +501,51 @@ impl NotificationBackend for AskgwHttpBackend {
     }
 
     async fn send_bw_locked_notification(&self, record: &BwRequestRecord) -> Result<()> {
-        self.log_unsupported_notify(
-            "BW-locked notification",
-            &format!("item={} field={}", record.item_name, record.field),
+        let text = format!(
+            "Bitwarden vault is locked. Request for '{}' ({}) is waiting.\nUnlock via dashboard to approve.",
+            record.item_name, record.field
         );
-        Ok(())
+        self.send_notify(Some("locked"), Some("warning"), Some("BW Locked"), text)
+            .await
     }
 
     async fn send_access_link(&self, url: &str) -> Result<()> {
-        self.log_unsupported_notify("web access link", url);
-        Ok(())
+        self.send_notify(
+            Some("access_link"),
+            Some("info"),
+            Some("Web Access"),
+            format!("Tap to open the vault dashboard:\n{url}"),
+        )
+        .await
     }
 
     async fn send_scrub_complete(&self, request_id: &str, item_name: &str) -> Result<()> {
-        self.log_unsupported_notify(
-            "scrub-complete notification",
-            &format!("request={request_id} item={item_name}"),
-        );
-        Ok(())
+        self.send_notify(
+            Some("completion"),
+            Some("success"),
+            None,
+            format!("Credential scrubbed: {item_name} (request {request_id})"),
+        )
+        .await
     }
 
     async fn update_completion_status(&self, info: &CompletionInfo) {
-        self.log_unsupported_notify(
-            "completion status update",
-            &format!("request={} exit={}", info.request_id, info.exit_code),
-        );
+        let text = if info.exit_code == 0 {
+            format!("Command completed: exit 0 (request {})", info.request_id)
+        } else {
+            let detail = info
+                .last_lines
+                .as_ref()
+                .map(|l| format!(": {l}"))
+                .unwrap_or_default();
+            format!(
+                "Command failed: exit {} (request {}){}",
+                info.exit_code, info.request_id, detail
+            )
+        };
+        let _ = self
+            .send_notify(Some("completion"), Some("info"), None, text)
+            .await;
     }
 
     fn name(&self) -> &'static str {
@@ -544,6 +633,49 @@ mod tests {
         assert!(frame.answers.is_empty());
     }
 
+    #[test]
+    fn test_serialize_notify_frame() {
+        let frame = NotifyFrame {
+            protocol: PROTOCOL,
+            frame_type: "notify",
+            id: "n1".into(),
+            source: "aisudo",
+            agent: Some("clutch"),
+            kind: Some("completion"),
+            level: Some("success"),
+            title: None,
+            text: "exit 0".into(),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"type\":\"notify\""));
+        assert!(json.contains("\"kind\":\"completion\""));
+        assert!(json.contains("\"level\":\"success\""));
+        assert!(json.contains("\"agent\":\"clutch\""));
+        assert!(!json.contains("title"));
+    }
+
+    #[test]
+    fn test_serialize_notify_frame_without_agent() {
+        let frame = NotifyFrame {
+            protocol: PROTOCOL,
+            frame_type: "notify",
+            id: "n2".into(),
+            source: "aisudo",
+            agent: None,
+            kind: None,
+            level: None,
+            title: None,
+            text: "hi".into(),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(!json.contains("agent"));
+        assert!(!json.contains("kind"));
+    }
+
+    /// (kind, level, title, text) of one captured `notify()` call, owned
+    /// since `NotifyFrame`'s fields borrow from the caller's stack frame.
+    type NotifyCall = (Option<String>, Option<String>, Option<String>, String);
+
     /// Fake [`Transport`] driven by a scripted sequence of poll results, so
     /// `ask_and_wait`'s orchestration (loop-until-terminal, timeout, cancel-
     /// on-give-up) can be tested without a real HTTP server — the seam the
@@ -554,6 +686,9 @@ mod tests {
         poll_results: Mutex<Vec<Result<AnswerFrame, String>>>,
         poll_calls: Arc<AtomicUsize>,
         cancel_calls: Arc<AtomicUsize>,
+        notify_result: Result<(), String>,
+        notify_calls: Arc<AtomicUsize>,
+        notify_frames: Arc<Mutex<Vec<NotifyCall>>>,
     }
 
     impl FakeTransport {
@@ -589,6 +724,17 @@ mod tests {
         async fn cancel(&self, _id: &str, _reason: &str) {
             self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         }
+
+        async fn notify(&self, frame: &NotifyFrame<'_>) -> Result<()> {
+            self.notify_calls.fetch_add(1, Ordering::SeqCst);
+            self.notify_frames.lock().unwrap().push((
+                frame.kind.map(String::from),
+                frame.level.map(String::from),
+                frame.title.map(String::from),
+                frame.text.clone(),
+            ));
+            self.notify_result.clone().map_err(|e| anyhow!(e))
+        }
     }
 
     /// Builds a backend over `transport`, returning it alongside the shared
@@ -606,10 +752,44 @@ mod tests {
             poll_results: Mutex::new(transport_no_counters.poll_results),
             poll_calls: Arc::clone(&poll_calls),
             cancel_calls: Arc::clone(&cancel_calls),
+            notify_result: Ok(()),
+            notify_calls: Arc::new(AtomicUsize::new(0)),
+            notify_frames: Arc::new(Mutex::new(Vec::new())),
         };
         let backend =
             AskgwHttpBackend::with_transport(Box::new(transport), timeout, poll_wait, None);
         (backend, poll_calls, cancel_calls)
+    }
+
+    /// Builds a backend for exercising the four fire-and-forget notify
+    /// methods, decoupled from the ask/poll/cancel infra above (a separate
+    /// concern) — captures every `notify()` call's (kind, level, title,
+    /// text) for assertion.
+    fn notify_backend_with(
+        notify_result: Result<(), String>,
+    ) -> (
+        AskgwHttpBackend,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<NotifyCall>>>,
+    ) {
+        let notify_calls = Arc::new(AtomicUsize::new(0));
+        let notify_frames = Arc::new(Mutex::new(Vec::new()));
+        let transport = FakeTransport {
+            submit_result: Ok(()),
+            poll_results: Mutex::new(Vec::new()),
+            poll_calls: Arc::new(AtomicUsize::new(0)),
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
+            notify_result,
+            notify_calls: Arc::clone(&notify_calls),
+            notify_frames: Arc::clone(&notify_frames),
+        };
+        let backend = AskgwHttpBackend::with_transport(
+            Box::new(transport),
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            Some("clutch".into()),
+        );
+        (backend, notify_calls, notify_frames)
     }
 
     /// Plain-data spec for building a [`FakeTransport`] via [`backend_with`],
@@ -830,5 +1010,111 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_completion_status_success_delivers_notify() {
+        let (backend, notify_calls, notify_frames) = notify_backend_with(Ok(()));
+        backend
+            .update_completion_status(&CompletionInfo {
+                request_id: "req-1".into(),
+                exit_code: 0,
+                last_lines: None,
+            })
+            .await;
+        assert_eq!(notify_calls.load(Ordering::SeqCst), 1);
+        let frames = notify_frames.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0]
+            .3
+            .contains("Command completed: exit 0 (request req-1)"));
+    }
+
+    #[tokio::test]
+    async fn test_update_completion_status_failure_includes_last_lines() {
+        let (backend, _calls, notify_frames) = notify_backend_with(Ok(()));
+        backend
+            .update_completion_status(&CompletionInfo {
+                request_id: "req-2".into(),
+                exit_code: 1,
+                last_lines: Some("boom".into()),
+            })
+            .await;
+        let frames = notify_frames.lock().unwrap();
+        assert!(frames[0].3.contains("exit 1"));
+        assert!(frames[0].3.contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_update_completion_status_delivery_failure_is_swallowed() {
+        // Fire-and-forget: a failed POST must not panic or surface to the
+        // caller (update_completion_status returns (), not Result).
+        let (backend, notify_calls, _frames) = notify_backend_with(Err("network down".into()));
+        backend
+            .update_completion_status(&CompletionInfo {
+                request_id: "req-3".into(),
+                exit_code: 0,
+                last_lines: None,
+            })
+            .await;
+        assert_eq!(notify_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_bw_locked_notification_delivers_notify() {
+        let (backend, notify_calls, notify_frames) = notify_backend_with(Ok(()));
+        let record = BwRequestRecord {
+            id: "r1".into(),
+            user: "alice".into(),
+            item_name: "AWS".into(),
+            field: "password".into(),
+            session_active: false,
+            unlock_url: None,
+        };
+        backend.send_bw_locked_notification(&record).await.unwrap();
+        assert_eq!(notify_calls.load(Ordering::SeqCst), 1);
+        let frames = notify_frames.lock().unwrap();
+        assert_eq!(frames[0].0.as_deref(), Some("locked"));
+        assert!(frames[0].3.contains("AWS"));
+    }
+
+    #[tokio::test]
+    async fn test_send_access_link_delivers_notify() {
+        let (backend, notify_calls, notify_frames) = notify_backend_with(Ok(()));
+        backend
+            .send_access_link("https://example.com/unlock")
+            .await
+            .unwrap();
+        assert_eq!(notify_calls.load(Ordering::SeqCst), 1);
+        let frames = notify_frames.lock().unwrap();
+        assert_eq!(frames[0].0.as_deref(), Some("access_link"));
+        assert!(frames[0].3.contains("https://example.com/unlock"));
+    }
+
+    #[tokio::test]
+    async fn test_send_scrub_complete_delivers_notify() {
+        let (backend, notify_calls, notify_frames) = notify_backend_with(Ok(()));
+        backend.send_scrub_complete("req-9", "AWS").await.unwrap();
+        assert_eq!(notify_calls.load(Ordering::SeqCst), 1);
+        let frames = notify_frames.lock().unwrap();
+        assert_eq!(frames[0].0.as_deref(), Some("completion"));
+        assert!(frames[0].3.contains("AWS"));
+        assert!(frames[0].3.contains("req-9"));
+    }
+
+    #[tokio::test]
+    async fn test_send_bw_locked_notification_delivery_failure_still_ok() {
+        // Result<()>-returning notify methods must also swallow delivery
+        // failures (fire-and-forget), returning Ok(()) regardless.
+        let (backend, ..) = notify_backend_with(Err("network down".into()));
+        let record = BwRequestRecord {
+            id: "r1".into(),
+            user: "alice".into(),
+            item_name: "AWS".into(),
+            field: "password".into(),
+            session_active: false,
+            unlock_url: None,
+        };
+        assert!(backend.send_bw_locked_notification(&record).await.is_ok());
     }
 }

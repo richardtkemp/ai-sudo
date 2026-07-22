@@ -99,9 +99,13 @@ install -o root -g root -m 755 "$DAEMON_BIN" /usr/local/bin/aisudo-daemon
 install -o root -g root -m 755 "$CLI_BIN" /usr/local/bin/aisudo
 
 # Config carries the Telegram token — create it 0600 atomically.
-info "Installing config to /etc/aisudo/aisudo.toml..."
 install -d -o root -g root -m 755 /etc/aisudo
-install -o root -g root -m 600 "$CONFIG_FILE" /etc/aisudo/aisudo.toml
+if [[ -f "$CONFIG_FILE" ]]; then
+    info "Installing config to /etc/aisudo/aisudo.toml..."
+    install -o root -g root -m 600 "$CONFIG_FILE" /etc/aisudo/aisudo.toml
+else
+    info "No local aisudo.toml; keeping existing /etc/aisudo/aisudo.toml"
+fi
 
 # Socket dir: group-traversable (x) but NOT group-writable, so aisudo members can
 # reach the socket but cannot unlink/replace it. (systemd's RuntimeDirectory
@@ -181,9 +185,13 @@ install_macos() {
     install -o root -g wheel -m 755 "$DAEMON_BIN" /usr/local/bin/aisudo-daemon
     install -o root -g wheel -m 755 "$CLI_BIN" /usr/local/bin/aisudo
 
-    info "Installing config to /etc/aisudo/aisudo.toml..."
     install -d -o root -g wheel -m 755 /etc/aisudo
-    install -o root -g wheel -m 600 "$CONFIG_FILE" /etc/aisudo/aisudo.toml
+    if [[ -f "$CONFIG_FILE" ]]; then
+        info "Installing config to /etc/aisudo/aisudo.toml..."
+        install -o root -g wheel -m 600 "$CONFIG_FILE" /etc/aisudo/aisudo.toml
+    else
+        info "No local aisudo.toml; keeping existing /etc/aisudo/aisudo.toml"
+    fi
 
     # Socket dir: group-traversable (x) but NOT group-writable, so aisudo
     # members can reach the socket but cannot unlink/replace it. /private/var/run
@@ -244,9 +252,13 @@ NEWSYSLOG_EOF
 # =====================================================================
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
-    error "aisudo.toml not found at $CONFIG_FILE"
-    error "Copy aisudo.toml.example to aisudo.toml and fill in your settings before running setup."
-    exit 1
+    if [[ -f /etc/aisudo/aisudo.toml ]]; then
+        info "No local aisudo.toml; keeping existing config at /etc/aisudo/aisudo.toml"
+    else
+        error "aisudo.toml not found at $CONFIG_FILE"
+        error "Copy aisudo.toml.example to aisudo.toml and fill in your settings before running setup."
+        exit 1
+    fi
 fi
 
 if [[ $EUID -ne 0 ]]; then

@@ -129,6 +129,15 @@ sleep 2
 if systemctl is-active --quiet aisudo-daemon; then
     info "aisudo-daemon is running!"
     echo ""
+    if id -nG "$BUILD_USER" | tr ' ' '\n' | grep -qx aisudo; then
+        info "$BUILD_USER is already a member of the aisudo group"
+    else
+        echo "Next steps:"
+        echo "  Add your user to the aisudo group:"
+        echo "    sudo usermod -aG aisudo $BUILD_USER"
+        echo "  (new group membership needs a fresh login shell or 'newgrp aisudo')"
+        echo ""
+    fi
     echo "=== aisudo setup completed at \$(date) ==="
     echo "View this log: cat /var/log/aisudo-setup.log"
 else
@@ -232,11 +241,15 @@ NEWSYSLOG_EOF
     if launchctl print system/ai.sudo.daemon &>/dev/null; then
         info "aisudo-daemon is running!"
         echo ""
-        echo "Next steps:"
-        echo "  Add your user to the aisudo group:"
-        echo "    sudo dseditgroup -o edit -a $BUILD_USER -t user aisudo"
-        echo "  (new group membership needs a fresh login shell or 'sg aisudo -l')"
-        echo ""
+        if dseditgroup -o checkmember -m "$BUILD_USER" aisudo &>/dev/null; then
+            info "$BUILD_USER is already a member of the aisudo group"
+        else
+            echo "Next steps:"
+            echo "  Add your user to the aisudo group:"
+            echo "    sudo dseditgroup -o edit -a $BUILD_USER -t user aisudo"
+            echo "  (new group membership needs a fresh login shell or 'sg aisudo -l')"
+            echo ""
+        fi
         echo "  Status:   sudo launchctl print system/ai.sudo.daemon"
         echo "  Logs:     tail -f /var/log/aisudo.log"
         echo "  Restart:  sudo launchctl kickstart -k system/ai.sudo.daemon"

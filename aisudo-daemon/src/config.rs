@@ -33,6 +33,8 @@ pub struct Config {
 
     pub askgw: Option<AskgwConfig>,
 
+    pub askgw_http: Option<AskgwHttpConfig>,
+
     #[serde(default = "default_limits")]
     pub limits: LimitsConfig,
 
@@ -72,6 +74,51 @@ pub struct AskgwConfig {
     /// gateway uses its default routing.
     #[serde(default)]
     pub agent: Option<String>,
+}
+
+/// Configuration for the HTTP askgw backend — reaches foci's ask-gateway over
+/// the network (its HTTP askgw endpoint, foci-side todo #1463) instead of a
+/// Unix socket. For a REMOTE host (e.g. a Mac) that can't reach the local
+/// socket without ssh-forwarding it. See notification::askgw_http for the
+/// wire contract (ASSUMED — reconcile against foci #1463 at review) and
+/// notes-1464.md for the exact request/response JSON this was built against.
+#[derive(Debug, Deserialize)]
+pub struct AskgwHttpConfig {
+    /// Base URL of foci's HTTP server, e.g. "https://foci.example.ts.net".
+    /// No trailing slash. The backend appends /askgw/ask, /askgw/ask/{id},
+    /// and /askgw/ask/{id}/cancel.
+    pub endpoint: String,
+
+    /// Bearer token — the SAME value as foci's `http.api_key` secret. Sent as
+    /// `Authorization: Bearer <api_key>` on every request, mirroring foci's
+    /// existing HTTP auth (cmd/foci-gw/http.go authMiddleware).
+    pub api_key: String,
+
+    /// Optional agent name to route asks to (e.g. "clutch"). If unset, the
+    /// gateway uses its default routing. Same semantics as [askgw].agent.
+    #[serde(default)]
+    pub agent: Option<String>,
+
+    /// How long each long-poll GET is allowed to block server-side, in
+    /// seconds, before returning a "pending" status for the client to
+    /// re-poll. foci's endpoint is assumed to clamp this to its own
+    /// server-side max regardless of what's requested here.
+    #[serde(default = "default_askgw_http_poll_wait")]
+    pub poll_wait_seconds: u32,
+
+    /// HTTP client timeout for each individual request (submit/poll/cancel),
+    /// in seconds. Must exceed poll_wait_seconds by a margin so the long-poll
+    /// response itself isn't cut off by the client's own request timeout.
+    #[serde(default = "default_askgw_http_request_timeout")]
+    pub request_timeout_seconds: u32,
+}
+
+fn default_askgw_http_poll_wait() -> u32 {
+    20
+}
+
+fn default_askgw_http_request_timeout() -> u32 {
+    30
 }
 
 fn default_socket_path() -> PathBuf {

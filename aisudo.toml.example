@@ -54,8 +54,9 @@ allowlist = [
 # (default: 365)
 # history_retention_days = 365
 
-# Approval backend. Configure EITHER [askgw] or [telegram] (or both — [askgw]
-# takes precedence when present). If neither is set, the daemon refuses to start.
+# Approval backend. Configure ONE of [askgw], [askgw_http], or [telegram].
+# If more than one is set, precedence is [askgw] > [askgw_http] > [telegram].
+# If none is set, the daemon refuses to start.
 
 # ask-gateway backend: routes approval prompts through foci's interactive button
 # surface over a local Unix socket instead of Telegram.
@@ -70,6 +71,31 @@ allowlist = [
 #
 # Optional agent name to route asks to. If unset, the gateway uses its default.
 # agent = "clutch"
+
+# ask-gateway over HTTP: same approval flow as [askgw], but reaches foci's
+# network-facing askgw endpoint instead of a Unix socket. For a REMOTE host
+# (e.g. a Mac running aisudo) that can't reach foci's local socket without
+# ssh-forwarding it. Requires foci's [askgw] http_enabled = true (foci-side
+# todo #1463 — the exact wire shape may still be settling; see
+# notification::askgw_http module doc in this repo for what this backend
+# currently assumes).
+# [askgw_http]
+# Base URL of foci's HTTP server. No trailing slash.
+# endpoint = "https://foci.example.ts.net"
+#
+# SAME value as foci's `http.api_key` secret. Sent as a bearer token.
+# api_key = "your-foci-http-api-key"
+#
+# Optional agent name to route asks to. If unset, the gateway uses its default.
+# agent = "clutch"
+#
+# Long-poll GET wait, in seconds (foci's server-side max is assumed to clamp
+# this further regardless).
+# poll_wait_seconds = 20
+#
+# HTTP client timeout per request (submit/poll/cancel), in seconds. Should
+# exceed poll_wait_seconds by a margin.
+# request_timeout_seconds = 30
 
 [telegram]
 # Create a bot via @BotFather on Telegram and paste the token here.

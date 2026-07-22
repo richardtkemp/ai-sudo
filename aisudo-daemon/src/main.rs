@@ -11,6 +11,7 @@ mod web_auth;
 use anyhow::Result;
 use dashmap::DashMap;
 use notification::askgw::AskgwBackend;
+use notification::askgw_http::AskgwHttpBackend;
 use notification::telegram::TelegramBackend;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -33,7 +34,13 @@ async fn main() -> Result<()> {
     info!("Opening database: {}", config.db_path.display());
     let db = Arc::new(db::Database::open(&config.db_path)?);
 
-    // Set up notification backend
+    // Set up notification backend. Precedence when more than one section is
+    // configured: [askgw] (local Unix socket, strongest transport security —
+    // SO_PEERCRED UID check) > [askgw_http] (network askgw, weaker bearer-
+    // token auth, for a remote host that can't reach the socket) > [telegram]
+    // (the original / fallback backend). In practice only one is normally
+    // set — a remote host running aisudo has no local askgw.sock to point
+    // [askgw] at, so it configures [askgw_http] instead.
     let backend: Arc<dyn notification::NotificationBackend> = if let Some(ref askgw_config) =
         config.askgw
     {
@@ -49,6 +56,20 @@ async fn main() -> Result<()> {
             askgw_config.gateway_uid
         );
         Arc::new(askgw)
+    } else if let Some(ref http_config) = config.askgw_http {
+        let askgw_http = AskgwHttpBackend::new(
+            http_config.endpoint.clone(),
+            http_config.api_key.clone(),
+            http_config.agent.clone(),
+            std::time::Duration::from_secs(config.timeout_seconds as u64),
+            std::time::Duration::from_secs(http_config.poll_wait_seconds as u64),
+            std::time::Duration::from_secs(http_config.request_timeout_seconds as u64),
+        )?;
+        info!(
+            "askgw_http notification backend enabled (endpoint: {})",
+            http_config.endpoint
+        );
+        Arc::new(askgw_http)
     } else if let Some(ref tg_config) = config.telegram {
         if tg_config.chat_id == 0 {
             warn!("Telegram chat_id is 0 — this is almost certainly wrong. Set chat_id in config.");
@@ -71,7 +92,9 @@ async fn main() -> Result<()> {
         );
         telegram
     } else {
-        anyhow::bail!("No approval mechanism configured. Set [askgw] or [telegram] in config.");
+        anyhow::bail!(
+            "No approval mechanism configured. Set [askgw], [askgw_http], or [telegram] in config."
+        );
     };
 
     // Set up BW session manager (if configured)

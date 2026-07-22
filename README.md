@@ -94,6 +94,17 @@ chat_id = 123456789
 # gateway_uid = "foci"   # socket owner, as username or numeric uid (fail-closed check)
 # agent = "clutch"       # optional: route asks to a specific agent
 
+# Alternative to both: same askgw approval flow, but over the network instead
+# of a local socket — for a REMOTE host (e.g. a Mac) that can't reach foci's
+# socket without ssh-forwarding it. Takes precedence over [telegram], but
+# [askgw] wins if both are set. Requires foci's [askgw] http_enabled = true.
+# [askgw_http]
+# endpoint = "https://foci.example.ts.net"  # foci's HTTP server base URL
+# api_key = "your-foci-http-api-key"        # same value as foci's http.api_key
+# agent = "clutch"                          # optional: route asks to a specific agent
+# poll_wait_seconds = 20                    # long-poll GET wait
+# request_timeout_seconds = 30              # HTTP client timeout per request
+
 [limits]
 check_binary_ownership = "auto"  # "off", "auto" (allowlist/temp rules only), or "all" (including Telegram-approved)
 allowed_binary_owners = []       # additional trusted UIDs beyond root (default: root only)
@@ -209,6 +220,7 @@ If you're using [OpenClaw](https://github.com/openclaw/openclaw), add this to yo
 - Unix socket is `root:aisudo 0660` — only group members can request
 - All requests and decisions are logged to SQLite for audit
 - Telegram notifications are not E2E encrypted — suitable for personal servers, not high-security environments
+- `[askgw_http]` (network askgw) is gated by a single bearer token (foci's `http.api_key`) — a materially weaker gate than `[askgw]`'s local-socket SO_PEERCRED UID check. Only use it for a host that genuinely can't reach the socket (e.g. over Tailscale/HTTPS to a trusted foci instance), not as a drop-in upgrade for a host that could use the socket instead.
 - Rate limiting prevents abuse (10 requests/minute/user)
 - **Single root process (no privilege separation):** splitting into an unprivileged front-end + a minimal root executor was evaluated and judged not worth the complexity here. The front-end *is* the approval authority, so compromising it already lets an attacker authorize arbitrary root execution regardless of any split — privsep would only shrink the blast radius of memory-safety/dependency bugs, a modest gain in a Rust codebase for this personal-server threat model.
 

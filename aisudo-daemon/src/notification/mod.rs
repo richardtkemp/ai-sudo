@@ -1,4 +1,5 @@
 pub mod askgw;
+pub mod askgw_http;
 pub mod telegram;
 
 use aisudo_common::{Decision, SudoRequestRecord};

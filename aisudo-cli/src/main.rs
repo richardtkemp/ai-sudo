@@ -307,45 +307,7 @@ fn main() -> ExitCode {
     // Uses the cloned writer fd (same underlying socket) to set SO_RCVTIMEO.
     writer.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
-    // Stream output from daemon
-    let mut exit_code: i32 = 1;
-
-    for line_result in lines {
-        let line = match line_result {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("{}: read error during execution: {e}", BINARY_NAME);
-                return ExitCode::from(1);
-            }
-        };
-
-        if line.is_empty() {
-            continue;
-        }
-
-        let output: ExecOutput = match serde_json::from_str(&line) {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-
-        match output.stream.as_str() {
-            "stdout" => {
-                print!("{}", output.data);
-                let _ = std::io::stdout().flush();
-            }
-            "stderr" => {
-                eprint!("{}", output.data);
-                let _ = std::io::stderr().flush();
-            }
-            "exit" => {
-                exit_code = output.exit_code.unwrap_or(1);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    ExitCode::from(exit_code as u8)
+    ExitCode::from(stream_exec_output(lines) as u8)
 }
 
 fn handle_request_rule(args: &[String]) -> ExitCode {
@@ -1032,15 +994,40 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     // Set read timeout for output streaming phase
     writer.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
-    // Stream output from daemon
+    ExitCode::from(stream_exec_output(lines) as u8)
+}
+
+/// Consume the exec-output stream from the daemon: print stdout/stderr lines as they
+/// arrive and return the command's exit code once the "exit" record is seen.
+///
+/// The socket has a read timeout (SO_RCVTIMEO) applied by the caller so the client
+/// doesn't block forever on a dead connection. But a long-running remote command can
+/// legitimately go quiet (no stdout/stderr) for longer than any single read timeout
+/// while still running fine — a disk scan between progress lines, for example. When
+/// that happens the read syscall returns EAGAIN/EWOULDBLOCK (or ETIMEDOUT), which is
+/// indistinguishable at this layer from a real problem unless we retry: erroring out
+/// here misreports a live, still-running command as a failure (#1402) even though the
+/// daemon-side process survives and completes correctly. So only treat a genuine
+/// connection loss as fatal; an idle-timeout read error just means "try again".
+fn stream_exec_output<I: Iterator<Item = std::io::Result<String>>>(lines: I) -> i32 {
     let mut exit_code: i32 = 1;
 
     for line_result in lines {
         let line = match line_result {
             Ok(l) => l,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Idle read timeout — the command may still be running quietly.
+                // Retry rather than declaring failure.
+                continue;
+            }
             Err(e) => {
-                eprintln!("{}: read error: {e}", BINARY_NAME);
-                return ExitCode::from(1);
+                eprintln!("{}: read error during execution: {e}", BINARY_NAME);
+                return 1;
             }
         };
 
@@ -1070,7 +1057,7 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
         }
     }
 
-    ExitCode::from(exit_code as u8)
+    exit_code
 }
 
 fn get_current_user() -> String {
@@ -1448,6 +1435,38 @@ mod tests {
                 .any(|a| a == "-l" || a == "--list-rules")
                 || args.get(1).map(|s| s.as_str()) == Some("-l")
         );
+    }
+
+    #[test]
+    fn idle_read_timeout_is_retried_not_fatal() {
+        // Repro for #1402: a long-running command that goes quiet for longer than the
+        // client's SO_RCVTIMEO produces a WouldBlock/TimedOut read error on the socket
+        // even though the daemon-side process is still alive and will finish normally.
+        // The streaming loop must retry on that error, not treat it as connection loss.
+        let lines: Vec<std::io::Result<String>> = vec![
+            Ok(r#"{"stream":"stdout","data":"part 1\n"}"#.to_string()),
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)), // idle timeout mid-stream
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),   // a second idle timeout
+            Ok(r#"{"stream":"stdout","data":"part 2\n"}"#.to_string()),
+            Ok(r#"{"stream":"exit","data":"","exit_code":0}"#.to_string()),
+        ];
+        let exit_code = stream_exec_output(lines.into_iter());
+        assert_eq!(
+            exit_code, 0,
+            "idle read timeouts must be retried, not surfaced as a failed command"
+        );
+    }
+
+    #[test]
+    fn real_connection_loss_is_still_fatal() {
+        // A genuine broken connection (not an idle timeout) must still be reported as
+        // a failure — only WouldBlock/TimedOut are safe to retry.
+        let lines: Vec<std::io::Result<String>> = vec![
+            Ok(r#"{"stream":"stdout","data":"part 1\n"}"#.to_string()),
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ];
+        let exit_code = stream_exec_output(lines.into_iter());
+        assert_eq!(exit_code, 1);
     }
 }
 

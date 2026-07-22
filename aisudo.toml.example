@@ -41,6 +41,26 @@ allowlist = [
     # "apt list",
 ]
 
+# --- macOS allowlist (uncomment on Darwin) ---------------------------
+# These are read-only commands safe to auto-approve on macOS. Linux users:
+# leave this commented; the defaults above and the project README are
+# Linux-shaped. Note `/var/lib/aisudo/aisudo.db` doesn't exist on macOS —
+# the daemon uses `/var/db/aisudo/aisudo.db` there automatically, so the
+# db_path below stays commented.
+#
+# allowlist = [
+#     "brew list",
+#     "brew search",
+#     "brew info",
+#     "launchctl list",
+#     "log show",
+#     "diskutil list",
+#     "softwareupdate --list",
+#     "ps aux",
+#     "vm_stat",
+#     "networksetup -listallhardwareports",
+# ]
+
 # Stdin size limits and temp rule settings
 [limits]
 # Maximum stdin payload size in bytes (default: 10 MB)
@@ -62,6 +82,7 @@ allowlist = [
 # surface over a local Unix socket instead of Telegram.
 # [askgw]
 # Path to the askgw socket (typically foci's data dir / askgw.sock).
+# NOTE: bare /run does not exist on macOS — use /var/run/... there.
 # socket_path = "/run/foci/askgw.sock"
 #
 # Expected owner of the socket, as a username ("foci") or numeric uid ("994").

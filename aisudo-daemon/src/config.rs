@@ -125,6 +125,14 @@ fn default_socket_path() -> PathBuf {
     PathBuf::from("/var/run/aisudo/aisudo.sock")
 }
 
+#[cfg(target_os = "macos")]
+fn default_db_path() -> PathBuf {
+    // /var/lib does not exist by default on Darwin; /var/db is the macOS
+    // convention (used by dyld, locationd, etc.).
+    PathBuf::from("/var/db/aisudo/aisudo.db")
+}
+
+#[cfg(not(target_os = "macos"))]
 fn default_db_path() -> PathBuf {
     PathBuf::from("/var/lib/aisudo/aisudo.db")
 }
@@ -869,6 +877,12 @@ max_stdin_bytes = 1024
             config.socket_path.to_str().unwrap(),
             "/var/run/aisudo/aisudo.sock"
         );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            config.db_path.to_str().unwrap(),
+            "/var/db/aisudo/aisudo.db"
+        );
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             config.db_path.to_str().unwrap(),
             "/var/lib/aisudo/aisudo.db"

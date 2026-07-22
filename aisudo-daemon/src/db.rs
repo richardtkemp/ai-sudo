@@ -73,7 +73,8 @@ impl Database {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
             // Best-effort tighten; ignore if the dir is shared/pre-existing with
-            // different intent, but our default (/var/lib/aisudo) is ours.
+            // different intent, but our default (/var/lib/aisudo on Linux,
+            // /var/db/aisudo on macOS) is ours.
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
         let conn = Connection::open(path)?;

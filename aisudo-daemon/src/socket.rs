@@ -500,6 +500,40 @@ pub async fn run_socket_listener(
         std::fs::create_dir_all(parent)?;
     }
 
+    // On macOS, /private/var/run is wiped on every boot and launchd has no
+    // analogue to systemd's RuntimeDirectory=. The mkdir above is therefore the
+    // *only* creator on a fresh boot, and with launchd's UMask=79 (octal 0117)
+    // it would land at mode 0o660 — missing the execute bit aisudo-group
+    // members need to traverse to the socket, silently locking the CLI out
+    // after a reboot. Force the mode and group explicitly so the socket
+    // directory survives reboots intact. Linux relies on systemd's
+    // RuntimeDirectory= for this and is intentionally not changed here.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = socket_path.parent() {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750))?;
+            match nix::unistd::Group::from_name("aisudo") {
+                Ok(Some(group)) => {
+                    nix::unistd::chown(parent, None, Some(group.gid))?;
+                }
+                Ok(None) | Err(_) => {
+                    // Without the aisudo group we can't chown the dir to it, so it
+                    // stays 0750 root:root and group members can't traverse to the
+                    // socket. setup.sh creates the group first, so this is a
+                    // misconfiguration — surface it loudly rather than silently
+                    // locking the CLI out.
+                    warn!(
+                        "aisudo group not found: socket dir {} left owner-only \
+                         (0750 root:root) — CLI clients will be unable to reach the \
+                         socket until the group exists and the daemon is restarted",
+                        parent.display()
+                    );
+                }
+            }
+        }
+    }
+
     // Remove stale socket file
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
@@ -4315,8 +4349,11 @@ mod tests {
     #[test]
     fn ownership_valid_system_binary() {
         let limits = test_limits_ownership_on();
-        // /usr/bin/ls should be owned by root and not world/group writable
-        assert!(check_binary_ownership("/usr/bin/ls", &limits).is_ok());
+        // /bin/ls is root-owned on both Linux and macOS and not world/group writable.
+        // (Don't use a bareword or /usr/bin/ls — the former resolves through PATH
+        // which may pick up a user-owned Homebrew binary on macOS, and /usr/bin/ls
+        // does not exist on macOS.)
+        assert!(check_binary_ownership("/bin/ls", &limits).is_ok());
     }
 
     #[test]
@@ -4410,8 +4447,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // The script is owned by the current (non-root) user — must be rejected
-        let cmd = format!("bash {}", script.display());
+        // The script is owned by the current (non-root) user — must be rejected.
+        // Use /bin/bash absolute (root-owned on both Linux and macOS) so the
+        // binary itself passes ownership and the script check is what runs.
+        // A bareword `bash` would resolve via PATH to a user-owned Homebrew
+        // bash on macOS and fail at the binary check, not the script check.
+        let cmd = format!("/bin/bash {}", script.display());
         let result = check_binary_ownership(&cmd, &limits);
         assert!(result.is_err(), "bash + non-root script should be rejected");
         assert!(
@@ -4477,8 +4518,11 @@ mod tests {
     #[test]
     fn ownership_interpreter_dash_c_skips_script_check() {
         let limits = test_limits_ownership_on();
-        // bash -c 'echo hello' — the -c flag means inline command, not a file
-        let result = check_binary_ownership("bash -c echo", &limits);
+        // /bin/bash -c 'echo hello' — the -c flag means inline command, not a
+        // file. Use absolute /bin/bash (root-owned on both Linux and macOS)
+        // so the binary passes ownership; a bareword `bash` may resolve via
+        // PATH to a user-owned Homebrew bash on macOS.
+        let result = check_binary_ownership("/bin/bash -c echo", &limits);
         assert!(result.is_ok(), "bash -c should not trigger script check");
     }
 
@@ -4557,8 +4601,9 @@ mod tests {
     #[test]
     fn ownership_non_interpreter_no_script_check() {
         let limits = test_limits_ownership_on();
-        // ls is not an interpreter — its arguments are not checked as scripts
-        let result = check_binary_ownership("/usr/bin/ls -la /tmp", &limits);
+        // /bin/ls is not an interpreter — its arguments are not checked as
+        // scripts. Use absolute path (root-owned on both Linux and macOS).
+        let result = check_binary_ownership("/bin/ls -la /tmp", &limits);
         assert!(result.is_ok());
     }
 

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.sudo.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/aisudo-daemon</string>
+        <string>/etc/aisudo/aisudo.toml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>Umask</key>
+    <integer>79</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/aisudo.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/aisudo.log</string>
+</dict>
+</plist>

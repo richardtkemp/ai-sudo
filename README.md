@@ -42,6 +42,10 @@ AI runs `aisudo whoami`
 - Rust toolchain (`cargo`)
 - A Telegram bot (create via [@BotFather](https://t.me/BotFather))
 - Your Telegram chat ID (get from [@userinfobot](https://t.me/userinfobot))
+- **macOS only:** Xcode Command Line Tools (`xcode-select --install`). A clean
+  Mac cannot `cargo build` without the linker and `Security.framework`
+  (reqwest's default native-tls links against it). This is the first thing
+  that fails on a fresh machine.
 
 ### Build & Install
 
@@ -52,13 +56,54 @@ cp aisudo.toml.example aisudo.toml   # then edit in your Telegram settings
 
 # Build + install. Run via sudo from your normal user account: setup.sh compiles
 # as you (unprivileged) and only the install steps run as root. It refuses to
-# build from a world-writable source tree.
+# build from a world-writable source tree. Works on Linux (systemd) and macOS
+# (launchd); setup.sh dispatches on `uname -s`.
 sudo ./setup.sh
 ```
 
 The build uses `cargo build --release --locked` as the invoking user, then root
-installs the binaries (`/usr/local/bin`, `0755 root:root`), config
-(`/etc/aisudo/aisudo.toml`, `0600`), the `aisudo` group, and the systemd unit.
+installs the binaries (`/usr/local/bin`, `0755 root:root` on Linux /
+`root:wheel` on macOS), config (`/etc/aisudo/aisudo.toml`, `0600`), the `aisudo`
+group, and the systemd unit (Linux) or launchd plist (macOS).
+
+**Adding yourself to the `aisudo` group** (required to connect to the daemon):
+
+```bash
+# Linux
+sudo usermod -aG aisudo $USER       # then log out and back in
+
+# macOS
+sudo dseditgroup -o edit -a $USER -t user aisudo
+# new group membership needs a fresh login shell: sg aisudo -l, or open a new terminal
+```
+
+### macOS notes
+
+- **State location:** the daemon uses `/var/db/aisudo/aisudo.db` on macOS (not
+  `/var/lib/`, which doesn't exist by default on Darwin). The default is
+  `cfg`-gated in `aisudo-daemon/src/config.rs`; you don't need to set
+  `db_path` in config.
+- **Logs:** `launchd` writes stdout/stderr to `/var/log/aisudo.log` (rotated by
+  `newsyslog` via a drop-in `setup.sh` installs). Use `tail -f
+  /var/log/aisudo.log` instead of `journalctl -u aisudo-daemon`.
+- **Service management:**
+  ```bash
+  sudo launchctl print system/ai.sudo.daemon       # status
+  sudo launchctl kickstart -k system/ai.sudo.daemon  # restart
+  ```
+- **Socket dir after reboot:** `/private/var/run` is wiped on every boot and
+  launchd has no equivalent of systemd's `RuntimeDirectory=`. The daemon
+  recreates `/var/run/aisudo` itself at startup with mode `0750 root:aisudo`
+  (cfg-gated macOS block in `socket.rs`). If the CLI ever can't connect after
+  a reboot, check that dir's ownership and mode first.
+- **`SystemCallArchitectures=native` is intentionally not paralleled** on macOS.
+  The threat it defends against (32-bit syscall ABI exploit portability) does
+  not exist on Darwin — Apple removed 32-bit app support in Catalina (10.15,
+  2019). See [`agents/decisions/002-systemcallarchitectures-macos.md`](agents/decisions/002-systemcallarchitectures-macos.md).
+- **askgw path caveat:** the `[askgw]` example uses bare `/run/foci/askgw.sock`,
+  which does not exist on macOS (only `/var/run` does). If you route approvals
+  through askgw on macOS, set the socket path under `/var/run/...` on the foci
+  side.
 
 ### Configure
 
@@ -181,7 +226,7 @@ Set `hot_reload = true` in `aisudo.toml` to pick up config changes without resta
 - **`aisudo-common`** — Shared types and protocol
 - **`aisudo-pam`** — Optional PAM module for intercepting native `sudo`
 
-The daemon runs as a systemd service (`aisudo-daemon.service`) and communicates with the CLI over a Unix socket (`/var/run/aisudo/aisudo.sock`). Users must be in the `aisudo` group to connect.
+The daemon runs as a systemd service on Linux (`aisudo-daemon.service`) or a launchd daemon on macOS (`ai.sudo.daemon.plist`), and communicates with the CLI over a Unix socket (`/var/run/aisudo/aisudo.sock`). Users must be in the `aisudo` group to connect.
 
 ## OpenClaw Integration
 

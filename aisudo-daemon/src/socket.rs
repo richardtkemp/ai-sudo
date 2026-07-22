@@ -2336,6 +2336,31 @@ async fn stream_child_output(
     Ok(status.code().unwrap_or(1))
 }
 
+/// Characters that `parse_command_chain` treats as chain operators, or rejects
+/// outright, whenever they appear *unquoted*. If one of these characters is
+/// still present in a parsed segment's command text, it can only have gotten
+/// there by being quoted (single/double quotes suppress operator detection by
+/// design, so a literal `;` can be passed as a real argument to a command that
+/// legitimately expects one).
+///
+/// A quoted operator/metacharacter is exactly the shape of the #1484 allowlist
+/// bypass: `ls ';' touch /tmp/badfile` never gets split into a `ls` segment
+/// and a `touch` segment (the `;` is quoted), so it collapses into ONE segment
+/// that `is_single_command_allowed` then prefix-matches only against `ls` —
+/// silently approving whatever trailing command-shaped text rides along after
+/// it. Any segment containing one of these characters must not be eligible
+/// for the allowlist/temp-rule/denylist-bypassing auto-approve fast path; it
+/// falls through to human review instead (same fallback behaviour as a failed
+/// ownership check — see `ownership_ok_or_log`), not an outright deny.
+const HIDDEN_OPERATOR_CHARS: [char; 10] = [';', '|', '&', '$', '`', '(', ')', '<', '>', '\n'];
+
+/// True if `command` contains a chain-operator/metacharacter that survived
+/// `parse_command_chain` — meaning it was quoted, and may be hiding smuggled
+/// content from the allowlist's segment-level checks.
+fn contains_hidden_operator(command: &str) -> bool {
+    command.chars().any(|c| HIDDEN_OPERATOR_CHARS.contains(&c))
+}
+
 fn is_allowed(command: &str, allowlist: &[String]) -> bool {
     // Try parsing as a command chain. If parsing fails (rejected metacharacters,
     // unterminated quotes, etc.), deny the command.
@@ -2343,10 +2368,13 @@ fn is_allowed(command: &str, allowlist: &[String]) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    // Every sub-command must match the allowlist.
-    segments
-        .iter()
-        .all(|seg| is_single_command_allowed(&seg.command, allowlist))
+    // Every sub-command must match the allowlist, AND must not contain a
+    // quoted operator/metacharacter smuggling extra command-like content past
+    // the leading-binary prefix match (#1484).
+    segments.iter().all(|seg| {
+        !contains_hidden_operator(&seg.command)
+            && is_single_command_allowed(&seg.command, allowlist)
+    })
 }
 
 /// Shell names (bare and absolute paths) recognized as wrappers.
@@ -3921,6 +3949,125 @@ mod tests {
         assert!(!is_allowed("apt list > /tmp/out", &allowlist));
         // backtick is rejected
         assert!(!is_allowed("apt list `whoami`", &allowlist));
+    }
+
+    // ===== #1484: quoted-metacharacter allowlist bypass =====
+    //
+    // `parse_command_chain` correctly refuses to split a chain operator that is
+    // inside quotes (that's by design — quotes suppress operator detection so a
+    // literal `;` can be passed as a real argument). But when the *whole* string
+    // still prefix-matches the allowlisted binary, the quoted operator plus
+    // whatever follows it rides along, unexamined, inside a single "segment"
+    // that `is_single_command_allowed` only prefix-checks. No shell is ever
+    // involved in the auto-approved exec path (confirmed: `exec_command_chain`
+    // -> `exec_single_command` -> `split_command_argv` -> `Command::new(argv[0])`,
+    // never `sh -c`), so today this is inert for a plain `ls`. But the
+    // *approval* itself is wrong: the human reviewing the log, and the
+    // allowlist's own stated security contract ("every segment must
+    // independently clear the allowlist"), are both defeated.
+    #[test]
+    fn is_allowed_rejects_quoted_semicolon_smuggle() {
+        let allow = vec!["ls".to_string()];
+        // The confirmed finding: quoting the `;` hides the trailing command
+        // from the chain splitter, and the whole string still starts with `ls`.
+        assert!(!is_allowed("ls ';' touch /tmp/badfile", &allow));
+        assert!(!is_allowed(r#"ls ";" touch /tmp/badfile"#, &allow));
+    }
+
+    #[test]
+    fn is_allowed_rejects_quoted_semicolon_smuggle_dangerous_payload() {
+        let allow = vec!["ls".to_string()];
+        // Same shape, but with a genuinely destructive trailing command — proves
+        // this isn't just about `touch`, it's the general smuggle pattern.
+        assert!(!is_allowed("ls ';' rm -rf /x", &allow));
+    }
+
+    #[test]
+    fn is_allowed_rejects_other_quoted_operators() {
+        let allow = vec!["ls".to_string()];
+        // && and || quoted the same way.
+        assert!(!is_allowed("ls '&&' touch /tmp/x", &allow));
+        assert!(!is_allowed("ls '||' touch /tmp/x", &allow));
+        // Pipe, quoted.
+        assert!(!is_allowed("ls '|' touch /tmp/x", &allow));
+        // Escaped (not quoted) semicolon inside a double-quoted segment — the
+        // backslash is consumed by parse_command_chain's in-double-quote escape
+        // handling, but the raw `;` character still survives into the segment.
+        assert!(!is_allowed(r#"ls "\;" touch /tmp/x"#, &allow));
+    }
+
+    #[test]
+    fn is_allowed_rejects_quoted_dangerous_metacharacters() {
+        let allow = vec!["ls".to_string()];
+        // $() command substitution, quoted so parse_command_chain treats it as
+        // literal instead of rejecting it outright.
+        assert!(!is_allowed("ls '$(touch /tmp/x)'", &allow));
+        // Backtick command substitution, quoted.
+        assert!(!is_allowed("ls '`touch /tmp/x`'", &allow));
+        // Redirection, quoted.
+        assert!(!is_allowed("ls '> /tmp/x'", &allow));
+        assert!(!is_allowed("ls '< /tmp/x'", &allow));
+    }
+
+    #[test]
+    fn is_allowed_with_strip_rejects_quoted_semicolon_smuggle() {
+        // Same bypass, exercised through the strip path (the real call site
+        // used by the daemon: `is_allowed_with_strip(&command, &allowlist,
+        // limits.strip_shell_prefix)`), with no bash -c wrapper involved at all.
+        let allow = vec!["ls".to_string()];
+        assert!(!is_allowed_with_strip(
+            "ls ';' touch /tmp/badfile",
+            &allow,
+            true
+        ));
+        assert!(!is_allowed_with_strip(
+            "ls ';' touch /tmp/badfile",
+            &allow,
+            false
+        ));
+    }
+
+    #[test]
+    fn is_allowed_still_allows_legitimate_commands_control_case() {
+        // Control case: a genuinely allowlisted single command, with no hidden
+        // operators anywhere, must still auto-approve. The fix must not be an
+        // overbroad "any quote at all" rejection.
+        let allow = vec!["apt list".to_string(), "ls".to_string()];
+        assert!(is_allowed("apt list --installed", &allow));
+        assert!(is_allowed("ls -la /tmp", &allow));
+        assert!(is_allowed("ls \"/tmp/some dir\"", &allow));
+    }
+
+    #[test]
+    fn unquoted_semicolon_still_splits_and_is_not_smuggled() {
+        // Control case: the UNQUOTED form must keep behaving as already
+        // established — it splits into segments, and the second segment
+        // (not itself allowlisted) makes the whole thing not-allowed, i.e. it
+        // routes to human approval rather than being silently smuggled through.
+        let allow = vec!["ls".to_string()];
+        assert!(!is_allowed("ls ; touch /tmp/x", &allow));
+        // And it must NOT be rejected merely for containing `;` unquoted when
+        // every segment IS allowlisted.
+        let allow2 = vec!["ls".to_string(), "touch".to_string()];
+        assert!(is_allowed("ls ; touch /tmp/x", &allow2));
+    }
+
+    #[test]
+    fn is_denied_does_not_catch_quoted_semicolon_smuggle_known_gap() {
+        // Documents a related, secondary finding: the denylist has the exact
+        // same blind spot, for the exact same reason (parse_command_chain
+        // collapses the quoted-`;` string into ONE segment, and is_denied only
+        // prefix-checks a segment's start). A denylisted `rm -rf` hidden after
+        // a quoted `;` is NOT caught here either.
+        //
+        // This is NOT a privilege-escalation risk on its own: with the
+        // is_allowed fix above, a command shaped like this can no longer
+        // auto-approve via the allowlist, so it falls through to human
+        // review regardless of whether the denylist also flags it explicitly.
+        // Recorded here as a known gap for potential follow-up hardening of
+        // is_denied, not something this fix depends on.
+        let deny = vec!["rm -rf".to_string()];
+        assert!(!is_denied("ls ';' rm -rf /x", &deny));
     }
 
     // ===== is_temp_rule_allowed with chains =====

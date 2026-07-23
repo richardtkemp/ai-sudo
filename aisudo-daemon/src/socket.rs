@@ -18,14 +18,62 @@ use tracing::{error, info, warn};
 
 use crate::bw_session::BwSessionManager;
 
-/// Records the instant the daemon started accepting connections.
-static DAEMON_START: OnceLock<std::time::Instant> = OnceLock::new();
 use crate::config::{BinaryOwnershipCheck, ConfigHolder, LimitsConfig, RateLimitMode};
 use crate::db::Database;
 use crate::notification::{
     BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord,
 };
 use crate::sudoers::SudoersCache;
+
+/// Records the instant the daemon started accepting connections.
+static DAEMON_START: OnceLock<std::time::Instant> = OnceLock::new();
+
+/// Caller-visible reason for a request denied solely because no approval
+/// backend is configured (see `NotificationBackend::is_configured`). Deliberately
+/// distinct from the generic `"notification error"` text used for a configured
+/// backend that failed at runtime (network blip, etc.) — an operator reading this
+/// must immediately understand the daemon has no approval mechanism at all,
+/// not that a configured one hiccupped.
+const NO_BACKEND_DENIAL_MSG: &str =
+    "no approval mechanism configured on this host ([askgw]/[askgw_http]/[telegram] all unset) \
+     — request denied; only allowlisted commands can be auto-approved until a backend is set up";
+
+/// Minimum interval between "denying a request, no backend configured" journal
+/// lines, so a busy unconfigured host logs one line per minute instead of one
+/// per request. Every suppressed occurrence is still counted and folded into
+/// the next line that does get logged, so nothing is silently dropped from
+/// the operator's view — see [`warn_no_backend_usage`].
+const NO_BACKEND_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+static NO_BACKEND_WARN_STATE: OnceLock<std::sync::Mutex<(std::time::Instant, u64)>> =
+    OnceLock::new();
+
+/// Log (at warn level, rate-limited) that a request needing human approval was
+/// denied because no approval backend is configured. Called from every socket.rs
+/// site that would otherwise have invoked a `NotificationBackend::send_*_and_wait`
+/// method. The first call in a run always logs immediately (an operator watching
+/// the journal right after startup should see this promptly); subsequent calls
+/// within `NO_BACKEND_WARN_INTERVAL` are tallied silently and folded into the
+/// next line once the interval elapses.
+fn warn_no_backend_usage() {
+    let state = NO_BACKEND_WARN_STATE.get_or_init(|| {
+        std::sync::Mutex::new((std::time::Instant::now() - NO_BACKEND_WARN_INTERVAL, 0))
+    });
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.1 += 1;
+    let now = std::time::Instant::now();
+    if now.duration_since(guard.0) >= NO_BACKEND_WARN_INTERVAL {
+        warn!(
+            "Denied {} request(s) needing human approval: no approval mechanism configured on \
+             this host ([askgw]/[askgw_http]/[telegram] all unset). Only allowlisted commands \
+             are being auto-approved. (repeats at most once per {}s)",
+            guard.1,
+            NO_BACKEND_WARN_INTERVAL.as_secs()
+        );
+        guard.0 = now;
+        guard.1 = 0;
+    }
+}
 
 /// Interpreter basenames whose script argument must also pass ownership checks.
 /// When a command starts with one of these, the next non-flag argument is treated
@@ -1106,15 +1154,22 @@ async fn handle_sudo_request(
         return Ok(());
     }
 
-    // Send notification and wait for response
-    let (decision, error_msg) = match backend.send_and_wait(&record).await {
-        Ok(d) => (d, None),
-        Err(e) => {
-            error!(
-                "Notification backend error for request {}: {e:#}",
-                record.id
-            );
-            (Decision::Denied, Some("notification error".to_string()))
+    // Send notification and wait for response. With no approval backend
+    // configured, deny outright rather than calling through — see
+    // is_configured() doc and NO_BACKEND_DENIAL_MSG.
+    let (decision, error_msg) = if !backend.is_configured() {
+        warn_no_backend_usage();
+        (Decision::Denied, Some(NO_BACKEND_DENIAL_MSG.to_string()))
+    } else {
+        match backend.send_and_wait(&record).await {
+            Ok(d) => (d, None),
+            Err(e) => {
+                error!(
+                    "Notification backend error for request {}: {e:#}",
+                    record.id
+                );
+                (Decision::Denied, Some("notification error".to_string()))
+            }
         }
     };
 
@@ -1257,11 +1312,16 @@ async fn handle_temp_rule_request(
         reason: request.reason.clone(),
     };
 
-    let (decision, error_msg) = match backend.send_temp_rule_and_wait(&record).await {
-        Ok(d) => (d, None),
-        Err(e) => {
-            error!("Notification backend error for temp rule {id}: {e:#}");
-            (Decision::Denied, Some("notification error".to_string()))
+    let (decision, error_msg) = if !backend.is_configured() {
+        warn_no_backend_usage();
+        (Decision::Denied, Some(NO_BACKEND_DENIAL_MSG.to_string()))
+    } else {
+        match backend.send_temp_rule_and_wait(&record).await {
+            Ok(d) => (d, None),
+            Err(e) => {
+                error!("Notification backend error for temp rule {id}: {e:#}");
+                (Decision::Denied, Some("notification error".to_string()))
+            }
         }
     };
 
@@ -1492,6 +1552,24 @@ async fn handle_bw_get(
                 return Ok(());
             }
         }
+    } else if !backend.is_configured() {
+        // No approval backend configured — deny outright rather than calling
+        // through. See is_configured() doc and NO_BACKEND_DENIAL_MSG.
+        warn_no_backend_usage();
+        db.update_bw_request_status(&id, "denied", "none")?;
+        let resp = BwGetResponse {
+            request_id: id,
+            decision: Decision::Denied,
+            value: None,
+            error: Some(NO_BACKEND_DENIAL_MSG.to_string()),
+            resolved_item_name: None,
+            awaiting_confirmation: false,
+        };
+        let resp_json = serde_json::to_string(&resp)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Ok(());
     } else {
         // Vault unlocked: send Telegram approval request and wait
         let decision = match backend.send_bw_request_and_wait(&record).await {
@@ -1594,11 +1672,16 @@ async fn handle_bw_get(
             field: request.field.clone(),
         };
 
-        let confirm_decision = match backend.send_bw_confirm_and_wait(&confirm_record).await {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Confirmation notification error for BW request {id}: {e:#}");
-                Decision::Denied
+        let (confirm_decision, confirm_error) = if !backend.is_configured() {
+            warn_no_backend_usage();
+            (Decision::Denied, Some(NO_BACKEND_DENIAL_MSG.to_string()))
+        } else {
+            match backend.send_bw_confirm_and_wait(&confirm_record).await {
+                Ok(d) => (d, None),
+                Err(e) => {
+                    error!("Confirmation notification error for BW request {id}: {e:#}");
+                    (Decision::Denied, None)
+                }
             }
         };
 
@@ -1608,7 +1691,9 @@ async fn handle_bw_get(
                 request_id: id,
                 decision: Decision::Denied,
                 value: None,
-                error: Some("request cancelled by user".to_string()),
+                error: Some(
+                    confirm_error.unwrap_or_else(|| "request cancelled by user".to_string()),
+                ),
                 resolved_item_name: Some(resolved_name),
                 awaiting_confirmation: false,
             };
@@ -2868,6 +2953,64 @@ mod tests {
         }
     }
 
+    /// Stands in for `notification::none::NoBackend` in tests: `is_configured()`
+    /// returns false, and every `send_*_and_wait` panics if actually called. Used
+    /// to prove two things at once — the no-backend path in `handle_sudo_request`
+    /// / `handle_temp_rule_request` (a) denies without ever calling through to the
+    /// backend (so if a future edit removes the `is_configured()` guard, these
+    /// tests fail via panic rather than silently passing), and (b) the allowlist
+    /// short-circuit still auto-approves without touching the backend at all,
+    /// configured or not.
+    struct MockUnconfiguredBackend;
+
+    #[async_trait::async_trait]
+    impl crate::notification::NotificationBackend for MockUnconfiguredBackend {
+        async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
+            panic!("send_and_wait must not be called when is_configured() is false");
+        }
+        async fn send_temp_rule_and_wait(
+            &self,
+            _record: &crate::notification::TempRuleRecord,
+        ) -> anyhow::Result<Decision> {
+            panic!("send_temp_rule_and_wait must not be called when is_configured() is false");
+        }
+        async fn send_bw_request_and_wait(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<Decision> {
+            panic!("send_bw_request_and_wait must not be called when is_configured() is false");
+        }
+        async fn send_bw_confirm_and_wait(
+            &self,
+            _record: &crate::notification::BwConfirmRecord,
+        ) -> anyhow::Result<Decision> {
+            panic!("send_bw_confirm_and_wait must not be called when is_configured() is false");
+        }
+        async fn send_bw_locked_notification(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_scrub_complete(
+            &self,
+            _request_id: &str,
+            _item_name: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
+        fn name(&self) -> &'static str {
+            "mock_unconfigured"
+        }
+        fn is_configured(&self) -> bool {
+            false
+        }
+    }
+
     /// Returns the username for the current process UID, matching what the daemon
     /// resolves via SO_PEERCRED when using `UnixStream::pair()`.
     fn real_test_user() -> String {
@@ -3262,6 +3405,138 @@ mod tests {
         let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
         assert_eq!(response.decision, Decision::Denied);
         assert!(response.error.unwrap().contains("notification"));
+    }
+
+    #[tokio::test]
+    async fn no_backend_denies_command_needing_approval_unmistakably() {
+        // todo #1541: with no approval backend configured, a command that
+        // isn't allowlisted must be denied outright (never routed to the
+        // backend — MockUnconfiguredBackend panics if it is), and the denial
+        // reason must be specific enough that an operator immediately
+        // understands no approval mechanism is configured — not a generic
+        // "notification error" (which could also mean a configured backend
+        // had a network blip).
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockUnconfiguredBackend);
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "some-command-needing-a-human".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        let error = response.error.expect("expected a denial reason");
+        assert!(
+            error.contains("no approval mechanism configured"),
+            "denial reason should name the missing approval mechanism, got: {error:?}"
+        );
+        assert_ne!(
+            error, "notification error",
+            "no-backend denial must be distinguishable from a configured backend's runtime error"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_backend_still_auto_approves_allowlisted_command() {
+        // todo #1541: an allowlisted command must still auto-approve with no
+        // backend configured — that's what keeps a backend-less daemon
+        // useful. MockUnconfiguredBackend panics on every send_*_and_wait, so
+        // this test also proves the allowlist short-circuit never touches the
+        // backend at all (configured or not).
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockUnconfiguredBackend);
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "apt list --installed".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &["apt list".to_string()],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+    }
+
+    #[tokio::test]
+    async fn no_backend_denies_temp_rule_request_unmistakably() {
+        // Same guarantee as the sudo-request path, for the temp-rule request
+        // handler: no backend configured -> denied with a specific reason,
+        // never routed through to the backend.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockUnconfiguredBackend);
+
+        let msg = aisudo_common::SocketMessage::TempRuleRequest(aisudo_common::TempRuleRequest {
+            user: "testuser".to_string(),
+            patterns: vec!["apt install".to_string()],
+            duration_seconds: 3600,
+            reason: Some("need to install deps".to_string()),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
+
+        let response: TempRuleResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        let error = response.error.expect("expected a denial reason");
+        assert!(
+            error.contains("no approval mechanism configured"),
+            "denial reason should name the missing approval mechanism, got: {error:?}"
+        );
+        assert!(response.expires_at.is_none());
     }
 
     #[tokio::test]

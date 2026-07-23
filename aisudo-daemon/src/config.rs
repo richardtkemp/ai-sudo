@@ -453,6 +453,112 @@ fn merge_allowlist(base: Value, overlay: Value) -> Value {
     }
 }
 
+/// Bare-defaults bootstrap content, installed at the config path if (and only
+/// if) nothing exists there yet. This is `include_str!`-embedded from
+/// `aisudo.toml.example` at the repo root so there is exactly one
+/// hand-maintained copy of "what the defaults are and how conf.d/ works" -
+/// the example a human copies for manual setup IS the file the daemon
+/// installs on a fresh host. Every value in it is commented out - every field
+/// the daemon reads is serde-defaulted, so a fully-commented file is valid
+/// TOML that parses to the compiled-in defaults, including all three approval
+/// backends ([askgw]/[askgw_http]/[telegram]) being unset. With none
+/// configured, the daemon still starts (main.rs warns loudly, at startup and
+/// on every request that would need approval) but denies any such request -
+/// only allowlisted commands auto-approve until an operator enables a
+/// backend, here or via a conf.d/ drop-in. See `ensure_default_config` below.
+const DEFAULT_CONFIG: &str = include_str!("../../aisudo.toml.example");
+
+/// If no file exists at `path`, write the bare-defaults bootstrap content
+/// there and return. NEVER overwrites or merges an existing file - an
+/// existing config is the operator's, full stop. Uses O_CREAT|O_EXCL
+/// (`create_new`) so the "only if absent" check is atomic even against a
+/// concurrent writer, rather than a separate `exists()` check + `write()`
+/// that could race.
+///
+/// This closes the fresh-host bootstrap gap: a config-management tool (e.g.
+/// dotfiles-ansible's aisudo role) may deliberately not reseed a base
+/// aisudo.toml - doing so would freeze whatever the compiled-in defaults
+/// happened to be at reseed time as though they'd been deliberately chosen,
+/// defeating the point of pushing real settings into conf.d/*.toml drop-ins
+/// instead. But *something* has to put a base file in place the first time,
+/// and the daemon binary itself is the one thing guaranteed to run on every
+/// provisioning path (a full `setup.sh` install, a bare `cp` of a rebuilt
+/// binary onto an already-provisioned host, etc.) - so it's the natural
+/// place to close the gap without coordinating a change across repos.
+fn ensure_default_config(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot create config directory '{}': {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Explicit 0755: don't inherit a tight process umask (e.g. the
+                // daemon's systemd unit sets UMask=0117) onto a directory that
+                // needs to stay traversable.
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).map_err(
+                    |e| {
+                        anyhow::anyhow!(
+                            "cannot set permissions on config directory '{}': {}",
+                            parent.display(),
+                            e
+                        )
+                    },
+                )?;
+            }
+        }
+    }
+
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 0600: this file can carry a real backend's credentials if an
+        // operator later edits it directly instead of using conf.d/.
+        open_opts.mode(0o600);
+    }
+
+    match open_opts.open(path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(DEFAULT_CONFIG.as_bytes()).map_err(|e| {
+                anyhow::anyhow!("cannot write default config '{}': {}", path.display(), e)
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "cannot set permissions on default config '{}': {}",
+                            path.display(),
+                            e
+                        )
+                    })?;
+            }
+            tracing::info!(
+                "no config file at {} - installed bare-defaults config (add settings via conf.d/*.toml, not this file)",
+                path.display()
+            );
+            Ok(())
+        }
+        // Already exists - created concurrently, or genuinely present. Either
+        // way: never overwrite, just proceed to load whatever is there.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "cannot create default config '{}': {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
 /// Load all `*.toml` files from `conf.d/` next to the main config file.
 /// Returns an empty vec if the directory does not exist.
 fn load_conf_d(config_path: &Path) -> anyhow::Result<Vec<(String, Value)>> {
@@ -571,8 +677,9 @@ pub struct ConfigHolder {
 
 impl ConfigHolder {
     pub fn new(path: &str) -> anyhow::Result<Self> {
-        let config = Config::load(path)?;
         let config_path = Path::new(path);
+        ensure_default_config(config_path)?;
+        let config = Config::load(path)?;
         let mtimes = collect_config_mtimes(config_path);
         Ok(Self {
             path: path.to_string(),
@@ -1052,5 +1159,122 @@ scrub_delay = 300
         let config = Config::load(&path).unwrap();
         assert_eq!(config.limits.rate_limit_requests, 50);
         assert_eq!(config.limits.rate_limit_window_seconds, 60); // default
+    }
+
+    // ===== Bootstrap default-config tests (todo #1540) =====
+
+    #[test]
+    fn bootstrap_installs_default_config_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        // Nested, not-yet-existing directory - exercises the parent-dir
+        // creation path too (mirrors a fresh host where /etc/aisudo doesn't
+        // exist yet).
+        let path = tmp.path().join("nested").join("aisudo.toml");
+        assert!(!path.exists());
+
+        let holder = ConfigHolder::new(path.to_str().unwrap()).unwrap();
+
+        // The file now exists with exactly the shipped example's content -
+        // single source of truth, no separate hand-synced bootstrap file.
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(written, DEFAULT_CONFIG);
+
+        // And it's genuinely usable: safe defaults, no backend configured
+        // (the daemon still starts on top of this and denies anything that
+        // would need one - see main.rs and socket.rs::is_configured - but
+        // the file itself parses and holds sane values).
+        let config = holder.config();
+        assert!(config.allowlist.is_empty());
+        assert!(config.telegram.is_none());
+        assert!(config.askgw.is_none());
+        assert!(config.askgw_http.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bootstrap_default_config_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("aisudo.toml");
+
+        ConfigHolder::new(path.to_str().unwrap()).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn bootstrap_never_overwrites_an_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let custom = "socket_path = \"/tmp/operators-own.sock\"\ntimeout_seconds = 12345\n";
+        let path = write_main_config(tmp.path(), custom);
+
+        let holder = ConfigHolder::new(&path).unwrap();
+
+        // File on disk is untouched.
+        assert_eq!(fs::read_to_string(&path).unwrap(), custom);
+        // And the operator's own values are what got loaded, not the defaults.
+        assert_eq!(holder.config().timeout_seconds, 12345);
+    }
+
+    #[test]
+    fn bootstrap_is_race_safe_against_a_concurrent_writer() {
+        // Simulates two daemon instances racing to bootstrap the same path:
+        // ensure_default_config must never clobber a file that appeared
+        // between its own existence check and its write (it doesn't do a
+        // separate check-then-write at all - it relies on O_EXCL).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("aisudo.toml");
+        fs::write(&path, "timeout_seconds = 999\n").unwrap();
+
+        ensure_default_config(&path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "timeout_seconds = 999\n"
+        );
+    }
+
+    #[test]
+    fn default_config_example_has_no_active_backend_or_allowlist() {
+        // Regression guard: DEFAULT_CONFIG is aisudo.toml.example, embedded
+        // verbatim as the fresh-host bootstrap file. If a future edit to
+        // that file ever uncomments a real backend or a populated allowlist,
+        // this must fail loudly - shipping either by default is exactly
+        // what todo #1540 requires NOT doing (safe-by-default, and no
+        // silently-broken backend that starts but never actually asks
+        // anyone anything).
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), DEFAULT_CONFIG);
+        let config = Config::load(&path).unwrap();
+
+        assert!(config.allowlist.is_empty());
+        assert!(config.denylist.is_empty());
+        assert!(config.allowlist_per_user.is_empty());
+        assert!(config.telegram.is_none());
+        assert!(config.askgw.is_none());
+        assert!(config.askgw_http.is_none());
+    }
+
+    #[test]
+    fn default_config_example_is_fully_commented() {
+        // Regression guard for todo #1541: the shipped example is pure
+        // documentation that happens to also be the bootstrap default - every
+        // line is either blank or a comment, with zero active (uncommented)
+        // key/value pairs or table headers. Every field the daemon reads is
+        // serde-defaulted (proven by the tests above successfully loading
+        // this content), so nothing needs to be active for the file to be a
+        // valid, safe-by-default config. If a future edit uncomments any
+        // line, this catches it even if the uncommented value happens to
+        // match the compiled-in default (which the two tests above,
+        // asserting on parsed *values*, would not catch).
+        for (i, line) in DEFAULT_CONFIG.lines().enumerate() {
+            let trimmed = line.trim_start();
+            assert!(
+                trimmed.is_empty() || trimmed.starts_with('#'),
+                "aisudo.toml.example line {} is active (not blank/commented): {line:?}",
+                i + 1
+            );
+        }
     }
 }

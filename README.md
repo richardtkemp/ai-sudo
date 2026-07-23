@@ -52,7 +52,7 @@ AI runs `aisudo whoami`
 ```bash
 git clone https://github.com/richardtkemp/ai-sudo.git
 cd ai-sudo
-cp aisudo.toml.example aisudo.toml   # then edit in your Telegram settings
+cp aisudo.toml.example aisudo.toml   # then uncomment [telegram] and fill in your bot token + chat ID
 
 # Build + install. Run via sudo from your normal user account: setup.sh compiles
 # as you (unprivileged) and only the install steps run as root. It refuses to

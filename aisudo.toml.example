@@ -1,23 +1,40 @@
-# ai-sudo daemon configuration
+# ai-sudo daemon configuration.
 #
-# Drop-in overrides: place *.toml files in conf.d/ next to this file
-# (e.g. /etc/aisudo/conf.d/99-local.toml). They are merged alphabetically.
-# Scalar values are replaced; allowlist entries are appended and deduplicated.
+# This file is also the daemon's bootstrap default: if aisudo-daemon starts
+# and finds no config file at the given path, it installs this exact content
+# there and continues (never overwriting or merging into an existing file).
+# EVERY value below is commented out — this file has no active settings at
+# all. Every field the daemon reads is serde-defaulted, so a fully-commented
+# file is valid and the daemon simply runs on its compiled-in defaults (shown
+# inline, commented, for discoverability). In particular no approval backend
+# is configured (see the commented [askgw]/[askgw_http]/[telegram] sections
+# further down): the daemon still starts, but warns loudly at startup and on
+# every request that would need one, and denies any such request outright —
+# only allowlisted commands auto-approve. Uncomment and edit values here, or
+# (preferred) add real settings via conf.d/*.toml, to change any of this.
+#
+# Real, host-specific configuration belongs in conf.d/*.toml next to this
+# file (e.g. /etc/aisudo/conf.d/99-local.toml), which ai-sudo deep-merges
+# over this file, merged alphabetically: scalar values are replaced;
+# allowlist entries are appended and deduplicated. Prefer a drop-in over
+# editing this file directly — if something else (packaging, config
+# management) owns this file's provenance, direct edits here can be
+# clobbered or lost on the next rebuild/reseed.
 
 # Path to the Unix socket for PAM module communication
-socket_path = "/var/run/aisudo/aisudo.sock"
+# socket_path = "/var/run/aisudo/aisudo.sock"
 
 # Path to the SQLite database
-db_path = "/var/lib/aisudo/aisudo.db"
+# db_path = "/var/lib/aisudo/aisudo.db"
 
 # Default timeout for approval requests (seconds)
-timeout_seconds = 60
+# timeout_seconds = 60
 
 # Hot-reload config on each incoming connection (checks file modification times).
 # Only per-connection values are reloaded: allowlist, timeout_seconds, max_stdin_bytes.
 # Structural values (socket_path, db_path) and notification settings
 # are set at startup and require a restart.
-hot_reload = false
+# hot_reload = false
 
 # Commands that are auto-approved without notification.
 # Matching is prefix-based at a whitespace boundary: an entry matches the command
@@ -29,10 +46,20 @@ hot_reload = false
 # arbitrary files as root. Do NOT auto-approve things like `apt install`
 # (runs package maintainer scripts / local .deb as root) — route those
 # through Telegram approval instead.
-allowlist = [
-    # "systemctl status",
-    # "apt list",
-]
+# allowlist = [
+#     "systemctl status",
+#     "apt list",
+# ]
+
+# Commands always denied, even if allowlisted or covered by a temp rule.
+# Checked first - deny always takes precedence. Same prefix-matching rules
+# as allowlist.
+# denylist = ["mkfs", "rm -rf /"]
+
+# Per-user allowlists, additive to the global allowlist above. Keys are
+# usernames, values are lists of command patterns (same matching rules).
+# [allowlist_per_user]
+# alice = ["docker ps", "kubectl get"]
 
 # --- macOS allowlist (uncomment on Darwin) ---------------------------
 # These are read-only commands safe to auto-approve on macOS. Linux users:
@@ -55,7 +82,7 @@ allowlist = [
 # ]
 
 # Stdin size limits and temp rule settings
-[limits]
+# [limits]
 # Maximum stdin payload size in bytes (default: 10 MB)
 # max_stdin_bytes = 10485760
 # Stdin preview size in Telegram notifications (default: 2048 bytes)
@@ -69,7 +96,9 @@ allowlist = [
 
 # Approval backend. Configure ONE of [askgw], [askgw_http], or [telegram].
 # If more than one is set, precedence is [askgw] > [askgw_http] > [telegram].
-# If none is set, the daemon refuses to start.
+# If none is set, the daemon still starts (it warns loudly, at startup and on
+# every request that would need approval) but denies any such request — only
+# allowlisted commands are auto-approved without one of these configured.
 
 # ask-gateway backend: routes approval prompts through foci's interactive button
 # surface over a local Unix socket instead of Telegram.
@@ -113,15 +142,17 @@ allowlist = [
 # exceed poll_wait_seconds by a margin.
 # request_timeout_seconds = 30
 
-[telegram]
+# Telegram backend: the original approval channel, and the simplest to set
+# up for a single standalone host (no foci install needed).
+# [telegram]
 # Create a bot via @BotFather on Telegram and paste the token here.
-bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-
+# bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+#
 # Your Telegram chat ID. Send /start to @userinfobot to find yours.
-chat_id = 123456789
-
+# chat_id = 123456789
+#
 # Long-poll timeout for Telegram getUpdates (seconds)
-poll_timeout_seconds = 30
+# poll_timeout_seconds = 30
 
 # Optional Bitwarden integration + web unlock UI.
 # [bitwarden]

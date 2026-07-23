@@ -1,5 +1,6 @@
 pub mod askgw;
 pub mod askgw_http;
+pub mod none;
 pub mod telegram;
 
 use aisudo_common::{Decision, SudoRequestRecord};
@@ -81,4 +82,15 @@ pub trait NotificationBackend: Send + Sync {
 
     /// Backend name for logging/audit.
     fn name(&self) -> &'static str;
+
+    /// False only for [`none::NoBackend`], the placeholder installed when no
+    /// approval mechanism ([askgw]/[askgw_http]/[telegram]) is configured.
+    /// Callers MUST check this before routing a request that needs human
+    /// approval to `send_and_wait`/`send_temp_rule_and_wait`/
+    /// `send_bw_request_and_wait`/`send_bw_confirm_and_wait` and deny outright
+    /// (with a caller-visible reason) instead of calling through — see
+    /// `socket.rs`. Defaults to true so every real backend gets this for free.
+    fn is_configured(&self) -> bool {
+        true
+    }
 }

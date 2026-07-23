@@ -12,6 +12,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use notification::askgw::AskgwBackend;
 use notification::askgw_http::AskgwHttpBackend;
+use notification::none::NoBackend;
 use notification::telegram::TelegramBackend;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -92,9 +93,25 @@ async fn main() -> Result<()> {
         );
         telegram
     } else {
-        anyhow::bail!(
-            "No approval mechanism configured. Set [askgw], [askgw_http], or [telegram] in config."
+        // No backend configured. Historically this was a startup bail — but that
+        // makes a fresh/misconfigured host (which now always has *some* config
+        // file on disk, see ensure_default_config in config.rs) refuse to start
+        // at all, including for its allowlist, which needs no backend and is
+        // often the whole reason the daemon is running on that host in the
+        // first place. Start anyway: allowlisted commands still auto-approve
+        // (socket.rs checks the allowlist before ever consulting a backend),
+        // and anything that would need a human is denied outright — see
+        // NoBackend and the is_configured() checks in socket.rs. A host with no
+        // approval mechanism must never end up MORE permissive than a
+        // configured one, so "deny by default" here is load-bearing, not a
+        // formality.
+        warn!(
+            "No approval mechanism configured — set [askgw], [askgw_http], or [telegram] in \
+             config to enable human approvals. Starting anyway: allowlisted commands will still \
+             auto-approve, but ANY command needing human approval will be DENIED until a backend \
+             is configured."
         );
+        Arc::new(NoBackend)
     };
 
     // Set up BW session manager (if configured)

@@ -920,6 +920,18 @@ async fn handle_sudo_request(
     // could be slipped past the denylist by appending e.g. `$(true)`. To run a
     // shell one-liner with redirects/substitutions, wrap it explicitly in
     // `bash -c '...'` (the metacharacters are then quoted and parse cleanly).
+    //
+    // The REJECTION MESSAGE deliberately does not lead with that, because
+    // `bash -c` is the expensive answer and was until recently the only one
+    // offered. Prefix matching runs on the whole command string, and
+    // `strip_shell_prefix` is OFF by default, so a wrapped command presents to
+    // the allowlist as `bash ...` and cannot match an entry written for the real
+    // command — every wrapped call therefore escalates to a human even when the
+    // underlying command is allowlisted. The cheap answer covers most cases and
+    // is stated first: a pipe or redirect that does not itself need root belongs
+    // OUTSIDE the call, where it never enters the matched string at all.
+    // `bash -c` stays documented for the case that genuinely needs a root shell
+    // (writing into a root-only path), with its cost named rather than implied.
     let parsed_segments = match parse_command_chain(&command) {
         Ok(segs) => segs,
         Err(reason) => {
@@ -928,7 +940,11 @@ async fn handle_sudo_request(
                 request_id: String::new(),
                 decision: Decision::Denied,
                 error: Some(format!(
-                    "unsupported shell syntax ({reason}); wrap in bash -c '...' to run as a shell"
+                    "unsupported shell syntax ({reason}). \
+                     Keep pipes and redirects OUTSIDE the call so the allowlist still \
+                     matches the real command, e.g. `aisudo 'systemctl status nginx' | head`. \
+                     If the redirect itself needs root, `bash -c '...'` works but will NOT \
+                     auto-approve: the allowlist sees `bash`, not your command, so it escalates."
                 )),
             };
             let resp_json = serde_json::to_string(&response)?;
@@ -3237,6 +3253,26 @@ mod tests {
             "expected unsupported-syntax error, got: {:?}",
             response.error
         );
+
+        // The guidance itself is load-bearing, so pin it. This message used to say
+        // only "wrap in bash -c '...'", which is advice that defeats the allowlist:
+        // prefix matching runs on the whole command string and strip_shell_prefix is
+        // off by default, so a wrapped call presents as `bash ...` and escalates to a
+        // human even when the real command is allowlisted. Following the error message
+        // was strictly worse than not following it.
+        let err = response.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("OUTSIDE"),
+            "the cheap fix (keep pipes/redirects outside the call) must be offered FIRST, got: {err:?}"
+        );
+        // bash -c may still be mentioned -- it is the only answer when the redirect
+        // itself needs root -- but never as a free lunch.
+        if err.contains("bash -c") {
+            assert!(
+                err.contains("NOT") && err.contains("auto-approve"),
+                "if bash -c is suggested, its escalation cost must be stated, got: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

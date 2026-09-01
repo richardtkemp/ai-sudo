@@ -2,8 +2,7 @@ use aisudo_common::{
     ActiveTempRule, BwGetResponse, BwLockResponse, BwStatusResponse, Decision, ExecOutput,
     HistoryRequest, HistoryResponse, ListRulesRequest, ListRulesResponse, RequestMode,
     RequestStatus, SocketMessage, StatusFrame, StatusRequest, StatusResponse, SudoRequest,
-    SudoRequestRecord, SudoResponse,
-    TempRuleRequest, TempRuleResponse,
+    SudoRequestRecord, SudoResponse, TempRuleRequest, TempRuleResponse,
 };
 use anyhow::Result;
 use base64::Engine as _;
@@ -868,7 +867,6 @@ async fn send_status(
     writer.flush().await?;
     Ok(())
 }
-
 
 async fn handle_sudo_request(
     request: SudoRequest,
@@ -5148,6 +5146,293 @@ mod tests {
         assert!(!is_interpreter("cat"));
         assert!(!is_interpreter("/usr/bin/ls"));
         assert!(!is_interpreter("systemctl"));
+    }
+
+    // ---- #1719: the status frame ----------------------------------------------------
+    //
+    // These drive handle_connection over a real socket pair and read EVERY line the daemon
+    // writes, because the defect these guard against is a frame appearing (or failing to)
+    // where the client does not expect it. Asserting on only the first line — as
+    // send_and_receive does — cannot see either failure.
+
+    async fn send_and_receive_all(
+        db: Arc<crate::db::Database>,
+        backend: Arc<dyn crate::notification::NotificationBackend>,
+        request_json: &str,
+        allowlist: &[String],
+        denylist: &[String],
+    ) -> Vec<String> {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let sudoers = Arc::new(SudoersCache::new(0));
+        let allowlist = allowlist.to_vec();
+        let denylist = denylist.to_vec();
+        let handler = tokio::spawn(async move {
+            handle_connection(
+                server,
+                db,
+                backend,
+                sudoers,
+                60,
+                &allowlist,
+                &denylist,
+                &std::collections::HashMap::new(),
+                test_limits(),
+                None,
+            )
+            .await
+        });
+
+        let (reader, mut writer) = client.into_split();
+        writer.write_all(request_json.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+        drop(writer);
+
+        let mut buf_reader = BufReader::new(reader);
+        let mut out = Vec::new();
+        loop {
+            let mut line = String::new();
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                buf_reader.read_line(&mut line),
+            )
+            .await
+            .expect("timed out waiting for daemon output")
+            .unwrap();
+            if n == 0 {
+                break;
+            }
+            let t = line.trim().to_string();
+            if !t.is_empty() {
+                out.push(t);
+            }
+        }
+        let _ = handler.await;
+        out
+    }
+
+    fn status_request(command: &str, wants_status: bool, skip_nopasswd: bool) -> String {
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: command.to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Pam,
+            reason: None,
+            stdin: None,
+            skip_nopasswd,
+            timeout_seconds: None,
+            dry_run: false,
+            wants_status,
+        };
+        serde_json::to_string(&request).unwrap()
+    }
+
+    async fn fresh_db(dir: &tempfile::TempDir) -> Arc<crate::db::Database> {
+        Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap())
+    }
+
+    /// An allowlisted command never reaches a person, and the frame must say so — this is the
+    /// case that made the old unconditional "a human must tap approve/deny" warning false.
+    #[tokio::test]
+    async fn allowlisted_command_is_announced_as_auto_approved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lines = send_and_receive_all(
+            fresh_db(&dir).await,
+            Arc::new(MockBackend),
+            &status_request("apt list --installed", true, false),
+            &["apt list".to_string()],
+            &[],
+        )
+        .await;
+
+        assert_eq!(lines.len(), 2, "expected status + decision, got: {lines:?}");
+        let frame: StatusFrame = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(frame.status, RequestStatus::AutoApproved);
+        let response: SudoResponse = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+    }
+
+    /// A denylisted command is refused by the daemon itself. Same shape, opposite status.
+    #[tokio::test]
+    async fn denylisted_command_is_announced_as_auto_denied() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lines = send_and_receive_all(
+            fresh_db(&dir).await,
+            Arc::new(MockBackend),
+            &status_request("rm -rf /important", true, false),
+            &[],
+            &["rm -rf /important".to_string()],
+        )
+        .await;
+
+        assert_eq!(lines.len(), 2, "expected status + decision, got: {lines:?}");
+        let frame: StatusFrame = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(frame.status, RequestStatus::AutoDenied);
+        let response: SudoResponse = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+    }
+
+    /// The escalating path: a command that is on neither list goes to the backend, and the
+    /// frame must be WaitingForHuman. MockApproveBackend answers immediately, so this pins
+    /// the status value; `the_waiting_frame_is_sent_before_the_wait` pins the ordering.
+    #[tokio::test]
+    async fn an_escalated_command_is_announced_as_waiting_for_human() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lines = send_and_receive_all(
+            fresh_db(&dir).await,
+            Arc::new(MockApproveBackend),
+            &status_request("systemctl restart nginx", true, true),
+            &[],
+            &[],
+        )
+        .await;
+
+        assert_eq!(lines.len(), 2, "expected status + decision, got: {lines:?}");
+        let frame: StatusFrame = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(frame.status, RequestStatus::WaitingForHuman);
+        let response: SudoResponse = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+    }
+
+    /// The backward-compatibility guarantee, and the only test that can catch a
+    /// `send_status` call that forgot to honour the opt-in: an older CLI omits
+    /// `wants_status`, so it must see exactly the one-frame wire it has always seen.
+    /// Sent through the escalating path, which is where an unconditional frame would do the
+    /// most damage — the old client would read the frame as its decision.
+    #[tokio::test]
+    async fn a_client_that_did_not_ask_gets_the_old_one_frame_wire() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lines = send_and_receive_all(
+            fresh_db(&dir).await,
+            Arc::new(MockApproveBackend),
+            &status_request("systemctl restart nginx", false, true),
+            &[],
+            &[],
+        )
+        .await;
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected the decision alone, got: {lines:?}"
+        );
+        assert!(
+            serde_json::from_str::<StatusFrame>(&lines[0]).is_err(),
+            "a status frame reached a client that never asked for one: {}",
+            lines[0]
+        );
+        let response: SudoResponse = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+    }
+
+    /// The ordering claim, which is the entire value of the frame: it must arrive BEFORE the
+    /// daemon blocks on the human, not after. A frame delivered after `send_and_wait` returns
+    /// would be technically correct and completely useless — the wait is already over.
+    ///
+    /// The backend here holds for 750ms. The test reads the first line with a 300ms budget:
+    /// it can only succeed if the frame was flushed before the block.
+    #[tokio::test]
+    async fn the_waiting_frame_is_sent_before_the_wait_not_after() {
+        struct SlowApproveBackend;
+
+        #[async_trait::async_trait]
+        impl crate::notification::NotificationBackend for SlowApproveBackend {
+            async fn send_and_wait(&self, _r: &SudoRequestRecord) -> anyhow::Result<Decision> {
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                Ok(Decision::Approved)
+            }
+            async fn send_temp_rule_and_wait(
+                &self,
+                _r: &crate::notification::TempRuleRecord,
+            ) -> anyhow::Result<Decision> {
+                Ok(Decision::Approved)
+            }
+            async fn send_bw_request_and_wait(
+                &self,
+                _r: &crate::notification::BwRequestRecord,
+            ) -> anyhow::Result<Decision> {
+                Ok(Decision::Approved)
+            }
+            async fn send_bw_confirm_and_wait(
+                &self,
+                _r: &crate::notification::BwConfirmRecord,
+            ) -> anyhow::Result<Decision> {
+                Ok(Decision::Approved)
+            }
+            async fn send_bw_locked_notification(
+                &self,
+                _r: &crate::notification::BwRequestRecord,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_scrub_complete(&self, _id: &str, _item: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn update_completion_status(&self, _i: &crate::notification::CompletionInfo) {}
+            fn name(&self) -> &'static str {
+                "slow-approve"
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = fresh_db(&dir).await;
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let sudoers = Arc::new(SudoersCache::new(0));
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(SlowApproveBackend);
+        let handler = tokio::spawn(async move {
+            handle_connection(
+                server,
+                db,
+                backend,
+                sudoers,
+                60,
+                &[],
+                &[],
+                &std::collections::HashMap::new(),
+                test_limits(),
+                None,
+            )
+            .await
+        });
+
+        let (reader, mut writer) = client.into_split();
+        let json = status_request("systemctl restart nginx", true, true);
+        writer.write_all(json.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            buf_reader.read_line(&mut line),
+        )
+        .await
+        .expect("no frame within 300ms — the status was sent AFTER the 750ms human wait, which defeats its purpose")
+        .unwrap();
+
+        let frame: StatusFrame = serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("first line was not a status frame ({e}): {}", line.trim()));
+        assert_eq!(frame.status, RequestStatus::WaitingForHuman);
+
+        // And the decision still follows, after the wait.
+        let mut line2 = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            buf_reader.read_line(&mut line2),
+        )
+        .await
+        .expect("decision never arrived")
+        .unwrap();
+        let response: SudoResponse = serde_json::from_str(line2.trim()).unwrap();
+        assert_eq!(response.decision, Decision::Approved);
+        drop(writer);
+        let _ = handler.await;
     }
 }
 

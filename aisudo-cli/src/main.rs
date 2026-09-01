@@ -228,40 +228,15 @@ fn main() -> ExitCode {
     // the line that matters. A daemon that predates the frame sends the decision straight
     // away; that parses as SudoResponse and not as StatusFrame, so falling through is the
     // whole of the compatibility story.
-    let mut first_line = match lines.next() {
-        Some(Ok(line)) => line,
-        Some(Err(e)) => {
-            eprintln!("{}: connection to daemon lost (main): {e}", BINARY_NAME);
-            return ExitCode::from(1);
-        }
-        None => {
-            eprintln!(
-                "{}: daemon closed connection unexpectedly (is it running?)",
-                BINARY_NAME
-            );
+    let (status, first_line) = match read_status_and_decision(&mut lines, "main") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
-
-    if let Ok(frame) = serde_json::from_str::<StatusFrame>(&first_line) {
-        if frame.status == RequestStatus::WaitingForHuman {
-            eprintln!("{}: requesting approval for: {command}", BINARY_NAME);
-            eprintln!(
-                "{}: approval is asynchronous — a human must tap approve/deny and may take minutes or longer. Waiting; do not retry or assume failure.",
-                BINARY_NAME
-            );
-        }
-        first_line = match lines.next() {
-            Some(Ok(line)) => line,
-            Some(Err(e)) => {
-                eprintln!("{}: connection to daemon lost after status: {e}", BINARY_NAME);
-                return ExitCode::from(1);
-            }
-            None => {
-                eprintln!("{}: daemon closed connection after status frame", BINARY_NAME);
-                return ExitCode::from(1);
-            }
-        };
+    if should_warn_a_human_is_waiting(status) {
+        warn_a_human_is_waiting(&command);
     }
 
     let response: SudoResponse = match serde_json::from_str(&first_line) {
@@ -902,6 +877,54 @@ fn run_via_sudo(command: &str, stdin_data: &Option<String>) -> ExitCode {
 }
 
 /// Retry the command through the normal aisudo approval flow with skip_nopasswd=true.
+/// Step past the optional leading [`StatusFrame`] (#1719) and return it alongside the line
+/// that carries the decision.
+///
+/// Both request paths set `wants_status`, so both receive this frame and both must consume
+/// it. Sharing one reader is the point: the first cut of #1719 open-coded the step in the
+/// main path only, and `retry_with_approval` then died with "invalid response from daemon:
+/// missing field `request_id`" — on the NOPASSWD-retry path, which is precisely the
+/// path that always waits on a human.
+///
+/// A daemon predating the frame sends the decision straight away. That parses as a
+/// [`SudoResponse`] and not as a [`StatusFrame`], so returning `None` and passing the line
+/// through unchanged is the whole of the backward-compatibility story.
+fn read_status_and_decision<I: Iterator<Item = std::io::Result<String>>>(
+    lines: &mut I,
+    context: &str,
+) -> Result<(Option<RequestStatus>, String), String> {
+    fn next_line<I: Iterator<Item = std::io::Result<String>>>(
+        lines: &mut I,
+        context: &str,
+    ) -> Result<String, String> {
+        match lines.next() {
+            Some(Ok(line)) => Ok(line),
+            Some(Err(e)) => Err(format!("connection to daemon lost ({context}): {e}")),
+            None => Err(format!("daemon closed connection unexpectedly ({context})")),
+        }
+    }
+    let first = next_line(lines, context)?;
+    match serde_json::from_str::<StatusFrame>(&first) {
+        Ok(frame) => Ok((Some(frame.status), next_line(lines, context)?)),
+        Err(_) => Ok((None, first)),
+    }
+}
+
+/// The warning that #1719 exists to make honest: it fires only when a person is genuinely
+/// being asked. An older daemon sends no frame at all and so stays silent — the old text
+/// was wrong far more often than it was right, so silence is the better default.
+fn should_warn_a_human_is_waiting(status: Option<RequestStatus>) -> bool {
+    status == Some(RequestStatus::WaitingForHuman)
+}
+
+fn warn_a_human_is_waiting(command: &str) {
+    eprintln!("{}: requesting approval for: {command}", BINARY_NAME);
+    eprintln!(
+        "{}: approval is asynchronous — a human must tap approve/deny and may take minutes or longer. Waiting; do not retry or assume failure.",
+        BINARY_NAME
+    );
+}
+
 fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let user = get_current_user();
     let cwd = std::env::current_dir()
@@ -973,20 +996,20 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     let reader = BufReader::new(stream);
     let mut lines = reader.lines();
 
-    let first_line = match lines.next() {
-        Some(Ok(line)) => line,
-        Some(Err(e)) => {
-            eprintln!(
-                "{}: connection to daemon lost (retry_approval): {e}",
-                BINARY_NAME
-            );
-            return ExitCode::from(1);
-        }
-        None => {
-            eprintln!("{}: daemon closed connection unexpectedly", BINARY_NAME);
+    // Must step past the status frame: this request sets wants_status, so the daemon sends
+    // one. And this path escalates by construction (skip_nopasswd), so the frame is
+    // WaitingForHuman and the warning here is always true — the gap the first cut of
+    // #1719 left open.
+    let (status, first_line) = match read_status_and_decision(&mut lines, "retry_approval") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
+    if should_warn_a_human_is_waiting(status) {
+        warn_a_human_is_waiting(command);
+    }
 
     let response: SudoResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
@@ -1288,10 +1311,7 @@ mod tests {
 
         // Multiple args: per-arg escaping preserves boundaries; an operator
         // passed as its own arg stays literal (quoted).
-        let args = vec![
-            "echo".to_string(),
-            "hello && rm -rf /".to_string(),
-        ];
+        let args = vec!["echo".to_string(), "hello && rm -rf /".to_string()];
         let result = build_command(&args);
         assert!(
             result.contains("'hello && rm -rf /'"),
@@ -1540,4 +1560,87 @@ fn find_command_start(args: &[String]) -> usize {
         }
     }
     i
+}
+
+#[cfg(test)]
+mod status_frame_reader_tests {
+    use super::*;
+
+    fn lines(v: &[&str]) -> std::vec::IntoIter<std::io::Result<String>> {
+        v.iter()
+            .map(|s| Ok(s.to_string()))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    const DECISION: &str = r#"{"request_id":"abc","decision":"approved"}"#;
+
+    /// The regression this module exists for. `retry_with_approval` set `wants_status` but
+    /// open-coded no step past the frame, so it fed the frame to `SudoResponse` and failed
+    /// with "missing field `request_id`" on every NOPASSWD retry. Both call sites now share
+    /// this reader, so the frame is consumed once and the decision is what comes back.
+    #[test]
+    fn a_status_frame_is_consumed_and_the_decision_is_returned() {
+        let mut it = lines(&[r#"{"status":"waiting_for_human"}"#, DECISION]);
+        let (status, decision) = read_status_and_decision(&mut it, "t").unwrap();
+        assert_eq!(status, Some(RequestStatus::WaitingForHuman));
+        assert_eq!(decision, DECISION);
+    }
+
+    /// An older daemon sends no frame. The decision must pass through untouched, and no
+    /// second line may be demanded — the daemon has already closed by then.
+    #[test]
+    fn an_old_daemon_sending_only_a_decision_needs_no_second_line() {
+        let mut it = lines(&[DECISION]);
+        let (status, decision) = read_status_and_decision(&mut it, "t").unwrap();
+        assert_eq!(status, None);
+        assert_eq!(decision, DECISION);
+    }
+
+    #[test]
+    fn a_truncated_stream_after_a_status_frame_is_an_error_not_a_hang() {
+        let mut it = lines(&[r#"{"status":"auto_approved"}"#]);
+        let err = read_status_and_decision(&mut it, "retry_approval").unwrap_err();
+        assert!(err.contains("closed connection"), "got: {err}");
+        assert!(err.contains("retry_approval"), "context lost: {err}");
+    }
+
+    #[test]
+    fn an_empty_stream_is_an_error_not_a_hang() {
+        let mut it = lines(&[]);
+        assert!(read_status_and_decision(&mut it, "main").is_err());
+    }
+
+    /// The whole point of #1719: the warning fires for exactly one status, and not for the
+    /// auto paths that never involve a person.
+    #[test]
+    fn the_human_warning_fires_only_for_waiting_for_human() {
+        assert!(should_warn_a_human_is_waiting(Some(
+            RequestStatus::WaitingForHuman
+        )));
+        assert!(!should_warn_a_human_is_waiting(Some(
+            RequestStatus::AutoApproved
+        )));
+        assert!(!should_warn_a_human_is_waiting(Some(
+            RequestStatus::AutoDenied
+        )));
+        assert!(!should_warn_a_human_is_waiting(None));
+    }
+
+    /// Every status the daemon can send must round-trip through the reader, or a new variant
+    /// would silently be read as "no frame" and its decision line eaten as the decision.
+    #[test]
+    fn every_status_is_recognised_by_the_reader() {
+        for (wire, want) in [
+            ("auto_approved", RequestStatus::AutoApproved),
+            ("auto_denied", RequestStatus::AutoDenied),
+            ("waiting_for_human", RequestStatus::WaitingForHuman),
+        ] {
+            let frame = format!(r#"{{"status":"{wire}"}}"#);
+            let mut it = lines(&[&frame, DECISION]);
+            let (status, decision) = read_status_and_decision(&mut it, "t").unwrap();
+            assert_eq!(status, Some(want), "wire form {wire}");
+            assert_eq!(decision, DECISION);
+        }
+    }
 }

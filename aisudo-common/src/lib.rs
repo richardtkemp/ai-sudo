@@ -685,7 +685,10 @@ mod status_frame_tests {
             RequestStatus::WaitingForHuman,
         ] {
             let json = serde_json::to_string(&StatusFrame { status: s }).unwrap();
-            assert_eq!(serde_json::from_str::<StatusFrame>(&json).unwrap().status, s);
+            assert_eq!(
+                serde_json::from_str::<StatusFrame>(&json).unwrap().status,
+                s
+            );
         }
     }
 

@@ -985,10 +985,7 @@ max_stdin_bytes = 1024
             "/var/run/aisudo/aisudo.sock"
         );
         #[cfg(target_os = "macos")]
-        assert_eq!(
-            config.db_path.to_str().unwrap(),
-            "/var/db/aisudo/aisudo.db"
-        );
+        assert_eq!(config.db_path.to_str().unwrap(), "/var/db/aisudo/aisudo.db");
         #[cfg(not(target_os = "macos"))]
         assert_eq!(
             config.db_path.to_str().unwrap(),

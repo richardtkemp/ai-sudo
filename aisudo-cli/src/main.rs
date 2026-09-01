@@ -1,6 +1,7 @@
 use aisudo_common::{
-    Decision, ExecOutput, ListRulesRequest, ListRulesResponse, RequestMode, SocketMessage,
-    SudoRequest, SudoResponse, TempRuleRequest, TempRuleResponse, DEFAULT_SOCKET_PATH,
+    Decision, ExecOutput, ListRulesRequest, ListRulesResponse, RequestMode, RequestStatus,
+    SocketMessage, StatusFrame, SudoRequest, SudoResponse, TempRuleRequest, TempRuleResponse,
+    DEFAULT_SOCKET_PATH,
 };
 use base64::Engine as _;
 use shell_escape::escape;
@@ -160,17 +161,12 @@ fn main() -> ExitCode {
         skip_nopasswd: false,
         timeout_seconds: timeout,
         dry_run,
+        wants_status: true,
     };
 
     if dry_run {
         eprintln!(
             "{}: checking if command would be approved: {command}",
-            BINARY_NAME
-        );
-    } else {
-        eprintln!("{}: requesting approval for: {command}", BINARY_NAME);
-        eprintln!(
-            "{}: approval is asynchronous — a human must tap approve/deny and may take minutes or longer. Waiting; do not retry or assume failure.",
             BINARY_NAME
         );
     }
@@ -225,7 +221,14 @@ fn main() -> ExitCode {
     // First line is the SudoResponse (approval decision)
     let mut lines = reader.lines();
 
-    let first_line = match lines.next() {
+    // The daemon answers with a StatusFrame first when we asked for one, saying which path
+    // the request took (#1719). Only WaitingForHuman means a person is actually being asked,
+    // and that is the only case worth warning about — the old code warned on EVERY command,
+    // including ones the allowlist approved in milliseconds, which taught the reader to skip
+    // the line that matters. A daemon that predates the frame sends the decision straight
+    // away; that parses as SudoResponse and not as StatusFrame, so falling through is the
+    // whole of the compatibility story.
+    let mut first_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => {
             eprintln!("{}: connection to daemon lost (main): {e}", BINARY_NAME);
@@ -239,6 +242,27 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    if let Ok(frame) = serde_json::from_str::<StatusFrame>(&first_line) {
+        if frame.status == RequestStatus::WaitingForHuman {
+            eprintln!("{}: requesting approval for: {command}", BINARY_NAME);
+            eprintln!(
+                "{}: approval is asynchronous — a human must tap approve/deny and may take minutes or longer. Waiting; do not retry or assume failure.",
+                BINARY_NAME
+            );
+        }
+        first_line = match lines.next() {
+            Some(Ok(line)) => line,
+            Some(Err(e)) => {
+                eprintln!("{}: connection to daemon lost after status: {e}", BINARY_NAME);
+                return ExitCode::from(1);
+            }
+            None => {
+                eprintln!("{}: daemon closed connection after status frame", BINARY_NAME);
+                return ExitCode::from(1);
+            }
+        };
+    }
 
     let response: SudoResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
@@ -899,6 +923,7 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
         skip_nopasswd: true,
         timeout_seconds: None,
         dry_run: false,
+        wants_status: true,
     };
 
     let msg = SocketMessage::SudoRequest(request);

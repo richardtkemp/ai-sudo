@@ -1300,6 +1300,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1332,6 +1333,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1361,6 +1363,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1390,6 +1393,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1419,6 +1423,7 @@ mod tests {
                 skip_nopasswd: false,
                 timeout_seconds: None,
                 dry_run: false,
+                wants_status: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             let id = record.id.clone();
@@ -1514,6 +1519,7 @@ mod tests {
                 skip_nopasswd: true,
                 timeout_seconds: None,
                 dry_run: false,
+                wants_status: false,
             },
             60,
         );
@@ -1612,6 +1618,7 @@ mod tests {
                     skip_nopasswd: true,
                     timeout_seconds: None,
                     dry_run: false,
+                    wants_status: false,
                 };
                 let record = aisudo_common::SudoRequestRecord::new(req, 60);
                 barrier.wait();
@@ -1678,6 +1685,7 @@ mod tests {
                         skip_nopasswd: true,
                         timeout_seconds: None,
                         dry_run: false,
+                        wants_status: false,
                     };
                     let record = aisudo_common::SudoRequestRecord::new(req, 60);
                     db.insert_request(&record).unwrap();
@@ -1713,6 +1721,7 @@ mod tests {
                 skip_nopasswd: false,
                 timeout_seconds: None,
                 dry_run: false,
+                wants_status: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1738,6 +1747,7 @@ mod tests {
                 skip_nopasswd: false,
                 timeout_seconds: None,
                 dry_run: false,
+                wants_status: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1755,6 +1765,7 @@ mod tests {
                 skip_nopasswd: false,
                 timeout_seconds: None,
                 dry_run: false,
+                wants_status: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1779,6 +1790,7 @@ mod tests {
                 skip_nopasswd: false,
                 timeout_seconds: None,
                 dry_run: false,
+                wants_status: false,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();

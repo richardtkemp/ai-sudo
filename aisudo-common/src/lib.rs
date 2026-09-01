@@ -34,6 +34,11 @@ pub struct SudoRequest {
     /// Returns decision without actually running the command.
     #[serde(default)]
     pub dry_run: bool,
+    /// Ask the daemon to send a [`StatusFrame`] BEFORE the decision, saying which
+    /// path the request took (#1719). Defaults to false so an older client talking
+    /// to a newer daemon sees the wire format it expects, unchanged.
+    #[serde(default)]
+    pub wants_status: bool,
 }
 
 fn default_mode() -> RequestMode {
@@ -274,6 +279,33 @@ pub enum SocketMessage {
     BwStatus(BwStatusRequest),
 }
 
+/// Which path a sudo request took, sent BEFORE the decision when the client set
+/// [`SudoRequest::wants_status`] (#1719).
+///
+/// The client previously had no way to know whether a human was involved: the daemon
+/// sent a single frame, the decision, and by the time it arrived any wait was already
+/// over. So the CLI warned "a human must tap approve/deny" on EVERY command, including
+/// the ones the allowlist approves in milliseconds — which trains the reader to ignore
+/// the warning exactly when it is true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestStatus {
+    /// Approved by the daemon itself (allowlist, temp rule, or NOPASSWD). No human.
+    AutoApproved,
+    /// Refused by the daemon itself (denylist, validation, rate limit). No human.
+    AutoDenied,
+    /// Escalated: a notification has gone out and the daemon is now waiting on a person.
+    WaitingForHuman,
+}
+
+/// The interim frame carrying a [`RequestStatus`]. Its `status` field is what
+/// distinguishes it from a [`SudoResponse`] on the wire, so a client can tell the two
+/// apart by attempting to parse and falling back — no version negotiation needed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StatusFrame {
+    pub status: RequestStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
@@ -351,6 +383,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let record = SudoRequestRecord::new(req, 60);
         assert_eq!(record.user, "alice");
@@ -379,6 +412,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let record = SudoRequestRecord::new(req, 30);
         assert_eq!(record.user, "bob");
@@ -408,6 +442,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"sudo_request\""));
@@ -614,5 +649,52 @@ mod tests {
         assert_eq!(deserialized.allowlist.len(), 1);
         assert_eq!(deserialized.temp_rules.len(), 1);
         assert_eq!(deserialized.nopasswd_rules.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod status_frame_tests {
+    use super::*;
+
+    /// The whole compatibility story rests on the two frames being distinguishable by a
+    /// parse attempt, with no version negotiation: a client that asked for a status frame
+    /// but is talking to an OLDER daemon receives the decision immediately, and must not
+    /// mistake it for a status.
+    #[test]
+    fn a_decision_does_not_parse_as_a_status_frame() {
+        let decision = r#"{"request_id":"abc","decision":"approved"}"#;
+        assert!(serde_json::from_str::<StatusFrame>(decision).is_err());
+        assert!(serde_json::from_str::<SudoResponse>(decision).is_ok());
+    }
+
+    #[test]
+    fn a_status_frame_does_not_parse_as_a_decision() {
+        let status = r#"{"status":"waiting_for_human"}"#;
+        assert!(serde_json::from_str::<SudoResponse>(status).is_err());
+        assert_eq!(
+            serde_json::from_str::<StatusFrame>(status).unwrap().status,
+            RequestStatus::WaitingForHuman
+        );
+    }
+
+    #[test]
+    fn every_status_round_trips_on_the_wire() {
+        for s in [
+            RequestStatus::AutoApproved,
+            RequestStatus::AutoDenied,
+            RequestStatus::WaitingForHuman,
+        ] {
+            let json = serde_json::to_string(&StatusFrame { status: s }).unwrap();
+            assert_eq!(serde_json::from_str::<StatusFrame>(&json).unwrap().status, s);
+        }
+    }
+
+    /// An older CLI does not send the field at all. It must deserialise as false, so the
+    /// daemon stays silent for it and the old one-frame wire format is preserved.
+    #[test]
+    fn a_request_without_wants_status_defaults_to_false() {
+        let old = r#"{"user":"u","command":"echo hi","cwd":"/","pid":1}"#;
+        let req: SudoRequest = serde_json::from_str(old).unwrap();
+        assert!(!req.wants_status);
     }
 }

@@ -102,6 +102,7 @@ mod tests {
                 skip_nopasswd: false,
                 timeout_seconds: None,
                 dry_run: false,
+                wants_status: false,
             },
             60,
         )

@@ -1,7 +1,8 @@
 use aisudo_common::{
     ActiveTempRule, BwGetResponse, BwLockResponse, BwStatusResponse, Decision, ExecOutput,
     HistoryRequest, HistoryResponse, ListRulesRequest, ListRulesResponse, RequestMode,
-    SocketMessage, StatusRequest, StatusResponse, SudoRequest, SudoRequestRecord, SudoResponse,
+    RequestStatus, SocketMessage, StatusFrame, StatusRequest, StatusResponse, SudoRequest,
+    SudoRequestRecord, SudoResponse,
     TempRuleRequest, TempRuleResponse,
 };
 use anyhow::Result;
@@ -847,6 +848,28 @@ fn override_user_from_peer(user: &mut String, peer_uid: u32) {
     *user = real_user;
 }
 
+/// Tell the client which path this request took, before the decision goes out (#1719).
+///
+/// A no-op unless the client set `wants_status`, so an older CLI keeps seeing exactly the
+/// wire format it expects: one frame, the decision. The frame matters most for
+/// `WaitingForHuman` — that is the only case where the CLI should say a person has to tap
+/// approve, and previously it said so every time because it could not tell.
+async fn send_status(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    wants_status: bool,
+    status: RequestStatus,
+) -> Result<()> {
+    if !wants_status {
+        return Ok(());
+    }
+    let json = serde_json::to_string(&StatusFrame { status })?;
+    writer.write_all(json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+
 async fn handle_sudo_request(
     request: SudoRequest,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
@@ -860,6 +883,9 @@ async fn handle_sudo_request(
     limits: &LimitsConfig,
 ) -> Result<()> {
     let mode = request.mode;
+    // Copied out because `request` is moved into SudoRequestRecord::new partway through,
+    // and the status frames are sent on both sides of that point.
+    let wants_status = request.wants_status;
     info!(
         "Received sudo request: user={} command={} mode={:?}",
         request.user, request.command, mode
@@ -876,6 +902,7 @@ async fn handle_sudo_request(
                 decoded.len(),
                 limits.max_stdin_bytes
             );
+            send_status(writer, wants_status, RequestStatus::AutoDenied).await?;
             let response = SudoResponse {
                 request_id: String::new(),
                 decision: Decision::Denied,
@@ -936,6 +963,7 @@ async fn handle_sudo_request(
         Ok(segs) => segs,
         Err(reason) => {
             warn!("Rejected command with unsupported shell syntax (user={user}): {reason}");
+            send_status(writer, wants_status, RequestStatus::AutoDenied).await?;
             let response = SudoResponse {
                 request_id: String::new(),
                 decision: Decision::Denied,
@@ -958,6 +986,7 @@ async fn handle_sudo_request(
     // Check denylist FIRST - deny always takes precedence
     if is_denied_with_strip(&command, denylist, limits.strip_shell_prefix) {
         warn!("Command denied via denylist: {}", command);
+        send_status(writer, wants_status, RequestStatus::AutoDenied).await?;
         let response = SudoResponse {
             request_id: String::new(),
             decision: Decision::Denied,
@@ -994,6 +1023,7 @@ async fn handle_sudo_request(
 
         // For dry-run, just return approved without executing or logging
         if dry_run {
+            send_status(writer, wants_status, RequestStatus::AutoApproved).await?;
             let response = SudoResponse {
                 request_id: String::new(),
                 decision: Decision::Approved,
@@ -1009,6 +1039,7 @@ async fn handle_sudo_request(
         let record = SudoRequestRecord::new(request, effective_timeout);
         db.insert_request(&record)?;
         db.update_decision(&record.id, Decision::Approved, "allowlist")?;
+        send_status(writer, wants_status, RequestStatus::AutoApproved).await?;
         let response = SudoResponse {
             request_id: record.id,
             decision: Decision::Approved,
@@ -1034,6 +1065,7 @@ async fn handle_sudo_request(
 
         // For dry-run, just return approved without executing or logging
         if dry_run {
+            send_status(writer, wants_status, RequestStatus::AutoApproved).await?;
             let response = SudoResponse {
                 request_id: String::new(),
                 decision: Decision::Approved,
@@ -1049,6 +1081,7 @@ async fn handle_sudo_request(
         let record = SudoRequestRecord::new(request.clone(), effective_timeout);
         db.insert_request(&record)?;
         db.update_decision(&record.id, Decision::Approved, "temp_rule")?;
+        send_status(writer, wants_status, RequestStatus::AutoApproved).await?;
         let response = SudoResponse {
             request_id: record.id,
             decision: Decision::Approved,
@@ -1081,6 +1114,7 @@ async fn handle_sudo_request(
 
             // For dry-run, just return UseSudo without logging
             if dry_run {
+                send_status(writer, wants_status, RequestStatus::AutoApproved).await?;
                 let response = SudoResponse {
                     request_id: String::new(),
                     decision: Decision::UseSudo,
@@ -1096,6 +1130,7 @@ async fn handle_sudo_request(
             let record = SudoRequestRecord::new(request.clone(), effective_timeout);
             db.insert_request(&record)?;
             db.update_decision(&record.id, Decision::UseSudo, "nopasswd")?;
+            send_status(writer, wants_status, RequestStatus::AutoApproved).await?;
             let response = SudoResponse {
                 request_id: record.id,
                 decision: Decision::UseSudo,
@@ -1125,6 +1160,7 @@ async fn handle_sudo_request(
             limits.rate_limit_window_seconds,
             global_rate_limit,
         )?;
+        send_status(writer, wants_status, RequestStatus::AutoDenied).await?;
         let response = SudoResponse {
             request_id: String::new(),
             decision: Decision::Denied,
@@ -1158,6 +1194,7 @@ async fn handle_sudo_request(
             "Rate limit exceeded ({}): user={} limit={} window={}s",
             limit_type, request.user, limits.rate_limit_requests, limits.rate_limit_window_seconds
         );
+        send_status(writer, wants_status, RequestStatus::AutoDenied).await?;
         let response = SudoResponse {
             request_id: String::new(),
             decision: Decision::Denied,
@@ -1177,6 +1214,10 @@ async fn handle_sudo_request(
         warn_no_backend_usage();
         (Decision::Denied, Some(NO_BACKEND_DENIAL_MSG.to_string()))
     } else {
+        // From here a person is genuinely being asked — the only case the CLI should
+        // warn about (#1719). Sent before the wait, not after, or it would arrive too
+        // late to be useful.
+        send_status(writer, wants_status, RequestStatus::WaitingForHuman).await?;
         match backend.send_and_wait(&record).await {
             Ok(d) => (d, None),
             Err(e) => {
@@ -2737,6 +2778,7 @@ mod tests {
                 skip_nopasswd: false,
                 timeout_seconds: None,
                 dry_run: false,
+                wants_status: false,
             };
             let record = SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -2791,6 +2833,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         writer.write_all(json.as_bytes()).await.unwrap();
@@ -3128,6 +3171,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3179,6 +3223,7 @@ mod tests {
             skip_nopasswd: true,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3216,6 +3261,7 @@ mod tests {
             skip_nopasswd: true,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         serde_json::to_string(&request).unwrap()
     }
@@ -3354,6 +3400,7 @@ mod tests {
             skip_nopasswd: true,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3389,6 +3436,7 @@ mod tests {
             skip_nopasswd: true,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3424,6 +3472,7 @@ mod tests {
             skip_nopasswd: true,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3468,6 +3517,7 @@ mod tests {
             skip_nopasswd: true,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3518,6 +3568,7 @@ mod tests {
             skip_nopasswd: true,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3596,6 +3647,7 @@ mod tests {
             skip_nopasswd: true,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3821,6 +3873,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -4535,6 +4588,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -4582,6 +4636,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -4612,6 +4667,7 @@ mod tests {
             skip_nopasswd: false,
             timeout_seconds: None,
             dry_run: false,
+            wants_status: false,
         };
         let json2 = serde_json::to_string(&request2).unwrap();
 

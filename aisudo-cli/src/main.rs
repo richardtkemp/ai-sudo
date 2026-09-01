@@ -228,16 +228,17 @@ fn main() -> ExitCode {
     // the line that matters. A daemon that predates the frame sends the decision straight
     // away; that parses as SudoResponse and not as StatusFrame, so falling through is the
     // whole of the compatibility story.
-    let (status, first_line) = match read_status_and_decision(&mut lines, "main") {
+    let (_status, first_line) = match read_status_and_decision(&mut lines, "main", |s| {
+        if should_warn_a_human_is_waiting(Some(s)) {
+            warn_a_human_is_waiting(&command);
+        }
+    }) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{}: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
-    if should_warn_a_human_is_waiting(status) {
-        warn_a_human_is_waiting(&command);
-    }
 
     let response: SudoResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
@@ -892,6 +893,7 @@ fn run_via_sudo(command: &str, stdin_data: &Option<String>) -> ExitCode {
 fn read_status_and_decision<I: Iterator<Item = std::io::Result<String>>>(
     lines: &mut I,
     context: &str,
+    on_status: impl FnOnce(RequestStatus),
 ) -> Result<(Option<RequestStatus>, String), String> {
     fn next_line<I: Iterator<Item = std::io::Result<String>>>(
         lines: &mut I,
@@ -905,7 +907,15 @@ fn read_status_and_decision<I: Iterator<Item = std::io::Result<String>>>(
     }
     let first = next_line(lines, context)?;
     match serde_json::from_str::<StatusFrame>(&first) {
-        Ok(frame) => Ok((Some(frame.status), next_line(lines, context)?)),
+        Ok(frame) => {
+            // MUST run before the next read. That read blocks for as long as the human takes
+            // — the entire reason the frame exists is to say something DURING that wait. An
+            // earlier version returned both lines and left the caller to react afterwards;
+            // strace on the installed binary showed the banner landing 4.0s late, after the
+            // decision had already arrived, which is worse than not printing it at all.
+            on_status(frame.status);
+            Ok((Some(frame.status), next_line(lines, context)?))
+        }
         Err(_) => Ok((None, first)),
     }
 }
@@ -1000,16 +1010,17 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     // one. And this path escalates by construction (skip_nopasswd), so the frame is
     // WaitingForHuman and the warning here is always true — the gap the first cut of
     // #1719 left open.
-    let (status, first_line) = match read_status_and_decision(&mut lines, "retry_approval") {
+    let (_status, first_line) = match read_status_and_decision(&mut lines, "retry_approval", |s| {
+        if should_warn_a_human_is_waiting(Some(s)) {
+            warn_a_human_is_waiting(command);
+        }
+    }) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{}: {e}", BINARY_NAME);
             return ExitCode::from(1);
         }
     };
-    if should_warn_a_human_is_waiting(status) {
-        warn_a_human_is_waiting(command);
-    }
 
     let response: SudoResponse = match serde_json::from_str(&first_line) {
         Ok(r) => r,
@@ -1582,7 +1593,7 @@ mod status_frame_reader_tests {
     #[test]
     fn a_status_frame_is_consumed_and_the_decision_is_returned() {
         let mut it = lines(&[r#"{"status":"waiting_for_human"}"#, DECISION]);
-        let (status, decision) = read_status_and_decision(&mut it, "t").unwrap();
+        let (status, decision) = read_status_and_decision(&mut it, "t", |_| {}).unwrap();
         assert_eq!(status, Some(RequestStatus::WaitingForHuman));
         assert_eq!(decision, DECISION);
     }
@@ -1592,7 +1603,7 @@ mod status_frame_reader_tests {
     #[test]
     fn an_old_daemon_sending_only_a_decision_needs_no_second_line() {
         let mut it = lines(&[DECISION]);
-        let (status, decision) = read_status_and_decision(&mut it, "t").unwrap();
+        let (status, decision) = read_status_and_decision(&mut it, "t", |_| {}).unwrap();
         assert_eq!(status, None);
         assert_eq!(decision, DECISION);
     }
@@ -1600,7 +1611,7 @@ mod status_frame_reader_tests {
     #[test]
     fn a_truncated_stream_after_a_status_frame_is_an_error_not_a_hang() {
         let mut it = lines(&[r#"{"status":"auto_approved"}"#]);
-        let err = read_status_and_decision(&mut it, "retry_approval").unwrap_err();
+        let err = read_status_and_decision(&mut it, "retry_approval", |_| {}).unwrap_err();
         assert!(err.contains("closed connection"), "got: {err}");
         assert!(err.contains("retry_approval"), "context lost: {err}");
     }
@@ -1608,7 +1619,7 @@ mod status_frame_reader_tests {
     #[test]
     fn an_empty_stream_is_an_error_not_a_hang() {
         let mut it = lines(&[]);
-        assert!(read_status_and_decision(&mut it, "main").is_err());
+        assert!(read_status_and_decision(&mut it, "main", |_| {}).is_err());
     }
 
     /// The whole point of #1719: the warning fires for exactly one status, and not for the
@@ -1638,9 +1649,79 @@ mod status_frame_reader_tests {
         ] {
             let frame = format!(r#"{{"status":"{wire}"}}"#);
             let mut it = lines(&[&frame, DECISION]);
-            let (status, decision) = read_status_and_decision(&mut it, "t").unwrap();
+            let (status, decision) = read_status_and_decision(&mut it, "t", |_| {}).unwrap();
             assert_eq!(status, Some(want), "wire form {wire}");
             assert_eq!(decision, DECISION);
         }
+    }
+    /// The ordering test, and the one this module was missing when f59b330 shipped. That
+    /// version returned BOTH lines and let the caller react afterwards, so the warning was
+    /// emitted only after the read that blocks for as long as the human takes. strace on the
+    /// installed binary showed it landing 4.0s late, after the decision had already arrived.
+    /// Every other test in this module passes against that version, because an in-memory
+    /// iterator never blocks and so ordering is invisible to it.
+    ///
+    /// This probe makes it visible: it records, at the instant the SECOND line is demanded,
+    /// whether the callback has run yet.
+    #[test]
+    fn the_warning_runs_before_the_read_that_blocks_on_the_human() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct OrderProbe {
+            items: std::vec::IntoIter<String>,
+            reads: usize,
+            fired: Rc<Cell<bool>>,
+            fired_before_second_read: Rc<Cell<Option<bool>>>,
+        }
+        impl Iterator for OrderProbe {
+            type Item = std::io::Result<String>;
+            fn next(&mut self) -> Option<Self::Item> {
+                self.reads += 1;
+                if self.reads == 2 {
+                    self.fired_before_second_read.set(Some(self.fired.get()));
+                }
+                self.items.next().map(Ok)
+            }
+        }
+
+        let fired = Rc::new(Cell::new(false));
+        let observed = Rc::new(Cell::new(None));
+        let mut probe = OrderProbe {
+            items: vec![
+                r#"{"status":"waiting_for_human"}"#.to_string(),
+                DECISION.to_string(),
+            ]
+            .into_iter(),
+            reads: 0,
+            fired: Rc::clone(&fired),
+            fired_before_second_read: Rc::clone(&observed),
+        };
+
+        let f = Rc::clone(&fired);
+        let (status, decision) =
+            read_status_and_decision(&mut probe, "t", move |_| f.set(true)).unwrap();
+
+        assert_eq!(status, Some(RequestStatus::WaitingForHuman));
+        assert_eq!(decision, DECISION);
+        assert_eq!(
+            observed.get(),
+            Some(true),
+            "the warning had not run when the blocking read was issued — it would reach the user only AFTER the human answered, which is the whole failure this guards"
+        );
+    }
+
+    /// The callback must NOT fire when there is no frame, or an old daemon's plain decision
+    /// would produce a spurious warning — the exact thing #1719 set out to remove.
+    #[test]
+    fn no_frame_means_no_callback() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let fired = Rc::new(Cell::new(false));
+        let f = Rc::clone(&fired);
+        let mut it = lines(&[DECISION]);
+        let (status, _) = read_status_and_decision(&mut it, "t", move |_| f.set(true)).unwrap();
+        assert_eq!(status, None);
+        assert!(!fired.get(), "callback fired with no status frame present");
     }
 }

@@ -328,6 +328,9 @@ impl Decision {
         }
     }
 
+    // Deliberately inherent, not std::str::FromStr: callers want a plain Option/Result here
+    // without importing the trait, and the name matches the rest of this module.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Decision::Pending),

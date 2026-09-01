@@ -1208,6 +1208,7 @@ fn capture_stdin() -> Result<Option<String>, String> {
 ///     security boundary.
 ///   * Multiple arguments — escape each to preserve argument boundaries; any
 ///     operator passed as its own arg stays literal.
+///
 /// When the first argument is a bare filename (no path separator) that exists
 /// in the current directory, prepend `./` so the daemon's `sh -c` / `Command::new`
 /// finds it. Without this, `aisudo script.sh` fails because the shell only
@@ -1467,9 +1468,9 @@ mod tests {
 
         // -l at index 2 should NOT be recognized as a mode flag since it's after the command
         // The mode flags should only be checked in args[1..cmd_start)
-        for i in 1..cmd_start {
+        for arg in &args[1..cmd_start] {
             assert!(
-                !matches!(args[i].as_str(), "-l" | "--list-rules"),
+                !matches!(arg.as_str(), "-l" | "--list-rules"),
                 "-l should not be found before command start"
             );
         }

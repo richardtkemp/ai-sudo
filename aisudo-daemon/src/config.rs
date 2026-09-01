@@ -148,35 +148,27 @@ fn default_poll_timeout() -> u32 {
 /// Rate limiting mode: per-user or global.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RateLimitMode {
     /// Each user has their own rate limit bucket.
+    #[default]
     PerUser,
     /// All users share a single global rate limit bucket.
     Global,
 }
 
-impl Default for RateLimitMode {
-    fn default() -> Self {
-        Self::PerUser
-    }
-}
-
 /// Binary ownership check level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BinaryOwnershipCheck {
     /// No ownership checking.
     Off,
     /// Check only auto-approved commands (allowlist/temp rules).
+    #[default]
     Auto,
     /// Check all commands, including human-approved (Telegram) ones.
     All,
-}
-
-impl Default for BinaryOwnershipCheck {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -203,6 +195,9 @@ pub struct LimitsConfig {
     /// Whether allowlisted/temp-rule commands count toward rate limit.
     /// Default: false (allowlisted commands bypass rate limiting entirely).
     #[serde(default)]
+    // Never read: this option silently does nothing. Tracked in #1822 — implement or delete,
+    // do not just drop the doc comment above.
+    #[allow(dead_code)]
     pub rate_limit_count_allowlisted: bool,
 
     /// Rate limit mode: per_user (default) or global.
@@ -213,6 +208,7 @@ pub struct LimitsConfig {
     /// - "off": no ownership checking
     /// - "auto": check only auto-approved commands (allowlist/temp rules) [default]
     /// - "all": check all commands, including human-approved (Telegram) ones
+    ///
     /// Also accepts true (= "auto") and false (= "off") for backward compatibility.
     #[serde(default, deserialize_with = "deserialize_binary_ownership_check")]
     pub check_binary_ownership: BinaryOwnershipCheck,

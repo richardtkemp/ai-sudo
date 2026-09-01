@@ -655,6 +655,9 @@ fn resolve_username(uid: u32) -> Option<String> {
         .map(|u| u.name)
 }
 
+// Wide by design: this threads the whole request context through one call rather than
+// hiding it in shared state. Bundling it into a struct is a real refactor, not a lint fix.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     db: Arc<Database>,
@@ -868,6 +871,9 @@ async fn send_status(
     Ok(())
 }
 
+// Wide by design: this threads the whole request context through one call rather than
+// hiding it in shared state. Bundling it into a struct is a real refactor, not a lint fix.
+#[allow(clippy::too_many_arguments)]
 async fn handle_sudo_request(
     request: SudoRequest,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
@@ -1015,7 +1021,7 @@ async fn handle_sudo_request(
     // never be auto-run unattended, but a human in the loop is an acceptable gate.
     // (`&&` short-circuits, so ownership is only checked for allowlisted commands.)
     if is_allowed_with_strip(&command, &effective_allowlist, limits.strip_shell_prefix)
-        && ownership_ok_or_log(&command, &match_command, &limits, "Allowlisted")
+        && ownership_ok_or_log(&command, &match_command, limits, "Allowlisted")
     {
         info!("Command auto-approved via allowlist: {}", command);
 
@@ -1057,7 +1063,7 @@ async fn handle_sudo_request(
     // As with the allowlist, a temp-rule match that fails the ownership gate
     // falls through to human approval rather than being denied outright.
     if is_temp_rule_allowed_with_strip(&db, &request.user, &command, limits.strip_shell_prefix)?
-        && ownership_ok_or_log(&command, &match_command, &limits, "Temp-rule")
+        && ownership_ok_or_log(&command, &match_command, limits, "Temp-rule")
     {
         info!("Command auto-approved via temp rule: {}", command);
 
@@ -1247,7 +1253,7 @@ async fn handle_sudo_request(
     if mode == RequestMode::Exec && decision == Decision::Approved {
         // If check_binary_ownership is "all", validate even human-approved commands
         if limits.check_binary_ownership == BinaryOwnershipCheck::All {
-            if let Err(reason) = check_ownership_with_strip(&command, &match_command, &limits) {
+            if let Err(reason) = check_ownership_with_strip(&command, &match_command, limits) {
                 deny_ownership(
                     writer,
                     request_id.clone(),
@@ -1898,7 +1904,7 @@ fn discover_session_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "jsonl") {
+            if path.extension().is_some_and(|ext| ext == "jsonl") {
                 files.push(path);
             }
         }
@@ -2554,12 +2560,11 @@ fn strip_one_shell_layer(input: &str) -> Option<String> {
                 return None;
             }
             // Quoted: strip surrounding quotes
-            if (rest.starts_with('\'') && rest.ends_with('\''))
-                || (rest.starts_with('"') && rest.ends_with('"'))
+            if ((rest.starts_with('\'') && rest.ends_with('\''))
+                || (rest.starts_with('"') && rest.ends_with('"')))
+                && rest.len() >= 2
             {
-                if rest.len() >= 2 {
-                    return Some(rest[1..rest.len() - 1].to_string());
-                }
+                return Some(rest[1..rest.len() - 1].to_string());
             }
             // Unquoted: real shell only executes the first token
             let first_token = rest.split_whitespace().next().unwrap_or(rest);
@@ -2700,6 +2705,19 @@ fn is_temp_rule_allowed_with_strip(
         }
     }
     Ok(true)
+}
+
+fn set_socket_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o660);
+    std::fs::set_permissions(path, perms)?;
+
+    // Set group to 'aisudo' so members of that group can connect
+    if let Some(group) = nix::unistd::Group::from_name("aisudo")? {
+        nix::unistd::chown(path, None, Some(group.gid))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3229,7 +3247,7 @@ mod tests {
             db,
             backend,
             &json,
-            &[bin_str.clone()],
+            std::slice::from_ref(&bin_str),
             &[],
             &std::collections::HashMap::new(),
             test_limits_ownership_on(), // Auto mode: human-approved commands skip the check
@@ -5434,17 +5452,4 @@ mod tests {
         drop(writer);
         let _ = handler.await;
     }
-}
-
-fn set_socket_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o660);
-    std::fs::set_permissions(path, perms)?;
-
-    // Set group to 'aisudo' so members of that group can connect
-    if let Some(group) = nix::unistd::Group::from_name("aisudo")? {
-        nix::unistd::chown(path, None, Some(group.gid))?;
-    }
-
-    Ok(())
 }

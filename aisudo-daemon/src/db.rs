@@ -34,6 +34,8 @@ pub struct ScrubQueueEntry {
 }
 
 #[derive(Debug, Clone, Serialize)]
+// Only returned by the two unused temp-rule getters above, so dead transitively (#1823).
+#[allow(dead_code)]
 pub struct TempRuleRow {
     pub id: String,
     pub user: String,
@@ -317,6 +319,8 @@ impl Database {
         Ok(changed > 0)
     }
 
+    // Unused today; tracked in #1823, which says what to check before deleting.
+    #[allow(dead_code)]
     pub fn get_request(&self, request_id: &str) -> Result<Option<SudoRequestRecord>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
@@ -350,6 +354,8 @@ impl Database {
         }
     }
 
+    // Unused today; tracked in #1823, which says what to check before deleting.
+    #[allow(dead_code)]
     pub fn get_pending_requests(&self) -> Result<Vec<SudoRequestRecord>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
@@ -414,6 +420,9 @@ impl Database {
         Ok(ids)
     }
 
+    // Wide by design: this threads the whole rule record through one call rather than
+    // hiding it in shared state. Bundling it into a struct is a real refactor, not a lint fix.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_temp_rule(
         &self,
         id: &str,
@@ -476,6 +485,8 @@ impl Database {
         Ok(changed > 0)
     }
 
+    // Unused today; tracked in #1823, which says what to check before deleting.
+    #[allow(dead_code)]
     pub fn get_temp_rule(&self, id: &str) -> Result<Option<TempRuleRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
@@ -531,6 +542,8 @@ impl Database {
         Ok(rows)
     }
 
+    // Unused today; tracked in #1823, which says what to check before deleting.
+    #[allow(dead_code)]
     pub fn get_all_temp_rules(&self) -> Result<Vec<TempRuleRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
@@ -658,6 +671,8 @@ impl Database {
 
     // --- Bitwarden request methods ---
 
+    // Unused today; tracked in #1823, which says what to check before deleting.
+    #[allow(dead_code)]
     pub fn insert_bw_request(
         &self,
         id: &str,
@@ -976,6 +991,8 @@ impl Database {
     }
 
     /// Rate limit check for BW requests (separate from sudo rate limit).
+    // Unused today; tracked in #1823, which says what to check before deleting.
+    #[allow(dead_code)]
     pub fn check_bw_rate_limit(&self, user: &str, max_per_minute: u32) -> Result<bool> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let count: u32 = conn.query_row(
@@ -1021,6 +1038,8 @@ impl Database {
     }
 
     /// Legacy rate limit check for backwards compatibility (1-minute window, per-user).
+    // Unused today; tracked in #1823, which says what to check before deleting.
+    #[allow(dead_code)]
     pub fn check_rate_limit_legacy(&self, user: &str, max_per_minute: u32) -> Result<bool> {
         self.check_rate_limit(user, max_per_minute, 60, false)
     }

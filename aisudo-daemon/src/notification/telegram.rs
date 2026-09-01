@@ -71,6 +71,9 @@ struct CallbackUser {
 #[derive(Debug, Deserialize)]
 struct TelegramMessage {
     message_id: i64,
+    // Part of the Telegram API wire format. Deserialised whether or not we read it —
+    // removing it would change what we accept, so this stays deliberately.
+    #[allow(dead_code)]
     from: Option<CallbackUser>,
     text: Option<String>,
     chat: Option<ChatInfo>,
@@ -878,9 +881,8 @@ impl NotificationBackend for TelegramBackend {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(pending_key.clone(), tx);
 
-        let msg_id = self.send_message(record).await.map_err(|e| {
+        let msg_id = self.send_message(record).await.inspect_err(|_e| {
             self.pending.remove(&pending_key);
-            e
         })?;
         info!(
             "Sent Telegram notification for request {} (message_id: {})",
@@ -925,10 +927,12 @@ impl NotificationBackend for TelegramBackend {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(pending_key.clone(), tx);
 
-        let msg_id = self.send_temp_rule_message(record).await.map_err(|e| {
-            self.pending.remove(&pending_key);
-            e
-        })?;
+        let msg_id = self
+            .send_temp_rule_message(record)
+            .await
+            .inspect_err(|_e| {
+                self.pending.remove(&pending_key);
+            })?;
         info!(
             "Sent Telegram temp rule notification for {} (message_id: {})",
             record.id, msg_id
@@ -967,10 +971,12 @@ impl NotificationBackend for TelegramBackend {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(pending_key.clone(), tx);
 
-        let msg_id = self.send_bw_request_message(record).await.map_err(|e| {
-            self.pending.remove(&pending_key);
-            e
-        })?;
+        let msg_id = self
+            .send_bw_request_message(record)
+            .await
+            .inspect_err(|_e| {
+                self.pending.remove(&pending_key);
+            })?;
         info!(
             "Sent BW request notification for {} (message_id: {})",
             record.id, msg_id
@@ -1012,10 +1018,12 @@ impl NotificationBackend for TelegramBackend {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(pending_key.clone(), tx);
 
-        let msg_id = self.send_bw_confirm_message(record).await.map_err(|e| {
-            self.pending.remove(&pending_key);
-            e
-        })?;
+        let msg_id = self
+            .send_bw_confirm_message(record)
+            .await
+            .inspect_err(|_e| {
+                self.pending.remove(&pending_key);
+            })?;
         info!(
             "Sent BW confirm notification for {} (message_id: {})",
             record.id, msg_id

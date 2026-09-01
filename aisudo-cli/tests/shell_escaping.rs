@@ -7,7 +7,7 @@ use std::process::Command;
 fn test_pipe_character_escaping() {
     // This should not be interpreted as a shell pipe due to proper escaping
     let output = Command::new("../target/debug/aisudo")
-        .args(&["-n", "sed", "-i", "s/foo|bar/baz/", "/tmp/nonexistent"])
+        .args(["-n", "sed", "-i", "s/foo|bar/baz/", "/tmp/nonexistent"])
         .output()
         .expect("Failed to execute aisudo");
 
@@ -43,7 +43,7 @@ fn test_shell_metacharacter_escaping() {
 
     for (cmd, arg) in test_cases {
         let output = Command::new("../target/debug/aisudo")
-            .args(&["-n", cmd, arg])
+            .args(["-n", cmd, arg])
             .output()
             .expect("Failed to execute aisudo");
 

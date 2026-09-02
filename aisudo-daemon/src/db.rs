@@ -197,6 +197,46 @@ impl Database {
         Ok(())
     }
 
+    /// `decided_by` values the daemon writes when it approves a request WITHOUT
+    /// involving a human: an allowlist match, an active temp rule, and a sudoers
+    /// NOPASSWD match. Every other value is a backend name (telegram, askgw), i.e. a
+    /// human said yes. socket.rs must write exactly these, which is why they are
+    /// constants here rather than literals at the call sites — `rate_limit_filter`
+    /// reads them back out of the DB and a drift would silently stop excluding.
+    pub const DECIDED_BY_ALLOWLIST: &'static str = "allowlist";
+    pub const DECIDED_BY_TEMP_RULE: &'static str = "temp_rule";
+    pub const DECIDED_BY_NOPASSWD: &'static str = "nopasswd";
+
+    /// Extra WHERE clause for the rate-limit COUNT, implementing
+    /// `limits.rate_limit_count_allowlisted`.
+    ///
+    /// true  -> empty. Every request in the window counts, so the limit is a brake on
+    ///          total privileged activity.
+    /// false -> exclude the auto-approved deciders above, so a burst of allowlisted
+    ///          commands cannot consume the budget a human-approval request needs.
+    ///
+    /// The COALESCE is load-bearing. `decided_by` is NULL while a request is pending
+    /// (the human-approval path inserts before anyone decides), and in SQL
+    /// `NULL NOT IN (...)` evaluates to NULL, which COUNT's WHERE treats as false.
+    /// Without the COALESCE this clause would exclude every PENDING request — the
+    /// exact opposite of its purpose, and it would disable the limit entirely on the
+    /// path that pages a human.
+    ///
+    /// The interpolated values are compile-time constants containing no quotes, so
+    /// this is not a parameterised-query bypass; window and user stay bound (L8).
+    fn rate_limit_filter(count_allowlisted: bool) -> String {
+        if count_allowlisted {
+            String::new()
+        } else {
+            format!(
+                " AND COALESCE(decided_by, '') NOT IN ('{}', '{}', '{}')",
+                Self::DECIDED_BY_ALLOWLIST,
+                Self::DECIDED_BY_TEMP_RULE,
+                Self::DECIDED_BY_NOPASSWD,
+            )
+        }
+    }
+
     pub fn insert_request(&self, record: &SudoRequestRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
@@ -244,19 +284,25 @@ impl Database {
         max_requests: u32,
         window_seconds: u32,
         global: bool,
+        count_allowlisted: bool,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let filter = Self::rate_limit_filter(count_allowlisted);
         let count: u32 = if global {
             conn.query_row(
-                "SELECT COUNT(*) FROM requests
-                 WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?1 || ' seconds')",
+                &format!(
+                    "SELECT COUNT(*) FROM requests
+                 WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?1 || ' seconds'){filter}"
+                ),
                 params![window_seconds],
                 |row| row.get(0),
             )?
         } else {
             conn.query_row(
-                "SELECT COUNT(*) FROM requests
-                 WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?2 || ' seconds')",
+                &format!(
+                    "SELECT COUNT(*) FROM requests
+                 WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?2 || ' seconds'){filter}"
+                ),
                 params![record.user, window_seconds],
                 |row| row.get(0),
             )?
@@ -1016,20 +1062,27 @@ impl Database {
         max_requests: u32,
         window_seconds: u32,
         global: bool,
+        count_allowlisted: bool,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        // window_seconds is bound, not interpolated, into the SQL (L8).
+        // window_seconds and user are bound, not interpolated, into the SQL (L8).
+        // `filter` is built only from compile-time constants — see rate_limit_filter.
+        let filter = Self::rate_limit_filter(count_allowlisted);
         let count: u32 = if global {
             conn.query_row(
-                "SELECT COUNT(*) FROM requests
-                 WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?1 || ' seconds')",
+                &format!(
+                    "SELECT COUNT(*) FROM requests
+                 WHERE datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?1 || ' seconds'){filter}"
+                ),
                 params![window_seconds],
                 |row| row.get(0),
             )?
         } else {
             conn.query_row(
-                "SELECT COUNT(*) FROM requests
-                 WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?2 || ' seconds')",
+                &format!(
+                    "SELECT COUNT(*) FROM requests
+                 WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-' || ?2 || ' seconds'){filter}"
+                ),
                 params![user, window_seconds],
                 |row| row.get(0),
             )?
@@ -1041,7 +1094,7 @@ impl Database {
     // Unused today; tracked in #1823, which says what to check before deleting.
     #[allow(dead_code)]
     pub fn check_rate_limit_legacy(&self, user: &str, max_per_minute: u32) -> Result<bool> {
-        self.check_rate_limit(user, max_per_minute, 60, false)
+        self.check_rate_limit(user, max_per_minute, 60, false, true)
     }
 
     /// Get the number of pending approval requests.
@@ -1522,7 +1575,7 @@ mod tests {
     #[test]
     fn check_rate_limit_under_limit() {
         let (_dir, db) = test_db();
-        assert!(db.check_rate_limit("alice", 5, 60, false).unwrap());
+        assert!(db.check_rate_limit("alice", 5, 60, false, false).unwrap());
     }
 
     fn make_request(id: &str, command: &str) -> aisudo_common::SudoRequestRecord {
@@ -1643,7 +1696,7 @@ mod tests {
                 barrier.wait();
                 // Large window so only concurrency (not time) decides the count.
                 if db
-                    .try_insert_request_rate_limited(&record, limit, 3600, false)
+                    .try_insert_request_rate_limited(&record, limit, 3600, false, false)
                     .unwrap()
                 {
                     admitted.fetch_add(1, Ordering::SeqCst);
@@ -1661,7 +1714,9 @@ mod tests {
             limit,
             "more than the limit slipped past the rate limiter (TOCTOU)"
         );
-        assert!(!db.check_rate_limit("alice", limit, 3600, false).unwrap());
+        assert!(!db
+            .check_rate_limit("alice", limit, 3600, false, false)
+            .unwrap());
     }
 
     #[test]
@@ -1688,7 +1743,9 @@ mod tests {
             let admitted = Arc::clone(&admitted);
             handles.push(std::thread::spawn(move || {
                 // Step 1: everyone checks (all see 0 < limit).
-                let under = db.check_rate_limit("alice", limit, 3600, false).unwrap();
+                let under = db
+                    .check_rate_limit("alice", limit, 3600, false, false)
+                    .unwrap();
                 // Force all checks to complete before any insert.
                 check_barrier.wait();
                 // Step 2: everyone who passed inserts.
@@ -1745,9 +1802,9 @@ mod tests {
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
         }
-        assert!(!db.check_rate_limit("alice", 5, 60, false).unwrap());
+        assert!(!db.check_rate_limit("alice", 5, 60, false, false).unwrap());
         // Different user still under limit (per-user mode)
-        assert!(db.check_rate_limit("bob", 5, 60, false).unwrap());
+        assert!(db.check_rate_limit("bob", 5, 60, false, false).unwrap());
     }
 
     #[test]
@@ -1790,7 +1847,7 @@ mod tests {
             db.insert_request(&record).unwrap();
         }
         // Global limit of 5: should be exceeded now (3 + 2 = 5)
-        assert!(!db.check_rate_limit("charlie", 5, 60, true).unwrap());
+        assert!(!db.check_rate_limit("charlie", 5, 60, true, false).unwrap());
     }
 
     #[test]
@@ -1815,9 +1872,124 @@ mod tests {
             db.insert_request(&record).unwrap();
         }
         // With window of 60s and limit of 2, should be exceeded
-        assert!(!db.check_rate_limit("alice", 2, 60, false).unwrap());
+        assert!(!db.check_rate_limit("alice", 2, 60, false, false).unwrap());
         // With window of 60s and limit of 5, should be under limit
-        assert!(db.check_rate_limit("alice", 5, 60, false).unwrap());
+        assert!(db.check_rate_limit("alice", 5, 60, false, false).unwrap());
+    }
+
+    // --- rate_limit_count_allowlisted (#1822) ---
+    //
+    // Before this flag was wired up, the COUNT had no decided_by filter at all, so
+    // auto-approved commands silently consumed the budget while never being blocked
+    // themselves. The user-visible symptom was a human-approval request denied with
+    // "rate limit exceeded" after a burst of allowlisted commands that produced no
+    // notification and left nothing to look at.
+
+    /// Insert `n` requests for `user` and mark each decided by `decider`.
+    fn insert_decided(db: &Database, user: &str, decider: &str, n: usize, tag: &str) {
+        for i in 0..n {
+            let req = aisudo_common::SudoRequest {
+                user: user.to_string(),
+                command: format!("{tag}-{i}"),
+                cwd: "/".to_string(),
+                pid: i as u32,
+                mode: aisudo_common::RequestMode::Pam,
+                reason: None,
+                stdin: None,
+                skip_nopasswd: false,
+                timeout_seconds: None,
+                dry_run: false,
+                wants_status: false,
+            };
+            let record = aisudo_common::SudoRequestRecord::new(req, 60);
+            db.insert_request(&record).unwrap();
+            assert!(db
+                .update_decision(&record.id, Decision::Approved, decider)
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn rate_limit_excludes_allowlisted_by_default() {
+        let (_dir, db) = test_db();
+        insert_decided(&db, "alice", Database::DECIDED_BY_ALLOWLIST, 5, "auto");
+
+        // Default (false): the five auto-approved commands do not consume the budget,
+        // so a request that WOULD page a human still gets through.
+        assert!(db.check_rate_limit("alice", 5, 60, false, false).unwrap());
+        // Opting in: they do consume it, and the limit of 5 is reached.
+        assert!(!db.check_rate_limit("alice", 5, 60, false, true).unwrap());
+    }
+
+    #[test]
+    fn rate_limit_excludes_every_auto_approve_path() {
+        let (_dir, db) = test_db();
+        insert_decided(&db, "alice", Database::DECIDED_BY_ALLOWLIST, 1, "a");
+        insert_decided(&db, "alice", Database::DECIDED_BY_TEMP_RULE, 1, "t");
+        insert_decided(&db, "alice", Database::DECIDED_BY_NOPASSWD, 1, "n");
+
+        // All three deciders mean "no human was asked", so all three are excluded.
+        assert!(db.check_rate_limit("alice", 1, 60, false, false).unwrap());
+        assert!(!db.check_rate_limit("alice", 1, 60, false, true).unwrap());
+    }
+
+    #[test]
+    fn rate_limit_still_counts_pending_requests() {
+        // The COALESCE guard in rate_limit_filter. A pending request has decided_by
+        // NULL, and `NULL NOT IN (...)` is NULL, which WHERE treats as false — so
+        // without the COALESCE this filter would exclude exactly the requests the
+        // limit exists to bound, disabling it on the human-approval path.
+        let (_dir, db) = test_db();
+        for i in 0..5 {
+            db.insert_request(&make_request(&format!("pending-{i}"), "ls"))
+                .unwrap();
+        }
+        assert!(!db.check_rate_limit("alice", 5, 60, false, false).unwrap());
+    }
+
+    #[test]
+    fn rate_limit_still_counts_human_decided_requests() {
+        // decided_by is a backend name when a human answered. Those must keep counting
+        // whichever way the flag is set.
+        let (_dir, db) = test_db();
+        insert_decided(&db, "alice", "telegram", 5, "human");
+        assert!(!db.check_rate_limit("alice", 5, 60, false, false).unwrap());
+    }
+
+    #[test]
+    fn rate_limit_excludes_allowlisted_in_global_mode_too() {
+        let (_dir, db) = test_db();
+        insert_decided(&db, "alice", Database::DECIDED_BY_ALLOWLIST, 3, "a");
+        insert_decided(&db, "bob", Database::DECIDED_BY_ALLOWLIST, 2, "b");
+        // Global mode ignores the user but must apply the same decided_by filter.
+        assert!(db.check_rate_limit("charlie", 5, 60, true, false).unwrap());
+        assert!(!db.check_rate_limit("charlie", 5, 60, true, true).unwrap());
+    }
+
+    #[test]
+    fn try_insert_rate_limited_excludes_allowlisted() {
+        // The enforcing path, not just the dry-run check: an escalation must still be
+        // admitted after a burst of allowlisted commands has filled the window.
+        let (_dir, db) = test_db();
+        insert_decided(&db, "alice", Database::DECIDED_BY_ALLOWLIST, 5, "auto");
+
+        let escalation = make_request("needs-a-human", "rm -rf /etc");
+        assert!(db
+            .try_insert_request_rate_limited(&escalation, 5, 60, false, false)
+            .unwrap());
+
+        // That escalation is itself pending, so it DOES count: the next one is blocked
+        // once the human-approval requests alone reach the limit.
+        for i in 0..4 {
+            let r = make_request(&format!("more-{i}"), "ls");
+            assert!(db
+                .try_insert_request_rate_limited(&r, 5, 60, false, false)
+                .unwrap());
+        }
+        let over = make_request("over", "ls");
+        assert!(!db
+            .try_insert_request_rate_limited(&over, 5, 60, false, false)
+            .unwrap());
     }
 
     // --- Bitwarden DB tests ---

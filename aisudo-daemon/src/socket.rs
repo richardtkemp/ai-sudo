@@ -1013,7 +1013,10 @@ async fn handle_sudo_request(
             allowlist.to_vec()
         };
 
-    // Check allowlist - auto-approved commands skip rate limiting.
+    // Check allowlist - auto-approved commands are never BLOCKED by the rate limit
+    // (this branch returns before the check). Whether they still CONSUME the budget a
+    // later human-approval request draws on is limits.rate_limit_count_allowlisted,
+    // enforced in Database::rate_limit_filter via the decided_by written below.
     // An allowlisted command is auto-approved ONLY if it also passes the binary
     // ownership/writability gate. If the gate fails we do NOT deny outright;
     // instead we fall through to the human-approval path below, so the command
@@ -1042,7 +1045,11 @@ async fn handle_sudo_request(
 
         let record = SudoRequestRecord::new(request, effective_timeout);
         db.insert_request(&record)?;
-        db.update_decision(&record.id, Decision::Approved, "allowlist")?;
+        db.update_decision(
+            &record.id,
+            Decision::Approved,
+            Database::DECIDED_BY_ALLOWLIST,
+        )?;
         send_status(writer, wants_status, RequestStatus::AutoApproved).await?;
         let response = SudoResponse {
             request_id: record.id,
@@ -1059,7 +1066,7 @@ async fn handle_sudo_request(
         return Ok(());
     }
 
-    // Check active temp rules - auto-approved commands skip rate limiting.
+    // Check active temp rules - same rate-limit treatment as the allowlist above.
     // As with the allowlist, a temp-rule match that fails the ownership gate
     // falls through to human approval rather than being denied outright.
     if is_temp_rule_allowed_with_strip(&db, &request.user, &command, limits.strip_shell_prefix)?
@@ -1084,7 +1091,11 @@ async fn handle_sudo_request(
 
         let record = SudoRequestRecord::new(request.clone(), effective_timeout);
         db.insert_request(&record)?;
-        db.update_decision(&record.id, Decision::Approved, "temp_rule")?;
+        db.update_decision(
+            &record.id,
+            Decision::Approved,
+            Database::DECIDED_BY_TEMP_RULE,
+        )?;
         send_status(writer, wants_status, RequestStatus::AutoApproved).await?;
         let response = SudoResponse {
             request_id: record.id,
@@ -1133,7 +1144,7 @@ async fn handle_sudo_request(
 
             let record = SudoRequestRecord::new(request.clone(), effective_timeout);
             db.insert_request(&record)?;
-            db.update_decision(&record.id, Decision::UseSudo, "nopasswd")?;
+            db.update_decision(&record.id, Decision::UseSudo, Database::DECIDED_BY_NOPASSWD)?;
             send_status(writer, wants_status, RequestStatus::AutoApproved).await?;
             let response = SudoResponse {
                 request_id: record.id,
@@ -1163,6 +1174,7 @@ async fn handle_sudo_request(
             limits.rate_limit_requests,
             limits.rate_limit_window_seconds,
             global_rate_limit,
+            limits.rate_limit_count_allowlisted,
         )?;
         send_status(writer, wants_status, RequestStatus::AutoDenied).await?;
         let response = SudoResponse {
@@ -1188,6 +1200,7 @@ async fn handle_sudo_request(
         limits.rate_limit_requests,
         limits.rate_limit_window_seconds,
         global_rate_limit,
+        limits.rate_limit_count_allowlisted,
     )? {
         let limit_type = if global_rate_limit {
             "global"

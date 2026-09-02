@@ -192,12 +192,20 @@ pub struct LimitsConfig {
     #[serde(default = "default_rate_limit_window_seconds")]
     pub rate_limit_window_seconds: u32,
 
-    /// Whether allowlisted/temp-rule commands count toward rate limit.
-    /// Default: false (allowlisted commands bypass rate limiting entirely).
+    /// Whether auto-approved commands count toward the rate limit.
+    ///
+    /// "Auto-approved" means the daemon decided without asking a human: an allowlist
+    /// match, an active temp rule, or a sudoers NOPASSWD match. Such a command is
+    /// never BLOCKED by the limit either way — it is decided before the check runs.
+    /// This flag controls whether it still CONSUMES the budget that later
+    /// human-approval requests draw on.
+    ///
+    /// Default: false. The limit exists to protect the human's attention, and an
+    /// auto-approved command notifies nobody, so a burst of them must not push a
+    /// genuine approval request over the edge. Set true to make the limit a brake on
+    /// total privileged activity instead — a cap on a runaway loop running thousands
+    /// of individually-allowlisted root commands.
     #[serde(default)]
-    // Never read: this option silently does nothing. Tracked in #1822 — implement or delete,
-    // do not just drop the doc comment above.
-    #[allow(dead_code)]
     pub rate_limit_count_allowlisted: bool,
 
     /// Rate limit mode: per_user (default) or global.

@@ -37,6 +37,150 @@ if [[ -n "$AISUDO_GID" && ! "$AISUDO_GID" =~ ^[0-9]+$ ]]; then
 fi
 
 # =====================================================================
+# Install rollback
+# =====================================================================
+# The install stops the daemon and overwrites the live binaries, config and
+# service unit IN PLACE. If what replaces them is broken, every agent on the
+# box loses privileged operations until a human intervenes by hand — and the
+# way that gets discovered is an agent failing, not the installer saying so.
+# (A human still has real /usr/bin/sudo, which this daemon does not mediate,
+# so it is recoverable; it is just silent.)
+#
+# So: snapshot the files the install is about to overwrite, arm a trap, and put
+# them back unless we reach a VERIFIED-HEALTHY daemon.
+#
+# WHY A TRAP AND NOT AN `else` AFTER THE HEALTH CHECK. Both install paths run
+# under `set -euo pipefail`. A failing `install`, `groupadd` or `daemon-reload`
+# aborts the script immediately and never reaches code placed after it — and by
+# then the daemon is stopped and the binaries may be half-swapped. The old
+# "daemon failed to start" branch was unreachable for every one of those
+# failures. Only a trap fires on that path.
+#
+# Every backed-up path is a plain FILE, deliberately. Restoring never needs a
+# recursive delete, so this code contains no `rm -rf` of anything it did not
+# itself create.
+
+AISUDO_PLATFORM="$(uname -s)"
+AISUDO_BACKUP_ROOT="/var/backups/aisudo"
+AISUDO_BACKUP_KEEP=5
+AISUDO_BACKUP_DIR=""
+AISUDO_LOG_HINT=""
+
+# Snapshot the given live paths into a timestamped dir, mirroring their real
+# layout, with a MANIFEST listing what was taken. Paths that do not exist are
+# skipped — that is how a first install correctly ends up with nothing to roll
+# back to, rather than a rollback that restores emptiness over a good install.
+aisudo_backup() {
+    AISUDO_BACKUP_DIR="$AISUDO_BACKUP_ROOT/$(date +%Y%m%d-%H%M%S).$$"
+    install -d -o root -g root -m 700 "$AISUDO_BACKUP_ROOT"
+    install -d -o root -g root -m 700 "$AISUDO_BACKUP_DIR"
+
+    local p found=0
+    for p in "$@"; do
+        [[ -f "$p" ]] || continue
+        install -d -o root -g root -m 700 "$AISUDO_BACKUP_DIR$(dirname "$p")"
+        cp -p "$p" "$AISUDO_BACKUP_DIR$p"
+        printf '%s\n' "$p" >>"$AISUDO_BACKUP_DIR/MANIFEST"
+        found=$((found + 1))
+    done
+
+    if [[ $found -eq 0 ]]; then
+        rmdir "$AISUDO_BACKUP_DIR" 2>/dev/null || true
+        AISUDO_BACKUP_DIR=""
+        info "Nothing installed yet — no rollback point (first install)"
+        return 0
+    fi
+
+    info "Backed up $found file(s) to $AISUDO_BACKUP_DIR"
+    aisudo_prune_backups
+}
+
+# Keep the last AISUDO_BACKUP_KEEP snapshots. `ls -t` rather than `find -printf`
+# because the latter is GNU-only and this runs on macOS too.
+aisudo_prune_backups() {
+    local old
+    while IFS= read -r old; do
+        # Belt and braces: only ever delete something under the backup root.
+        [[ -n "$old" && "$old" == "$AISUDO_BACKUP_ROOT"/* ]] || continue
+        rm -rf -- "$old"
+    done < <(ls -1dt "$AISUDO_BACKUP_ROOT"/*/ 2>/dev/null | tail -n +$((AISUDO_BACKUP_KEEP + 1)) || true)
+}
+
+aisudo_restart_daemon() {
+    case "$AISUDO_PLATFORM" in
+        Linux)
+            systemctl restart aisudo-daemon
+            ;;
+        Darwin)
+            launchctl bootout system /Library/LaunchDaemons/ai.sudo.daemon.plist 2>/dev/null || true
+            launchctl bootstrap system /Library/LaunchDaemons/ai.sudo.daemon.plist
+            ;;
+    esac
+}
+
+# The gate that decides whether the install keeps its changes.
+#
+# `systemctl is-active` / `launchctl print` only prove the process launched. A
+# daemon that starts and is THEN broken — cannot open its DB, fails to bind the
+# socket, panics on the first request — passes both and still leaves every agent
+# unable to escalate. So the check is an end-to-end round trip: `aisudo --status`
+# connects to the socket, sends a Status message and parses the reply, exiting
+# non-zero on any failure along the way. It notifies nobody, so it is safe to run
+# unattended.
+#
+# Ten one-second attempts rather than one `sleep 2`: the daemon may still be
+# opening its socket, and a health gate that is merely impatient would roll back
+# a perfectly good install.
+aisudo_health_check() {
+    local i
+    for i in $(seq 1 10); do
+        if /usr/local/bin/aisudo --status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Trap handler. Restores the snapshot, restarts, and reports which of the two
+# bad outcomes happened: rolled back and healthy, or rolled back and still dead.
+aisudo_rollback() {
+    local rc=$?
+    trap - ERR EXIT
+
+    if [[ -z "$AISUDO_BACKUP_DIR" || ! -f "$AISUDO_BACKUP_DIR/MANIFEST" ]]; then
+        error "Install failed (status $rc) and there is no previous install to restore."
+        error "Expected on a first install. Fix the cause and re-run: $AISUDO_LOG_HINT"
+        exit "$rc"
+    fi
+
+    error "Install failed (status $rc) — restoring the previous install"
+    error "  from $AISUDO_BACKUP_DIR"
+    local p
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        if cp -p "$AISUDO_BACKUP_DIR$p" "$p"; then
+            info "  restored $p"
+        else
+            error "  FAILED to restore $p — copy it back by hand from $AISUDO_BACKUP_DIR"
+        fi
+    done <"$AISUDO_BACKUP_DIR/MANIFEST"
+
+    aisudo_restart_daemon || true
+
+    if aisudo_health_check; then
+        info "Rolled back. The previous daemon is answering on its socket again."
+        info "The new build is still at $DAEMON_BIN if you want to debug it."
+    else
+        error "ROLLED BACK, BUT THE RESTORED DAEMON IS NOT ANSWERING."
+        error "  backup: $AISUDO_BACKUP_DIR"
+        error "  logs:   $AISUDO_LOG_HINT"
+        error "  Recover with real /usr/bin/sudo, which this daemon does not mediate."
+    fi
+    exit "$rc"
+}
+
+# =====================================================================
 # Platform-specific install functions
 # =====================================================================
 # Defined before the dispatch below — bash does not hoist function
@@ -77,6 +221,32 @@ echo "=== aisudo setup started at \$(date) ==="
 info()  { echo -e "\033[0;32m[✓]\033[0m \$*"; }
 warn()  { echo -e "\033[1;33m[!]\033[0m \$*"; }
 error() { echo -e "\033[0;31m[✗]\033[0m \$*"; }
+INSTALL_EOF
+
+    # The rollback library goes in via `declare -f`, not a heredoc. The heredoc
+    # around it MUST stay unquoted (it interpolates $groupadd_gid_flag,
+    # $DAEMON_BIN, $SCRIPT_DIR...), and an unquoted heredoc would eat every
+    # $1/$@/$? inside those function bodies. `declare -f` writes them verbatim,
+    # so Linux and macOS share ONE definition instead of a copy that drifts.
+    cat >> "$INSTALL_SCRIPT" <<VARS_EOF
+AISUDO_PLATFORM="Linux"
+AISUDO_BACKUP_ROOT="$AISUDO_BACKUP_ROOT"
+AISUDO_BACKUP_KEEP=$AISUDO_BACKUP_KEEP
+AISUDO_BACKUP_DIR=""
+AISUDO_LOG_HINT="journalctl -u aisudo-daemon -n 50"
+DAEMON_BIN="$DAEMON_BIN"
+CLI_BIN="$CLI_BIN"
+VARS_EOF
+    declare -f aisudo_backup aisudo_prune_backups aisudo_restart_daemon \
+               aisudo_health_check aisudo_rollback >> "$INSTALL_SCRIPT"
+
+    cat >> "$INSTALL_SCRIPT" <<INSTALL_EOF
+
+# Snapshot every file below overwrites, THEN arm the trap — both before the
+# daemon is stopped, so any failure from here on has something to restore.
+aisudo_backup /usr/local/bin/aisudo-daemon /usr/local/bin/aisudo \\
+              /etc/aisudo/aisudo.toml /etc/systemd/system/aisudo-daemon.service
+trap aisudo_rollback ERR EXIT
 
 if systemctl is-active --quiet aisudo-daemon 2>/dev/null; then
     info "Stopping running aisudo-daemon..."
@@ -124,10 +294,10 @@ info "Enabling and starting aisudo-daemon..."
 systemctl enable aisudo-daemon
 systemctl restart aisudo-daemon
 
-sleep 2
-
-if systemctl is-active --quiet aisudo-daemon; then
-    info "aisudo-daemon is running!"
+# Verified-answering, not merely is-active — see aisudo_health_check.
+if aisudo_health_check; then
+    trap - ERR EXIT   # the install stands; nothing left to roll back to
+    info "aisudo-daemon is running and answering on its socket!"
     echo ""
     if id -nG "$BUILD_USER" | tr ' ' '\n' | grep -qx aisudo; then
         info "$BUILD_USER is already a member of the aisudo group"
@@ -141,12 +311,17 @@ if systemctl is-active --quiet aisudo-daemon; then
     echo "=== aisudo setup completed at \$(date) ==="
     echo "View this log: cat /var/log/aisudo-setup.log"
 else
-    error "aisudo-daemon failed to start. Check: journalctl -u aisudo-daemon -n 20"
+    error "aisudo-daemon is not answering on its socket after the install."
+    error "Check: journalctl -u aisudo-daemon -n 50"
     echo ""
     echo "=== aisudo setup FAILED at \$(date) ==="
+    # Falls through to the EXIT trap, which restores the previous install.
+    exit 1
 fi
 
-rm -f "\$0"  # clean up temp script
+# Only reached on success — the failure branch exits above and the trap handles
+# it, keeping this script on disk so a post-mortem has more than the log.
+rm -f "\$0"
 INSTALL_EOF
 
     systemd-run --unit=aisudo-install --description="aisudo install" \
@@ -166,6 +341,14 @@ INSTALL_EOF
 # kill semantics with the daemon, so we install inline. Logs go to a flat
 # file (rotated by newsyslog) instead of journald.
 install_macos() {
+    AISUDO_LOG_HINT="tail -50 /var/log/aisudo.log"
+    # Snapshot every file below overwrites, THEN arm the trap — both before the
+    # daemon is stopped, so any failure from here on has something to restore.
+    aisudo_backup /usr/local/bin/aisudo-daemon /usr/local/bin/aisudo \
+                  /etc/aisudo/aisudo.toml /etc/newsyslog.d/aisudo.conf \
+                  /Library/LaunchDaemons/ai.sudo.daemon.plist
+    trap aisudo_rollback ERR EXIT
+
     # Stop the running daemon if present (bootout is idempotent — fails
     # harmlessly if not loaded).
     if launchctl print system/ai.sudo.daemon &>/dev/null; then
@@ -236,10 +419,10 @@ NEWSYSLOG_EOF
     info "Loading and starting aisudo-daemon..."
     launchctl bootstrap system /Library/LaunchDaemons/ai.sudo.daemon.plist
 
-    sleep 2
-
-    if launchctl print system/ai.sudo.daemon &>/dev/null; then
-        info "aisudo-daemon is running!"
+    # Verified-answering, not merely loaded — see aisudo_health_check.
+    if aisudo_health_check; then
+        trap - ERR EXIT   # the install stands; nothing left to roll back to
+        info "aisudo-daemon is running and answering on its socket!"
         echo ""
         if dseditgroup -o checkmember -m "$BUILD_USER" aisudo &>/dev/null; then
             info "$BUILD_USER is already a member of the aisudo group"
@@ -254,8 +437,10 @@ NEWSYSLOG_EOF
         echo "  Logs:     tail -f /var/log/aisudo.log"
         echo "  Restart:  sudo launchctl kickstart -k system/ai.sudo.daemon"
     else
-        error "aisudo-daemon failed to start. Check: tail -50 /var/log/aisudo.log"
+        error "aisudo-daemon is not answering on its socket after the install."
+        error "Check: tail -50 /var/log/aisudo.log"
         error "Also: sudo launchctl print system/ai.sudo.daemon"
+        # Falls through to the EXIT trap, which restores the previous install.
         exit 1
     fi
 }

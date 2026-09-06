@@ -285,7 +285,7 @@ fn main() -> ExitCode {
             } else {
                 eprintln!("\x1b[31msudo: request denied by user\x1b[0m");
             }
-            return ExitCode::from(1);
+            return ExitCode::from(decision_exit_code(response.decision));
         }
         Decision::Timeout => {
             if dry_run {
@@ -295,7 +295,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "\x1b[33msudo: request timed out (no response within approval window)\x1b[0m"
             );
-            return ExitCode::from(1);
+            return ExitCode::from(decision_exit_code(response.decision));
         }
         Decision::Pending => {
             eprintln!("{}: unexpected pending response", BINARY_NAME);
@@ -466,11 +466,11 @@ fn handle_request_rule(args: &[String]) -> ExitCode {
             } else {
                 eprintln!("{}: temp rule denied", BINARY_NAME);
             }
-            ExitCode::from(1)
+            ExitCode::from(decision_exit_code(response.decision))
         }
         Decision::Timeout => {
             eprintln!("{}: temp rule request timed out", BINARY_NAME);
-            ExitCode::from(1)
+            ExitCode::from(decision_exit_code(response.decision))
         }
         _ => {
             eprintln!("{}: unexpected response", BINARY_NAME);
@@ -1038,11 +1038,11 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
             } else {
                 eprintln!("{}: request denied by user", BINARY_NAME);
             }
-            return ExitCode::from(1);
+            return ExitCode::from(decision_exit_code(response.decision));
         }
         Decision::Timeout => {
             eprintln!("{}: request timed out", BINARY_NAME);
-            return ExitCode::from(1);
+            return ExitCode::from(decision_exit_code(response.decision));
         }
         _ => {
             eprintln!("{}: unexpected response", BINARY_NAME);
@@ -1054,6 +1054,31 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
     writer.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
     ExitCode::from(stream_exec_output(lines) as u8)
+}
+
+/// Process exit code for a request that terminated WITHOUT the command ever running
+/// (i.e. every `Decision` other than `Approved`, which execs and reports the child's
+/// own exit status instead of consulting this table).
+///
+/// `Denied` and `Timeout` MUST map to different codes (#1840). A denial means a human
+/// looked at the request and said no; a timeout means no one ever looked — the command
+/// still didn't run, but nothing is known about intent. Before this both collapsed to
+/// the same code (1), so a caller branching on exit status alone could not tell "a
+/// person rejected this" from "this was never seen" apart, and worse, a caller that
+/// only checked for a NON-zero code could still reason as if the command ran (it did
+/// not, in both cases) — the fix that matters most is that this path is non-zero at
+/// all, distinctness is the secondary, still-required guarantee.
+fn decision_exit_code(decision: Decision) -> u8 {
+    match decision {
+        Decision::Denied => 1,
+        Decision::Timeout => 2,
+        // Approved never reaches here in the real (non-dry-run) exec path — it execs
+        // and returns the child's exit code instead. UseSudo and Pending are handled
+        // by their own dedicated branches before this would be consulted; if either
+        // ever falls through here it is a protocol-level surprise, not a normal
+        // decision, so it gets the same code as an unexplained failure.
+        Decision::Approved | Decision::UseSudo | Decision::Pending => 1,
+    }
 }
 
 /// Consume the exec-output stream from the daemon: print stdout/stderr lines as they
@@ -1524,6 +1549,55 @@ mod tests {
         ];
         let exit_code = stream_exec_output(lines.into_iter());
         assert_eq!(exit_code, 1);
+    }
+
+    // --- #1840: a timed-out approval must exit non-zero, and distinguishably from a
+    // denial. A real end-to-end repro needs a human to deliberately not respond within
+    // the approval window, which isn't something a test suite can do — so these pin
+    // down the pure mapping instead, which is the part that actually decides the exit
+    // code the shell sees.
+
+    #[test]
+    fn timeout_and_denied_are_both_non_zero() {
+        // The unsafe failure mode this bug produced was a caller treating exit 0 as
+        // "the command ran". Any decision that skips execution must therefore be
+        // non-zero, full stop, regardless of which one it is.
+        assert_ne!(decision_exit_code(Decision::Denied), 0);
+        assert_ne!(decision_exit_code(Decision::Timeout), 0);
+    }
+
+    #[test]
+    fn timeout_and_denied_are_distinguishable() {
+        // The second, still-required half of #1840: "denied" (a human looked and said
+        // no) and "timeout" (no one ever looked) carry different information, and a
+        // caller must be able to branch on which one happened.
+        assert_ne!(
+            decision_exit_code(Decision::Denied),
+            decision_exit_code(Decision::Timeout),
+            "denied and timeout must map to different exit codes"
+        );
+    }
+
+    #[test]
+    fn decision_exit_code_is_stable_per_variant() {
+        // Pin the exact values so a future edit that collapses them back together (or
+        // reassigns them silently) shows up as a diff here, not just as "still passes".
+        assert_eq!(decision_exit_code(Decision::Denied), 1);
+        assert_eq!(decision_exit_code(Decision::Timeout), 2);
+    }
+
+    #[test]
+    fn unexpected_decisions_fall_back_to_a_generic_non_zero_code() {
+        // Approved/UseSudo/Pending are each handled by their own branch before the
+        // mapping table would normally be consulted; if one ever falls through anyway
+        // (a protocol-level surprise) it must still fail loudly, not report success.
+        for d in [Decision::Approved, Decision::UseSudo, Decision::Pending] {
+            assert_ne!(
+                decision_exit_code(d),
+                0,
+                "{d:?} must not silently report success"
+            );
+        }
     }
 }
 

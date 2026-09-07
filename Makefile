@@ -36,6 +36,7 @@ test-install-rollback:
 lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --locked -- -D warnings
+	shellcheck setup.sh scripts/*.sh
 
 update:
 	sudo ./setup.sh

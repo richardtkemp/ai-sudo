@@ -31,6 +31,7 @@ install() { local a=(); while [[ $# -gt 0 ]]; do case "$1" in -o|-g) shift 2;; *
 systemctl() { :; }
 # shellcheck disable=SC1090
 source "$LIB"
+# shellcheck disable=SC2034  # read by the sourced setup.sh functions, not by this file
 AISUDO_PLATFORM=Linux
 AISUDO_BACKUP_ROOT="$T/backups"
 DAEMON_BIN="$T/newbuild/aisudo-daemon"
@@ -117,11 +118,21 @@ echo "== setup.sh actually WIRES the library in, in the right order =="
 GEN="$T/generated-install.sh"
 (
   set -e
-  SCRIPT_DIR="$REPO"; CONFIG_FILE="$SCRIPT_DIR/aisudo.toml"
+  # All of these are read by install_linux, eval'd below, not by this file.
+  # shellcheck disable=SC2034
+  SCRIPT_DIR="$REPO"
+  # shellcheck disable=SC2034
+  CONFIG_FILE="$SCRIPT_DIR/aisudo.toml"
+  # shellcheck disable=SC2034
   DAEMON_BIN="$SCRIPT_DIR/target/release/aisudo-daemon"
+  # shellcheck disable=SC2034
   CLI_BIN="$SCRIPT_DIR/target/release/aisudo"
-  AISUDO_GID=""; BUILD_USER="${SUDO_USER:-$USER}"
+  # shellcheck disable=SC2034
+  AISUDO_GID=""
+  # shellcheck disable=SC2034
+  BUILD_USER="${SUDO_USER:-$USER}"
   # Intercept the launch: capture the generated script instead of running it.
+  # shellcheck disable=SC2317  # invoked by install_linux, not directly
   systemd-run() { cp "$INSTALL_SCRIPT" "$GEN"; rm -f "$INSTALL_SCRIPT"; }
   eval "$(awk '/^install_linux\(\) \{$/{on=1} on; /^\}$/{if(on)exit}' "$REPO/setup.sh")"
   install_linux >/dev/null 2>&1
@@ -135,6 +146,7 @@ grep -q 'for p in "\$@"' "$GEN" || fail "backup body was mangled on the way into
 # `trap - ERR EXIT;` INSIDE the rollback function body matches too, and the arm
 # counts six landmarks instead of five.
 order=$(grep -n 'aisudo_backup /usr/local/bin\|^trap aisudo_rollback\|^    systemctl stop\|^if aisudo_health_check\|^    trap - ERR EXIT   #' "$GEN" | cut -d: -f1 | tr '\n' ' ')
+# shellcheck disable=SC2086  # word-splitting the line numbers is the intent
 set -- $order
 [[ $# -eq 5 ]] || fail "expected 5 wiring landmarks in the generated script, found $#: $order"
 [[ $1 -lt $2 && $2 -lt $3 && $3 -lt $4 && $4 -lt $5 ]] \

@@ -99,6 +99,7 @@ aisudo_backup() {
 # because the latter is GNU-only and this runs on macOS too.
 aisudo_prune_backups() {
     local old
+    # shellcheck disable=SC2012  # need mtime ordering; backup dirs are our own timestamped names, never arbitrary
     while IFS= read -r old; do
         # Belt and braces: only ever delete something under the backup root.
         [[ -n "$old" && "$old" == "$AISUDO_BACKUP_ROOT"/* ]] || continue
@@ -132,8 +133,8 @@ aisudo_restart_daemon() {
 # opening its socket, and a health gate that is merely impatient would roll back
 # a perfectly good install.
 aisudo_health_check() {
-    local i
-    for i in $(seq 1 10); do
+    local _
+    for _ in $(seq 1 10); do
         if /usr/local/bin/aisudo --status >/dev/null 2>&1; then
             return 0
         fi
@@ -228,6 +229,7 @@ INSTALL_EOF
     # $DAEMON_BIN, $SCRIPT_DIR...), and an unquoted heredoc would eat every
     # $1/$@/$? inside those function bodies. `declare -f` writes them verbatim,
     # so Linux and macOS share ONE definition instead of a copy that drifts.
+    # shellcheck disable=SC2129  # separate appends on purpose: the quoted/unquoted heredoc split above is the point
     cat >> "$INSTALL_SCRIPT" <<VARS_EOF
 AISUDO_PLATFORM="Linux"
 AISUDO_BACKUP_ROOT="$AISUDO_BACKUP_ROOT"
@@ -501,6 +503,7 @@ WORLD_WRITABLE=$(find "$SCRIPT_DIR" \
     -perm -0002 -print 2>/dev/null | head -5)
 if [[ -n "$WORLD_WRITABLE" ]]; then
     error "Refusing to build/install: world-writable files in the source tree:"
+    # shellcheck disable=SC2001  # multi-line prefix; ${var//} cannot anchor per line
     echo "$WORLD_WRITABLE" | sed 's/^/    /'
     error "A world-writable source tree could be tampered with before being compiled into the root daemon."
     error "Fix with: chmod -R o-w '$SCRIPT_DIR'"

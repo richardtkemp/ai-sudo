@@ -33,9 +33,10 @@ pub struct ScrubQueueEntry {
     pub retry_count: i32,
 }
 
+// Test-only: returned by get_temp_rule, the read-back verification helper used by
+// this module's unit tests. Not constructed by production code (#1823).
 #[derive(Debug, Clone, Serialize)]
-// Only returned by the two unused temp-rule getters above, so dead transitively (#1823).
-#[allow(dead_code)]
+#[cfg(test)]
 pub struct TempRuleRow {
     pub id: String,
     pub user: String,
@@ -365,8 +366,11 @@ impl Database {
         Ok(changed > 0)
     }
 
-    // Unused today; tracked in #1823, which says what to check before deleting.
-    #[allow(dead_code)]
+    // Test-only: kept as the read-back verification helper used throughout this
+    // module's unit tests (insert_request/update_decision/prune_old_records
+    // round-trips). Not called by production code (#1823) — cfg(test) reflects
+    // that instead of #[allow(dead_code)].
+    #[cfg(test)]
     pub fn get_request(&self, request_id: &str) -> Result<Option<SudoRequestRecord>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
@@ -398,43 +402,6 @@ impl Database {
         } else {
             Ok(None)
         }
-    }
-
-    // Unused today; tracked in #1823, which says what to check before deleting.
-    #[allow(dead_code)]
-    pub fn get_pending_requests(&self) -> Result<Vec<SudoRequestRecord>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, decided_at, decided_by, stdin_bytes
-             FROM requests WHERE status = 'pending' ORDER BY timestamp ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let status_str: String = row.get(6)?;
-            let ts_str: String = row.get(5)?;
-            let decided_at_str: Option<String> = row.get(9)?;
-            let stdin_bytes: Option<i64> = row.get(11)?;
-            Ok(SudoRequestRecord {
-                id: row.get(0)?,
-                user: row.get(1)?,
-                command: row.get(2)?,
-                cwd: row.get(3)?,
-                pid: row.get(4)?,
-                timestamp: parse_datetime(&ts_str).unwrap_or_default(),
-                status: Decision::from_str(&status_str).unwrap_or(Decision::Pending),
-                timeout_seconds: row.get(7)?,
-                nonce: row.get(8)?,
-                decided_at: decided_at_str.and_then(|s| parse_datetime(&s)),
-                decided_by: row.get(10)?,
-                reason: None,
-                stdin: None, // Not stored in DB
-                stdin_bytes: stdin_bytes.map(|n| n as usize),
-            })
-        })?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
     }
 
     pub fn expire_timed_out_requests(&self) -> Result<Vec<String>> {
@@ -531,8 +498,10 @@ impl Database {
         Ok(changed > 0)
     }
 
-    // Unused today; tracked in #1823, which says what to check before deleting.
-    #[allow(dead_code)]
+    // Test-only: kept as the read-back verification helper used by this module's
+    // temp-rule unit tests. Not called by production code (#1823) — cfg(test)
+    // reflects that instead of #[allow(dead_code)].
+    #[cfg(test)]
     pub fn get_temp_rule(&self, id: &str) -> Result<Option<TempRuleRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
@@ -583,35 +552,6 @@ impl Database {
         )?;
         let rows = stmt
             .query_map(params![user], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(rows)
-    }
-
-    // Unused today; tracked in #1823, which says what to check before deleting.
-    #[allow(dead_code)]
-    pub fn get_all_temp_rules(&self) -> Result<Vec<TempRuleRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT id, user, patterns, duration_seconds, requested_at, expires_at, status, nonce, decided_at, decided_by, reason
-             FROM temp_rules ORDER BY requested_at DESC",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(TempRuleRow {
-                    id: row.get(0)?,
-                    user: row.get(1)?,
-                    patterns: row.get(2)?,
-                    duration_seconds: row.get(3)?,
-                    requested_at: row.get(4)?,
-                    expires_at: row.get(5)?,
-                    status: row.get(6)?,
-                    nonce: row.get(7)?,
-                    decided_at: row.get(8)?,
-                    decided_by: row.get(9)?,
-                    reason: row.get(10)?,
-                })
-            })?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -716,31 +656,6 @@ impl Database {
     }
 
     // --- Bitwarden request methods ---
-
-    // Unused today; tracked in #1823, which says what to check before deleting.
-    #[allow(dead_code)]
-    pub fn insert_bw_request(
-        &self,
-        id: &str,
-        user: &str,
-        item_name: &str,
-        field: &str,
-        nonce: &str,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
-            "INSERT INTO bw_requests (id, user, item_name, field, nonce)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, user, item_name, field, nonce],
-        )?;
-        drop(conn);
-        self.audit_log(
-            id,
-            "bw_request_created",
-            &format!("user={user} item={item_name} field={field}"),
-        )?;
-        Ok(())
-    }
 
     /// Atomically check the BW per-minute rate limit and, if under it, insert the
     /// request — count and insert under one lock hold (M2 TOCTOU). Returns
@@ -1036,20 +951,6 @@ impl Database {
         Ok(())
     }
 
-    /// Rate limit check for BW requests (separate from sudo rate limit).
-    // Unused today; tracked in #1823, which says what to check before deleting.
-    #[allow(dead_code)]
-    pub fn check_bw_rate_limit(&self, user: &str, max_per_minute: u32) -> Result<bool> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let count: u32 = conn.query_row(
-            "SELECT COUNT(*) FROM bw_requests
-             WHERE user = ?1 AND datetime(replace(timestamp, 'T', ' ')) > datetime('now', '-1 minute')",
-            params![user],
-            |row| row.get(0),
-        )?;
-        Ok(count < max_per_minute)
-    }
-
     /// Check sudo request rate limit.
     ///
     /// - `user`: The user making the request (ignored if mode is global)
@@ -1088,13 +989,6 @@ impl Database {
             )?
         };
         Ok(count < max_requests)
-    }
-
-    /// Legacy rate limit check for backwards compatibility (1-minute window, per-user).
-    // Unused today; tracked in #1823, which says what to check before deleting.
-    #[allow(dead_code)]
-    pub fn check_rate_limit_legacy(&self, user: &str, max_per_minute: u32) -> Result<bool> {
-        self.check_rate_limit(user, max_per_minute, 60, false, true)
     }
 
     /// Get the number of pending approval requests.
@@ -1478,72 +1372,6 @@ mod tests {
 
         let fetched = db.get_request(&id).unwrap().unwrap();
         assert_eq!(fetched.status, Decision::Approved);
-    }
-
-    #[test]
-    fn get_pending_requests_filters_correctly() {
-        let (_dir, db) = test_db();
-        for i in 0..3 {
-            let req = aisudo_common::SudoRequest {
-                user: "alice".to_string(),
-                command: format!("cmd-{i}"),
-                cwd: "/".to_string(),
-                pid: i as u32,
-                mode: aisudo_common::RequestMode::Pam,
-                reason: None,
-                stdin: None,
-                skip_nopasswd: false,
-                timeout_seconds: None,
-                dry_run: false,
-                wants_status: false,
-            };
-            let record = aisudo_common::SudoRequestRecord::new(req, 60);
-            let id = record.id.clone();
-            db.insert_request(&record).unwrap();
-            if i == 2 {
-                db.update_decision(&id, Decision::Approved, "test").unwrap();
-            }
-        }
-
-        let pending = db.get_pending_requests().unwrap();
-        assert_eq!(pending.len(), 2);
-        for r in &pending {
-            assert_eq!(r.status, Decision::Pending);
-        }
-    }
-
-    #[test]
-    fn get_all_temp_rules_returns_all() {
-        let (_dir, db) = test_db();
-        let now = chrono::Utc::now();
-        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
-        let patterns = serde_json::to_string(&vec!["apt install"]).unwrap();
-
-        db.insert_temp_rule(
-            "r1",
-            "alice",
-            &patterns,
-            3600,
-            &now.to_rfc3339(),
-            &future,
-            "n1",
-            None,
-        )
-        .unwrap();
-        db.insert_temp_rule(
-            "r2",
-            "bob",
-            &patterns,
-            7200,
-            &now.to_rfc3339(),
-            &future,
-            "n2",
-            Some("testing"),
-        )
-        .unwrap();
-
-        let all = db.get_all_temp_rules().unwrap();
-        assert_eq!(all.len(), 2);
     }
 
     #[test]
@@ -1997,8 +1825,15 @@ mod tests {
     #[test]
     fn insert_and_get_bw_request() {
         let (_dir, db) = test_db();
-        db.insert_bw_request("bw-1", "alice", "GitHub Token", "password", "nonce-1")
-            .unwrap();
+        db.try_insert_bw_request_rate_limited(
+            "bw-1",
+            "alice",
+            "GitHub Token",
+            "password",
+            "nonce-1",
+            u32::MAX,
+        )
+        .unwrap();
 
         let req = db.get_bw_request("bw-1").unwrap().unwrap();
         assert_eq!(req.user, "alice");
@@ -2019,7 +1854,7 @@ mod tests {
     #[test]
     fn update_bw_request_status_and_get() {
         let (_dir, db) = test_db();
-        db.insert_bw_request("bw-1", "alice", "Token", "password", "n1")
+        db.try_insert_bw_request_rate_limited("bw-1", "alice", "Token", "password", "n1", u32::MAX)
             .unwrap();
         assert!(db
             .update_bw_request_status("bw-1", "approved", "telegram")
@@ -2034,7 +1869,7 @@ mod tests {
     #[test]
     fn set_bw_resolved_name() {
         let (_dir, db) = test_db();
-        db.insert_bw_request("bw-1", "alice", "Token", "password", "n1")
+        db.try_insert_bw_request_rate_limited("bw-1", "alice", "Token", "password", "n1", u32::MAX)
             .unwrap();
         db.set_bw_resolved_name("bw-1", "GitHub Personal Access Token")
             .unwrap();
@@ -2049,7 +1884,7 @@ mod tests {
     #[test]
     fn set_bw_credential_hash() {
         let (_dir, db) = test_db();
-        db.insert_bw_request("bw-1", "alice", "Token", "password", "n1")
+        db.try_insert_bw_request_rate_limited("bw-1", "alice", "Token", "password", "n1", u32::MAX)
             .unwrap();
         db.set_bw_credential_hash("bw-1", "sha256:abc12345")
             .unwrap();
@@ -2202,29 +2037,5 @@ mod tests {
         // Should not error
         db.log_bw_session_event("unlock", "via web_ui").unwrap();
         db.log_bw_session_event("lock", "manual").unwrap();
-    }
-
-    #[test]
-    fn check_bw_rate_limit_under_limit() {
-        let (_dir, db) = test_db();
-        assert!(db.check_bw_rate_limit("alice", 10).unwrap());
-    }
-
-    #[test]
-    fn check_bw_rate_limit_at_limit() {
-        let (_dir, db) = test_db();
-        for i in 0..10 {
-            db.insert_bw_request(
-                &format!("bw-{i}"),
-                "alice",
-                "Token",
-                "password",
-                &format!("n{i}"),
-            )
-            .unwrap();
-        }
-        assert!(!db.check_bw_rate_limit("alice", 10).unwrap());
-        // Different user still under limit
-        assert!(db.check_bw_rate_limit("bob", 10).unwrap());
     }
 }

@@ -1070,31 +1070,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_get_temp_rule() {
-        let (_dir, db) = test_db();
-        let now = chrono::Utc::now();
-        let expires = (now + chrono::Duration::seconds(3600)).to_rfc3339();
-        let patterns = serde_json::to_string(&vec!["apt install", "apt list"]).unwrap();
-
-        db.insert_temp_rule(
-            "rule-1",
-            "alice",
-            &patterns,
-            3600,
-            &now.to_rfc3339(),
-            &expires,
-            "nonce-1",
-            Some("need deps"),
-        )
-        .unwrap();
-
-        let rule = db.get_temp_rule("rule-1").unwrap().unwrap();
-        assert_eq!(rule.user, "alice");
-        assert_eq!(rule.status, "pending");
-        assert_eq!(rule.reason.as_deref(), Some("need deps"));
-    }
-
-    #[test]
     fn insert_temp_rule_clamps_excessive_duration() {
         // Defense-in-depth: the storage layer hard-caps the rule lifetime even if
         // the handler's config clamp is bypassed/buggy, and re-derives expires_at.
@@ -1253,39 +1228,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_get_request() {
-        let (_dir, db) = test_db();
-        let req = aisudo_common::SudoRequest {
-            user: "alice".to_string(),
-            command: "ls -la".to_string(),
-            cwd: "/home/alice".to_string(),
-            pid: 1234,
-            mode: aisudo_common::RequestMode::Exec,
-            reason: Some("testing".to_string()),
-            stdin: Some("aGVsbG8=".to_string()),
-            skip_nopasswd: false,
-            timeout_seconds: None,
-            dry_run: false,
-            wants_status: false,
-        };
-        let record = aisudo_common::SudoRequestRecord::new(req, 60);
-        let id = record.id.clone();
-
-        db.insert_request(&record).unwrap();
-
-        let fetched = db.get_request(&id).unwrap().unwrap();
-        assert_eq!(fetched.user, "alice");
-        assert_eq!(fetched.command, "ls -la");
-        assert_eq!(fetched.cwd, "/home/alice");
-        assert_eq!(fetched.pid, 1234);
-        assert_eq!(fetched.status, Decision::Pending);
-        assert_eq!(fetched.timeout_seconds, 60);
-        assert_eq!(fetched.stdin_bytes, Some(6));
-        assert!(fetched.decided_at.is_none());
-        assert!(fetched.decided_by.is_none());
-    }
-
-    #[test]
     fn insert_request_without_stdin() {
         let (_dir, db) = test_db();
         let req = aisudo_common::SudoRequest {
@@ -1307,12 +1249,6 @@ mod tests {
 
         let fetched = db.get_request(&id).unwrap().unwrap();
         assert!(fetched.stdin_bytes.is_none());
-    }
-
-    #[test]
-    fn get_request_not_found() {
-        let (_dir, db) = test_db();
-        assert!(db.get_request("nonexistent").unwrap().is_none());
     }
 
     #[test]

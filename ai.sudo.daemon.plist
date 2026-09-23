@@ -20,6 +20,8 @@
         <false/>
     </dict>
 
+    <!-- 79 = octal 0117, for the daemon's own socket/DB. Approved commands
+         do not inherit it: the daemon resets their umask to 022 (#1955). -->
     <key>Umask</key>
     <integer>79</integer>
 

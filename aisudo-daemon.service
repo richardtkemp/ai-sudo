@@ -14,7 +14,8 @@ RestartSec=5
 # children and would break arbitrary approved root commands (e.g. ss/iptables need
 # AF_NETLINK, writes need a writable filesystem). UMask tightens the default creation
 # mode so the socket is created 0660 (closing the window before the daemon chmods it)
-# and the DB/journal are not group/world-readable.
+# and the DB/journal are not group/world-readable. Approved commands do NOT inherit it:
+# the daemon resets their umask to 022 before exec (#1955).
 UMask=0117
 
 # Refuse non-native syscall ABIs (e.g. 32-bit syscalls on a 64-bit host) — a common

@@ -1925,6 +1925,25 @@ fn discover_session_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
+/// Give an approved command the conventional 022 umask instead of the daemon's own.
+///
+/// The daemon runs under UMask=0117 (systemd unit / launchd plist) so its socket and DB are
+/// born private. Children inherit umask across fork+exec, and 0117 strips +x from every
+/// directory they create — so a tool that makes a temp dir then writes inside it (uv, most
+/// build tools) gets EACCES on a path the invoking user fully owns (#1955). The tight umask is
+/// hardening for the daemon's files, not a policy for the command a human approved; 022 is
+/// what sudo gives by default.
+fn reset_child_umask(cmd: &mut tokio::process::Command) {
+    // SAFETY: the closure runs between fork and exec; umask(2) is async-signal-safe, cannot
+    // fail, and the closure neither allocates nor takes locks.
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
+            Ok(())
+        });
+    }
+}
+
 /// Execute a command and stream stdout/stderr back over the socket.
 ///
 /// When `use_shell` is true, the command is passed to `sh -c` (for human-approved commands).
@@ -1960,6 +1979,7 @@ async fn exec_command(
         c.args(parts);
         c
     };
+    reset_child_umask(&mut cmd);
 
     let mut child = cmd
         .current_dir(cwd)
@@ -2280,6 +2300,7 @@ async fn exec_single_command(
     if argv.len() > 1 {
         cmd.args(&argv[1..]);
     }
+    reset_child_umask(&mut cmd);
 
     let mut child = cmd
         .current_dir(cwd)
@@ -2327,6 +2348,7 @@ async fn exec_pipeline(
         if argv.len() > 1 {
             cmd.args(&argv[1..]);
         }
+        reset_child_umask(&mut cmd);
 
         let is_last = idx == segments.len() - 1;
 
@@ -5464,5 +5486,109 @@ mod tests {
         assert_eq!(response.decision, Decision::Approved);
         drop(writer);
         let _ = handler.await;
+    }
+
+    const CHILD_UMASK_ENV: &str = "AISUDO_TEST_CHILD_UMASK_INNER";
+
+    /// #1955: approved commands must not inherit the daemon's UMask=0117. umask is
+    /// process-wide, so setting 0117 inside this test would race every other test thread
+    /// (tempfile dirs would lose +x). Instead re-run this test binary with 0117 applied to
+    /// that child only, executing just the inner test below — the same shape as the real
+    /// daemon, whose whole process runs under the tight umask.
+    #[test]
+    fn approved_commands_do_not_inherit_daemon_umask() {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "socket::tests::approved_commands_umask_inner",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_UMASK_ENV, "1");
+        // SAFETY: umask(2) is async-signal-safe and the closure does not allocate.
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o117));
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // "1 passed" guards against the filter silently matching zero tests.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "inner test failed under daemon umask 0117\n--- stdout\n{stdout}\n--- stderr\n{stderr}"
+        );
+    }
+
+    /// Runs only when spawned by `approved_commands_do_not_inherit_daemon_umask`.
+    #[tokio::test]
+    #[ignore = "driven by approved_commands_do_not_inherit_daemon_umask under umask 0117"]
+    async fn approved_commands_umask_inner() {
+        use tokio::io::AsyncReadExt;
+        assert!(
+            std::env::var_os(CHILD_UMASK_ENV).is_some(),
+            "run via approved_commands_do_not_inherit_daemon_umask"
+        );
+        // Precondition: this process really is under the daemon's umask, or the test proves nothing.
+        let own = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o117));
+        assert_eq!(own.bits(), 0o117, "harness did not apply umask 0117");
+
+        // Collect every stdout frame an exec path writes to the socket.
+        async fn stdout_of<F, Fut>(run: F) -> String
+        where
+            F: FnOnce(tokio::net::unix::OwnedWriteHalf) -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let (_server_r, server_w) = server.into_split();
+            run(server_w).await;
+            let mut raw = String::new();
+            let mut client = client;
+            client.read_to_string(&mut raw).await.unwrap();
+            raw.lines()
+                .filter_map(|l| serde_json::from_str::<ExecOutput>(l).ok())
+                .filter(|f| f.stream == "stdout")
+                .map(|f| f.data)
+                .collect()
+        }
+
+        // Human-approved path: `sh -c`.
+        let shell = stdout_of(|mut w| async move {
+            exec_command("umask", "/", None, &mut w, true, "tester")
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(shell.trim(), "0022", "shell exec path");
+
+        // Human-approved, direct-exec path.
+        let direct = stdout_of(|mut w| async move {
+            exec_command("sh -c umask", "/", None, &mut w, false, "tester")
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(direct.trim(), "0022", "direct exec path");
+
+        // Auto-approved chain: a single command, and each stage of a pipeline.
+        for (chain, what) in [
+            ("sh -c umask", "chain single command"),
+            ("sh -c umask | cat", "pipeline first stage"),
+            ("echo x | sh -c umask", "pipeline last stage"),
+        ] {
+            let segments = parse_command_chain(chain).unwrap();
+            let out = stdout_of(|mut w| async move {
+                exec_command_chain(&segments, "/", None, &mut w, "tester")
+                    .await
+                    .unwrap();
+            })
+            .await;
+            assert_eq!(out.trim(), "0022", "{what}");
+        }
     }
 }

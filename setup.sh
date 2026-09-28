@@ -522,6 +522,36 @@ if ! sudo -u "$BUILD_USER" bash -lc 'command -v cargo' &>/dev/null; then
     exit 1
 fi
 
+# Fail if the build dir holds files the build user does not own (#1647).
+#
+# The build runs as whoever invoked sudo, so two users running this in turn
+# both write the same target/. cargo then dies deep inside a dependency's
+# build.rs: std::fs::copy preserves permissions, and setting the mode on a file
+# someone else owns is EPERM even when the directory is group-writable. It
+# surfaces as "libsqlite3-sys ... Could not copy bindings ... Operation not
+# permitted", which reads as a toolchain problem, not an ownership one.
+#
+# This fails instead of cleaning automatically: a clean costs a full cold
+# rebuild, and whether to chown or clean is the operator's call.
+aisudo_check_target_ownership() {
+    local target="$1" user="$2" foreign
+    [[ -d "$target" ]] || return 0
+    # ls -ld's third column is the owner on both GNU and BSD; find -printf is GNU-only.
+    foreign=$(find "$target" ! -user "$user" -exec ls -ld {} + | awk '{print $3}' | sort | uniq -c)
+    [[ -z "$foreign" ]] && return 0
+    error "Refusing to build: $target contains files not owned by the build user '$user'."
+    echo "    Files not owned by $user, by owner:"
+    # shellcheck disable=SC2001  # multi-line prefix; ${var//} cannot anchor per line
+    echo "$foreign" | sed 's/^ */      /'
+    error "A previous build ran as a different user. cargo would fail with a misleading"
+    error "'Operation not permitted' from a dependency's build script (e.g. libsqlite3-sys)."
+    error "Fix with ONE of:"
+    echo "    sudo chown -R '$user' '$target'    # keeps the build cache"
+    echo "    sudo rm -rf '$target'              # full cold rebuild"
+    return 1
+}
+aisudo_check_target_ownership "$SCRIPT_DIR/target" "$BUILD_USER" || exit 1
+
 info "Building ai-sudo (release) as $BUILD_USER..."
 sudo -u "$BUILD_USER" bash -lc "cd '$SCRIPT_DIR' && cargo build --release --locked" 2>&1 | tail -8
 

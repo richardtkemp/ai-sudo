@@ -24,26 +24,11 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
-        eprintln!("Usage: {} [OPTIONS] <command> [args...]", BINARY_NAME);
-        eprintln!(
-            "       {} --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]",
-            BINARY_NAME
-        );
-        eprintln!("       {} -l | --list-rules", BINARY_NAME);
-        eprintln!("       {} --status", BINARY_NAME);
-        eprintln!("       {} --history [N]", BINARY_NAME);
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  -r, --reason <text>      Reason for the command (shown in approval request)");
-        eprintln!("  -t, --timeout <seconds>  Override approval timeout for this request");
-        eprintln!(
-            "  -n, --dry-run            Check if command would be approved without executing"
-        );
-        eprintln!("  -l, --list-rules         Show active rules for current user");
-        eprintln!("  --status                 Show daemon status");
-        eprintln!("  --history [N]            Show last N requests (default 20)");
-        eprintln!("  -h, --help               Show this help message");
+    // -h/--help is matched in the option loop below, so only an aisudo option
+    // before the command name counts. A -h after it belongs to the command
+    // (`sudo df -h`), #2650.
+    if args.len() < 2 {
+        print_usage();
         return ExitCode::from(1);
     }
 
@@ -57,6 +42,10 @@ fn main() -> ExitCode {
 
     while i < args.len() {
         match args[i].as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                return ExitCode::from(1);
+            }
             "-l" | "--list-rules" => {
                 return handle_list_rules();
             }
@@ -308,6 +297,26 @@ fn main() -> ExitCode {
     writer.set_read_timeout(Some(Duration::from_secs(300))).ok();
 
     ExitCode::from(stream_exec_output(lines) as u8)
+}
+
+fn print_usage() {
+    eprintln!("Usage: {} [OPTIONS] <command> [args...]", BINARY_NAME);
+    eprintln!(
+        "       {} --request-rule --duration <seconds> [-r \"reason\"] <pattern> [pattern...]",
+        BINARY_NAME
+    );
+    eprintln!("       {} -l | --list-rules", BINARY_NAME);
+    eprintln!("       {} --status", BINARY_NAME);
+    eprintln!("       {} --history [N]", BINARY_NAME);
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -r, --reason <text>      Reason for the command (shown in approval request)");
+    eprintln!("  -t, --timeout <seconds>  Override approval timeout for this request");
+    eprintln!("  -n, --dry-run            Check if command would be approved without executing");
+    eprintln!("  -l, --list-rules         Show active rules for current user");
+    eprintln!("  --status                 Show daemon status");
+    eprintln!("  --history [N]            Show last N requests (default 20)");
+    eprintln!("  -h, --help               Show this help message");
 }
 
 fn handle_request_rule(args: &[String]) -> ExitCode {

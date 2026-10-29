@@ -72,13 +72,13 @@ AISUDO_LOG_HINT=""
 # back to, rather than a rollback that restores emptiness over a good install.
 aisudo_backup() {
     AISUDO_BACKUP_DIR="$AISUDO_BACKUP_ROOT/$(date +%Y%m%d-%H%M%S).$$"
-    install -d -o root -g root -m 700 "$AISUDO_BACKUP_ROOT"
-    install -d -o root -g root -m 700 "$AISUDO_BACKUP_DIR"
+    install -d -o 0 -g 0 -m 700 "$AISUDO_BACKUP_ROOT"
+    install -d -o 0 -g 0 -m 700 "$AISUDO_BACKUP_DIR"
 
     local p found=0
     for p in "$@"; do
         [[ -f "$p" ]] || continue
-        install -d -o root -g root -m 700 "$AISUDO_BACKUP_DIR$(dirname "$p")"
+        install -d -o 0 -g 0 -m 700 "$AISUDO_BACKUP_DIR$(dirname "$p")"
         cp -p "$p" "$AISUDO_BACKUP_DIR$p"
         printf '%s\n' "$p" >>"$AISUDO_BACKUP_DIR/MANIFEST"
         found=$((found + 1))

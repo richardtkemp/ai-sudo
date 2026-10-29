@@ -3,3 +3,4 @@ target/
 *.md
 .build-config.toml
 .claude/
+!skills/**/*.md

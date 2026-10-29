@@ -1,483 +1,221 @@
-# sudo Installation Guide
+# sudo — install, update, remove
 
-Complete guide to installing and configuring sudo from scratch.
+How to install ai-sudo on Linux or macOS, keep it current, and remove it. Run `uname -s`
+first. Paths per OS are in the **Platforms** table in `SKILL.md`. The repo `README.md` has
+more detail, including a "macOS notes" section.
+
+**`aisudo`, not `sudo`, is the group.** On Linux, `sudo` is a real, unrelated system group that
+grants unrestricted root. Joining it gives no aisudo access.
 
 ---
 
 ## Prerequisites
 
-### Required
-- **Rust toolchain** (cargo)
-- **An approval transport.** The daemon picks ONE backend, by precedence:
-  `[askgw]` > `[askgw_http]` > a direct bot transport. This host uses `[askgw]`,
-  which needs a running foci gateway exposing an askgw unix socket.
-- **Root access** (for installation)
+| | Linux | macOS |
+|---|---|---|
+| init system | systemd | launchd |
+| compiler | Rust (`cargo`), from rustup or the distro | Xcode Command Line Tools (`xcode-select --install`) and `brew install rust` |
+| first install | a human with root | a human with the real admin password |
+| approval transport | a running foci with askgw enabled | same |
 
-### System Requirements
-- Linux (tested on Linux Mint 22 / Ubuntu-based)
-- systemd
-- SQLite3
-- OpenSSL
+`cargo` must be on the build user's **login** PATH (`bash -lc 'command -v cargo'`). `setup.sh`
+builds as the user who ran `sudo`, never as root, and stops if it cannot find cargo.
 
 ---
 
-## Step 1: Install Rust (if needed)
+## Step 1: enable askgw in foci
 
-```bash
-# Check if already installed
-cargo --version
-
-# If not installed:
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-```
-
----
-
-## Step 2: Set up the approval transport (askgw)
-
-The daemon does not talk to a chat platform itself. It hands the question to foci over a
-unix socket, and foci posts it into a chat with approve/deny buttons.
-
-1. **Enable askgw in foci's config** (`~/config/foci.toml`):
-   ```toml
-   [askgw]
-   enabled = true
-   socket_path = "/home/foci/data/askgw.sock"
-   allowed_uids = ["root"]     # aisudo-daemon runs as root
-   default_agent = "clutch"    # which agent's chat unrouted asks land in
-   ```
-
-2. **Confirm the socket exists and foci is listening on it:**
-   ```bash
-   ls -l /home/foci/data/askgw.sock
-   ss -lx | grep askgw
-   ```
-
-3. **Note which chat `default_agent` resolves to.** foci presents the question on that
-   agent's *primary* connection. If the agent has several transports configured, the
-   question follows the primary one — which is not necessarily the one you actually read.
-   The daemon-side `agent` key (Step 5) overrides the routing per install.
-
----
-
-## Step 3: Clone Repository
-
-```bash
-cd ~/git
-git clone https://github.com/richardtkemp/ai-sudo.git
-cd ai-sudo
-```
-
----
-
-## Step 4: Configure
-
-```bash
-# Copy example config
-cp aisudo.toml.example aisudo.toml
-
-# Edit config
-nano aisudo.toml
-```
-
-**Minimum required config:**
+The daemon does not talk to a chat platform. It sends the ask to foci over a unix socket, and
+foci posts it into a chat. In foci's config (`<foci home>/config/foci.toml`):
 
 ```toml
-# ai-sudo daemon configuration
+[askgw]
+enabled = true
+allowed_uids = ["root"]     # aisudo-daemon runs as root
+default_agent = "<agent>"   # chat where unrouted asks land (clutch on the NUC, cam on the Mac)
+# socket_path is optional; the default is <foci data dir>/askgw.sock
+```
 
+Check that foci listens:
+
+| | Linux | macOS |
+|---|---|---|
+| socket | `ls -l /home/foci/data/askgw.sock` | `ls -l /Users/richardkemp/foci/data/askgw.sock` |
+| listener | `ss -lx \| grep askgw` | `lsof -U \| grep askgw` |
+
+---
+
+## Step 2: clone and configure
+
+```bash
+git clone https://github.com/richardtkemp/ai-sudo.git ~/git/ai-sudo
+```
+
+`setup.sh` copies a config to `/etc/aisudo/aisudo.toml` only if `aisudo.toml` exists in the
+repo root. To write a first config, copy `aisudo.toml.example` to `aisudo.toml` and edit it.
+Then the minimum is:
+
+```toml
 socket_path = "/var/run/aisudo/aisudo.sock"
-db_path = "/var/lib/aisudo/aisudo.db"
-timeout_seconds = 7200  # 2 hours
-
-allowlist = [
-    # Add commands that should auto-approve
-    "systemctl status",
-    "journalctl",
-    "df",
-    "du",
-    # ... see aisudo.toml.example for full list
-]
+# db_path: leave unset. The default is /var/lib/aisudo/aisudo.db on Linux
+# and /var/db/aisudo/aisudo.db on macOS.
+timeout_seconds = 7200
+hot_reload = true          # serde default is false; without it conf.d edits need a restart
+allowlist = []             # put rules in /etc/aisudo/conf.d/*.toml instead
 
 [askgw]
-socket_path = "/home/foci/data/askgw.sock"
-gateway_uid = "foci"   # username or numeric uid; the daemon stats the socket and
-                       # refuses to connect if the owner does not match (protocol 3.2)
-# agent = "clutch"     # OPTIONAL: route asks to a named agent. Unset means the
-                       # gateway uses its own default_agent routing.
+socket_path = "<foci data dir>/askgw.sock"   # Step 1 table
+gateway_uid = "<foci user>"                  # foci on Linux, richardkemp on macOS
+agent = "<agent>"                            # set it; see below
 ```
 
-**Set `agent` explicitly if more than one agent exists.** With it unset the gateway falls
-back to `default_agent`, then `master_agent`, then the first agent in config order — three
-layers of implicit choice, and a question delivered to the wrong chat still reports success
-to the daemon, which then blocks for the full approval window with nothing visible anywhere.
+`gateway_uid` takes a user name or a numeric uid. The daemon checks the socket owner and
+refuses to connect on a mismatch.
 
-**Do not add `http_bind` or `http_enable_not_recommended`.** This guide used to list
-`http_bind = "127.0.0.1:7654"` here. The HTTP API was removed in `86599f9` (2026-02-05)
-and neither key is a field on the config struct any more. There is no
-`deny_unknown_fields`, so serde ignores them silently — a config that sets them looks
-configured and does nothing. The NUC's live config had exactly that dead key in it until
-`793581d`.
+**Set `agent` if more than one agent exists.** Without it, foci falls back to `default_agent`,
+then `master_agent`, then the first agent in config order. An ask that goes to the wrong chat
+still reports success to the daemon, which then waits the full 2 h with nothing visible.
 
-**Important:**
-- Replace `YOUR_BOT_TOKEN_HERE` with your actual bot token
-- Replace `YOUR_CHAT_ID_HERE` with your numeric chat ID
-- Keep quotes around bot_token, but NOT around chat_id
+**Do not add `http_bind` or `http_enable_not_recommended`.** The HTTP API was removed in
+`86599f9`. The config has no `deny_unknown_fields`, so serde ignores these keys silently.
+
+On an existing install, leave the repo without `aisudo.toml`. Then `setup.sh` does not touch
+`/etc/aisudo/` and its `conf.d/` drop-ins.
 
 ---
 
-## Step 5: Build & Install
+## Step 3: build and install (first install)
+
+A human runs this in a terminal, from the repo:
 
 ```bash
-# Still in ~/git/ai-sudo directory
-sudo bash setup.sh
+cd ~/git/ai-sudo && sudo ./setup.sh     # the real sudo: aisudo does not exist yet
 ```
 
-**What setup.sh does:**
-1. Builds release binaries (`cargo build --release`)
-2. Installs binaries to `/usr/local/bin/`
-3. Copies config to `/etc/aisudo/` — but ONLY if a local `aisudo.toml` exists in the
-   repo. There is none, so an existing `/etc/aisudo/aisudo.toml` is left alone.
-4. Creates the `aisudo` system group
-5. Creates runtime directories
-6. Installs systemd service
-7. Enables and starts daemon
+| `setup.sh` does | Linux | macOS |
+|---|---|---|
+| build (as the invoking user) | `cargo build --release --locked` | same |
+| back up files it overwrites | `/var/backups/aisudo/<ts>.<pid>/` + `MANIFEST` | same |
+| create group `aisudo` | `groupadd --system` (or `--gid N`) | `dseditgroup -o create` |
+| install service | `/etc/systemd/system/aisudo-daemon.service` | `/Library/LaunchDaemons/ai.sudo.daemon.plist` (starts at boot) |
+| log | journald; install log `/var/log/aisudo-setup.log` | `/var/log/aisudo.log`, rotated by `/etc/newsyslog.d/aisudo.conf` |
+| run the install | in a transient `systemd-run` unit (survives the daemon restart) | inline |
+| health gate | `aisudo --status` round trip, 10 tries; on failure it rolls back | same |
 
-**Output should show:**
-```
-[✓] Building ai-sudo (release)...
-[✓] Installing daemon binary...
-[✓] Installing CLI wrapper...
-[✓] Installing config...
-[✓] Creating sudo service group...
-[✓] Creating runtime directories...
-[✓] Installing systemd service...
-[✓] Enabling and starting aisudo-daemon...
-[✓] aisudo-daemon is running!
-
-═══════════════════════════════════════════════════
-  ai-sudo setup complete!
-═══════════════════════════════════════════════════
-```
+The rollback is described in `troubleshooting.md`, "Emergency recovery".
 
 ---
 
-## Step 6: Add User to the aisudo Group
+## Step 4: add the foci user to the group, and the shim
 
-The group is `aisudo`, NOT `sudo`. `sudo` is the real, unrelated system group that
-grants unrestricted root (gid 27 on a Debian/Ubuntu box). Adding yourself to it does
-not give you aisudo access and does give you something you did not ask for.
+| | Linux | macOS |
+|---|---|---|
+| add | `sudo usermod -aG aisudo foci` | `sudo dseditgroup -o edit -a richardkemp -t user aisudo` |
+| check | `id -nG foci \| tr ' ' '\n' \| grep -x aisudo` | `dseditgroup -o checkmember -m richardkemp aisudo` |
+| shim | `ln -s /usr/local/bin/aisudo /home/foci/bin/sudo` | `ln -s /usr/local/bin/aisudo /Users/richardkemp/foci/bin/sudo` |
 
-```bash
-# Add yourself
-sudo usermod -aG aisudo $USER
+The shim directory must come before `/usr/bin` on the agent's PATH. `setup.sh` does not make
+the shim.
 
-# Verify. Match the whole word — 'grep sudo' also matches 'aisudo' and proves nothing.
-groups | tr ' ' '\n' | grep -x aisudo
-
-# Log out and back in for group changes to take effect
-# OR: newgrp sudo
-```
-
-**Why?** Only members of the `sudo` group can connect to the Unix socket.
+A new group membership applies only to a new login session. Restart foci after the add.
 
 ---
 
-## Step 7: Test Installation
-
-### Test 1: Simple command
+## Step 5: test
 
 ```bash
-sudo whoami
+sudo -n whoami     # "would require approval" (no ask is sent)
+sudo whoami        # an ask appears in the agent's chat; approve -> prints "root"
+sudo whoami        # deny this one -> "request denied"
+aisudo --status    # pending count; proves the socket round trip
 ```
 
-**Expected:**
-1. CLI shows: `sudo: requesting approval for: whoami`
-2. An approval request appears in the routed agent's chat
-3. Click **[Approve]**
-4. CLI shows: `root` (output of whoami as root)
-
-### Test 2: Allowlisted command (auto-approved)
-
-```bash
-sudo df -h
-```
-
-**Expected:**
-- No approval request (auto-approved)
-- Output shows immediately
-
-### Test 3: Denied request
-
-```bash
-sudo whoami
-```
-
-**Then:** Click **[Deny]**
-
-**Expected:**
-```
-sudo: request denied by user
-```
-
----
-
-## Troubleshooting
-
-### Build fails
-
-```bash
-# Check Rust version
-rustc --version  # Should be 1.70+
-
-# Update if needed
-rustup update stable
-
-# Clean and rebuild
-cargo clean
-cargo build --release
-```
-
-### Daemon won't start
-
-```bash
-# Check status
-systemctl status aisudo-daemon
-
-# View logs
-journalctl -u aisudo-daemon -n 50
-
-# Common issues:
-# 1. Config syntax error
-sudo cat /etc/aisudo/aisudo.toml
-
-# 2. Socket directory missing — mode and group are NOT arbitrary
-sudo install -d -o root -g aisudo -m 750 /var/run/aisudo
-
-# 3. Database directory missing — root only, it holds the DB and transient credentials
-sudo install -d -o root -g root -m 700 /var/lib/aisudo
-```
-
-### "Connection refused"
-
-```bash
-# Check socket exists
-ls -l /var/run/aisudo/aisudo.sock
-
-# Check permissions
-ls -ld /var/run/aisudo/
-
-# Under systemd this shows drwxr-xr-x root root: RuntimeDirectory in the unit file
-# recreates the directory as 0755 root:root on every start, overriding what setup.sh
-# made. Both are fine — group-traversable is all that is needed. What matters is that
-# it is NOT group-writable, or aisudo members could unlink and replace the socket.
-
-# Check you're in the group. Match the WHOLE word: 'grep sudo' also matches 'aisudo'
-# and tells you nothing.
-groups | tr ' ' '\n' | grep -x aisudo
-
-# If not, add yourself and re-login
-sudo usermod -aG aisudo $USER
-```
-
-### Approval requests never arrive
-
-Confirm which backend is actually live before checking anything — the daemon picks one by
-precedence, and checks against a backend that is not in use run cleanly and return empty,
-which reads as "nothing wrong here".
-
-```bash
-# Which backend did the daemon choose? It names it at startup.
-journalctl -u aisudo-daemon | grep 'backend enabled'
-
-# askgw: is the socket there, and is the daemon connected to it?
-ls -l /home/foci/data/askgw.sock
-ss -xp | grep askgw          # want ESTAB, with foci-gw's pid on the other end
-
-# Is a request actually queued? Also a live round-trip probe of the socket.
-aisudo --status              # "Pending requests: 1" = daemon is blocked waiting
-```
-
-`Received sudo request` in the daemon log with nothing after it means the daemon is still
-waiting — it logs nothing on a successful send, so silence is not an error.
-
-**A delivery can succeed and still be invisible.** foci returns "unavailable" only when it
-has no connection at all; if it has one, the send succeeds and the daemon waits out the
-full window. So "no error anywhere, and no prompt" points at ROUTING — the question went to
-a real chat that nobody reads. Check `default_agent` and the `agent` key (Step 5), not the
-transport.
+Pick a command for the auto-approve test from `sudo -l`. The allowlist is per host.
 
 ---
 
 ## Updating an existing install
 
-`sudo make -C /home/rich/git/ai-sudo update` (= `sudo ./setup.sh`). It builds release as the
-**invoking** user — never root — then installs, reloads and restarts.
+### Linux
 
-**A bad daemon binary locks you out of sudo, and setup.sh has no rollback.** So, in order:
+```bash
+make -C /home/rich/git/ai-sudo update      # NO leading sudo
+```
 
-1. **Preserve.** `cp -p /usr/local/bin/aisudo /usr/local/bin/aisudo-daemon` somewhere you own,
-   with a note giving the restore commands. Copying needs no privilege; restoring does — so write
-   it down for a human who may have no working sudo.
-2. **Boot the new daemon before installing it**, on a throwaway config (`socket_path`/`db_path`
-   under /tmp, a small `allowlist`). If it starts and serves one request, it will start under
-   systemd.
-3. Then update.
+The target runs `sudo ./setup.sh` itself. An outer `sudo` makes `SUDO_USER` root, and
+`setup.sh` refuses to build as root. The install then runs in a transient `systemd-run` unit,
+so make returns before the install ends. **Exit 0 proves nothing.** Verify:
 
-**`make update`'s exit code means nothing.** The install is forked into a transient systemd unit
-so it survives the daemon restart; make returns immediately and the unit is gone by the time you
-look. Verify instead with `/var/log/aisudo-setup.log` (ends in a completion line),
-`systemctl show aisudo-daemon -p ActiveEnterTimestamp,NRestarts` (`NRestarts=0` = came up first
-try, not crash-looping), and `sha256sum /usr/local/bin/aisudo target/release/aisudo`.
+```bash
+stat -c %y /usr/local/bin/aisudo-daemon /usr/local/bin/aisudo     # newer than your start
+systemctl show aisudo-daemon -p ActiveEnterTimestamp,NRestarts     # new start; NRestarts=0
+tail -5 /var/log/aisudo-setup.log      # want "=== aisudo setup completed at", no "Install failed"
+```
 
-**Config is preserved** unless a local `aisudo.toml` exists in the repo — there is none, so
-`/etc/aisudo/` and its `conf.d/` drop-ins survive. Confirm rather than assume.
+### macOS
 
-**Gates that abort before installing anything** (so, harmless): a world-writable file in the tree,
-or `cargo` missing from the build user's **login** shell (`bash -lc`, not your current PATH).
+**Do not run `setup.sh` through aisudo.** It restarts the daemon that runs it. A full update
+(daemon, plist) needs a human in a terminal with the real password:
+`cd ~/git/ai-sudo && sudo ./setup.sh`.
+
+For a change to the client only, build and install the client:
+
+```bash
+cargo build --release --locked -p aisudo-cli
+sudo install -o 0 -g 0 -m 755 target/release/aisudo /usr/local/bin/aisudo
+```
+
+Use `-g 0`, not `-g root`: macOS has no group named `root` (gid 0 is `wheel`).
+Verify with `stat -f %Sm /usr/local/bin/aisudo` and one `sudo -n whoami`.
+
+### Both
+
+Config survives an update when the repo has no `aisudo.toml`. Confirm it: `ls /etc/aisudo/conf.d/`
+before and after. Gates that stop before anything is installed (harmless): a world-writable
+file in the tree, or no `cargo` on the build user's login PATH.
+
+---
 
 ## Uninstall
 
-```bash
-# Stop and disable service
-sudo systemctl stop aisudo-daemon
-sudo systemctl disable aisudo-daemon
+Run as root (a human with the real `/usr/bin/sudo`; aisudo goes away during these steps).
 
-# Remove binaries
-sudo rm /usr/local/bin/aisudo
-sudo rm /usr/local/bin/aisudo-daemon
-# ...and any per-agent shim pointing at it, e.g. /home/foci/bin/sudo
-
-# Remove service file
-sudo rm /etc/systemd/system/aisudo-daemon.service
-sudo systemctl daemon-reload
-
-# Remove config and data (optional)
-sudo rm -rf /etc/aisudo      # includes conf.d/ — check for drop-ins you want to keep
-sudo rm -rf /var/lib/aisudo  # the audit database lives here
-sudo rm -rf /var/run/aisudo
-
-# Remove group (optional)
-sudo groupdel aisudo
-
-# Remove user from group
-sudo gpasswd -d $USER sudo
-```
+| step | Linux | macOS |
+|---|---|---|
+| stop service | `systemctl disable --now aisudo-daemon` | `launchctl bootout system /Library/LaunchDaemons/ai.sudo.daemon.plist` |
+| remove service file | `rm /etc/systemd/system/aisudo-daemon.service && systemctl daemon-reload` | `rm /Library/LaunchDaemons/ai.sudo.daemon.plist /etc/newsyslog.d/aisudo.conf` |
+| remove binaries | `rm /usr/local/bin/aisudo /usr/local/bin/aisudo-daemon` | same |
+| remove shim | `rm /home/foci/bin/sudo` | `rm /Users/richardkemp/foci/bin/sudo` |
+| remove data (optional) | `rm -rf /var/lib/aisudo /var/run/aisudo` | `rm -rf /var/db/aisudo /var/run/aisudo /var/log/aisudo.log` |
+| remove config (optional) | `rm -rf /etc/aisudo` (check `conf.d/` first) | same |
+| remove group (optional) | `groupdel aisudo` | `dseditgroup -o delete aisudo` |
 
 ---
 
-## Advanced Configuration
+## Security notes
 
-### Custom allowlist
+- The daemon runs as root and runs approved commands as root.
+- With `[askgw]` the request stays on the machine, but the question text goes into a chat.
+  Do not put secrets in a command line.
+- Only members of `aisudo` can connect to `/var/run/aisudo/aisudo.sock`. The socket
+  directory must not be group-writable.
+- The audit DB keeps history for `history_retention_days` (default 365).
 
-Edit `/etc/aisudo/aisudo.toml`:
-
-```toml
-allowlist = [
-    # File operations (read-only)
-    "cat /var/log",
-    "tail -f /var/log",
-    
-    # System info
-    "systemctl status",
-    "journalctl",
-    
-    # Network
-    "ss -tunlp",
-    "netstat -tunlp",
-    
-    # Custom app commands
-    "myapp status",
-    "myapp logs",
-]
-```
-
-**After editing:**
-```bash
-sudo systemctl restart aisudo-daemon
-```
-
-### Adjust timeout
-
-```toml
-timeout_seconds = 3600  # 1 hour
-```
-
-### Multiple chat IDs (future feature)
-
-Currently supports one chat_id. For multiple admins, create separate deployments or use the HTTP API.
-
----
-
-## PAM Mode — not implemented
-
-This section previously described `sudo bash setup.sh --pam`, a PAM module at
-`/usr/lib/security/pam_sudo.so`, and an edit to `/etc/pam.d/sudo`. **None of that
-exists.** Verified 2026-09-01:
-
-- `setup.sh` accepts only `--gid N` and `-h|--help`, and rejects anything else with
-  "Unknown argument".
-- The cargo workspace has four members — `aisudo-common`, `aisudo-daemon`, `aisudo-cli`,
-  `aibw-cli`. There is no PAM crate and nothing builds a `.so`.
-
-It was built and then deleted. `agents/decisions/001-rust-pam-module.md` (ADR-001,
-2026-01-12) chose the nonstick crate; an `aisudo-pam` crate existed; commit `86599f9`
-(2026-02-05, "Remove HTTP API and PAM module") deleted `aisudo-pam/src/lib.rs` and its
-Cargo.toml with the reason "neither was needed". The ADR is still marked DECIDED, which
-is what kept this page describing a shipped feature.
-
-`RequestMode::Pam` does still exist on the wire, but it no longer means PAM. It is what
-the CLI sends for `--dry-run` (`aisudo-cli/src/main.rs`): decide, and do not execute.
-
-Interception is CLI-only, and deliberately so: `sudo` on your PATH is the aisudo client,
-which shadows `/usr/bin/sudo`.
-
----
-
-## Security Notes
-
-- Daemon runs as root - it has full system access when executing commands
-- With `[askgw]` the request never leaves the machine, but the question text is posted
-  into a chat — treat it as visible to anything with access to that chat
-- Rate limiting prevents spam but not targeted abuse
-- Audit logs in SQLite can grow large - consider rotation
-- Socket permissions are critical - only `sudo` group members can connect
-
-**Recommendations:**
-- Use for personal/development servers only
-- Don't put passwords or secrets in commands (the full command line is shown for approval)
-- Review audit logs periodically
-- Consider VPN or Tailscale for remote access instead of exposing sudo
-
----
-
-## Files Installed
+## Files installed
 
 | File | Purpose |
-|------|---------|
-| `/usr/local/bin/aisudo` | CLI wrapper. There is no `/usr/local/bin/sudo` — the `sudo` you type is a per-agent symlink (e.g. `/home/foci/bin/sudo -> /usr/local/bin/aisudo`) earlier on PATH, created outside setup.sh |
-| `/usr/local/bin/aisudo-daemon` | Daemon binary |
-| `/etc/aisudo/aisudo.toml` | Base configuration |
-| `/etc/aisudo/conf.d/*.toml` | Drop-in overrides, merged over the base at startup. Not created or touched by setup.sh, and not mentioned anywhere else in this guide — but this is where most real configuration lives (9 drop-ins on the NUC as of 2026-09-01). Only `.toml` is loaded, so `.bak` siblings are ignored. The daemon logs each one it loads at INFO on startup |
-| `/etc/systemd/system/aisudo-daemon.service` | Systemd unit |
-| `/var/run/aisudo/aisudo.sock` | Unix socket |
-| `/var/lib/aisudo/aisudo.db` | SQLite audit database |
+|---|---|
+| `/usr/local/bin/aisudo` | client; the per-agent `sudo` shim points here |
+| `/usr/local/bin/aisudo-daemon` | daemon |
+| `/etc/aisudo/aisudo.toml` | base config |
+| `/etc/aisudo/conf.d/*.toml` | drop-ins merged over the base; most real config lives here. Not created by `setup.sh` |
+| systemd unit / LaunchDaemon plist | see Step 3 table |
+| `/var/run/aisudo/aisudo.sock` | client socket |
+| audit DB | Platforms table in `SKILL.md` |
+| `/var/backups/aisudo/` | install backups, last 5 |
 
----
+## PAM mode does not exist
 
-## Next Steps
-
-After installation:
-1. ✅ Test basic commands
-2. ✅ Add commonly-used commands to allowlist
-3. ✅ Integrate with OpenClaw (add to TOOLS.md)
-4. ✅ Review audit logs occasionally
-5. ✅ Keep backups of `/etc/aisudo/aisudo.toml`
-
----
-
-## Support
-
-- Repository: https://github.com/richardtkemp/ai-sudo
-- Issues: https://github.com/richardtkemp/ai-sudo/issues
-- Skill docs: `~/shared/skills/sudo/SKILL.md` (see also `command-forms.md`, `allowlist.md`, `troubleshooting.md`)
+Older docs described `setup.sh --pam` and a `pam_sudo.so`. Commit `86599f9` (2026-02-05)
+removed the PAM module. `setup.sh` accepts only `--gid N` and `-h`. `RequestMode::Pam` still
+exists on the wire, but it means `--dry-run` (decide, do not run).

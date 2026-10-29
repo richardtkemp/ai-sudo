@@ -1,105 +1,121 @@
-# sudo — when the daemon or the approval path is not working
+# sudo — when the daemon or the approval path does not work
 
-Diagnosis and recovery for the sudo machinery itself. If the command runs but is not
-auto-approved, that is `allowlist.md`; if it is rejected or mangled, that is
-`command-forms.md`.
+Diagnosis and recovery for the sudo machinery itself. If the command runs but does not
+auto-approve, read `allowlist.md`. If the daemon rejects or changes the command, read
+`command-forms.md`. Paths and service commands per OS are in the **Platforms** table in
+`SKILL.md`; run `uname -s` first.
 
-## Troubleshooting
+## "Connection refused" or "daemon not running"
 
-### "Connection refused" or "daemon not running"
+| | Linux | macOS |
+|---|---|---|
+| status | `systemctl status aisudo-daemon` | `launchctl print system/ai.sudo.daemon` |
+| logs | `journalctl -u aisudo-daemon -n 50` | `tail -50 /var/log/aisudo.log` |
+| restart | `sudo systemctl restart aisudo-daemon` | `sudo launchctl kickstart -k system/ai.sudo.daemon` |
+
+**macOS restart:** `kickstart -k` kills the daemon that serves your request. So the client
+exits 1 although the restart worked. Read `/var/log/aisudo.log` for the new startup lines
+before you report a failure.
+
+If the daemon is down, aisudo cannot restart it. A human must use the real `/usr/bin/sudo`.
+
+**macOS after a reboot:** `/var/run` is empty after every boot. The daemon recreates
+`/var/run/aisudo` itself at startup (mode `0750 root:aisudo`). If the client cannot connect
+after a reboot, check that directory's owner and mode first.
+
+## "Permission denied" on the socket
+
+Only members of the group `aisudo` can connect. **Not `sudo`**: on Linux that is a real,
+unrelated group that grants unrestricted root and no aisudo access.
 
 ```bash
-# Check daemon status
-systemctl status aisudo-daemon
-
-# Check logs
-journalctl -u aisudo-daemon -n 50
-
-# Restart daemon
-sudo systemctl restart aisudo-daemon
-```
-
-### "Permission denied" connecting to socket
-
-```bash
-# Check you're in the aisudo group. Grep for the exact name: `grep sudo`
-# also matches "aisudo", so it passes whether or not you are in it.
+# Both OSes. Match the whole word: 'grep sudo' also matches 'aisudo'.
 id -nG | tr ' ' '\n' | grep -qx aisudo && echo yes || echo no
-
-# Add yourself if missing. NOT `-aG sudo` — that is a different, real system
-# group granting unrestricted root, and it gives no aisudo access.
-sudo usermod -aG aisudo $USER
-# Then log out and back in (or `newgrp aisudo`)
 ```
 
-### Approval never arrives
+| | Linux | macOS |
+|---|---|---|
+| add | `sudo usermod -aG aisudo $USER` | `sudo dseditgroup -o edit -a $USER -t user aisudo` |
+| check membership in the directory | `getent group aisudo` | `dseditgroup -o checkmember -m $USER aisudo` |
+| takes effect | new login (or `newgrp aisudo`) | new login session only |
 
-**This host uses `[askgw]`** — a unix socket to foci, which posts the question into the approver's
-chat. Confirm it rather than assuming: the daemon picks one backend by precedence
-(`[askgw]` > `[askgw_http]` > a direct bot transport), and checks against a backend that
-is not live all run cleanly and return empty, which reads as "nothing wrong here".
+A running process (foci, its agents) keeps its old groups. After an add, restart that process.
+
+## Approval never arrives
+
+All hosts use `[askgw]`. Confirm it: the daemon picks one backend by precedence
+(`[askgw]` > `[askgw_http]` > a direct bot transport). A check against a backend that is not
+live returns empty, and empty reads as "nothing wrong".
 
 ```bash
 grep -rn '^\[askgw' /etc/aisudo/aisudo.toml /etc/aisudo/conf.d/*.toml
-journalctl -u aisudo-daemon | grep -i 'backend enabled'   # names it at startup
-
-aisudo --status          # pending count + approval rate; also a live socket probe
-ss -xp | grep askgw      # daemon<->gateway conn should be ESTAB, with foci-gw's pid
+aisudo --status        # pending count; also a live round trip over the daemon socket
 ```
 
-`Received sudo request` with nothing after it in the daemon log means it is still
-blocked waiting — the daemon logs only on backend ERROR, so silence is normal.
+| check | Linux | macOS |
+|---|---|---|
+| backend chosen at startup | `journalctl -u aisudo-daemon \| grep 'backend enabled'` | `grep 'backend enabled' /var/log/aisudo.log` |
+| daemon connected to foci | `ss -xp \| grep askgw` (want ESTAB, foci-gw pid on the far end) | `grep 'askgw connected' /var/log/aisudo.log`, or `lsof -U \| grep askgw` |
+| request reached daemon | `journalctl -u aisudo-daemon \| grep 'Received sudo request'` | `grep 'Received sudo request' /var/log/aisudo.log` |
 
-**foci logs nothing when an ask arrives or is presented** (only `answered` and
-`notify for unknown or expired`). An empty foci.log at the incident minute is NOT
-evidence the ask never got there. Tracked in #1837.
+`Received sudo request` with nothing after it means the daemon still waits. It logs only on a
+backend ERROR, so silence there is normal.
 
-### Command gets "Timeout" response
+**foci logs each ask.** grep the foci log (Platforms table) for `[askgw]`:
 
-Default timeout is 7200 seconds (2 hours). If you didn't approve in time:
+- `ask arrived id=… agent=…` — foci received it from the daemon.
+- `ask posted id=… session=…` — foci put it into that chat.
+- `ask unavailable … no chat session for agent` / `ask present failed` — delivery failed.
+- `ask answered` / `ask timed out` / `ask abandoned` — the end of the ask.
+
+`ask posted` with no answer means routing: the ask went to a real chat that nobody reads.
+Check the `agent` key in `[askgw]` (daemon side) and `default_agent` (foci side).
+
+## Command gets "Timeout"
+
+`timeout_seconds` is 7200 (2 h) on both hosts. Look up the request in the audit DB
+(path in the Platforms table):
 
 ```bash
-# Check audit log for the request
-sudo sqlite3 /var/lib/aisudo/aisudo.db \
-  "SELECT * FROM requests ORDER BY timestamp DESC LIMIT 5;"
+sudo sqlite3 <db_path> "SELECT id,user,command,status,timestamp FROM requests ORDER BY timestamp DESC LIMIT 5;"
 ```
 
-### "Rate limit exceeded" error
+## "Rate limit exceeded"
 
-**Rate limit:** 30 non-allowlisted requests per minute per user (allowlisted commands don't count toward the limit).
+Default: 30 requests that need a human per 60 s, per user (`rate_limit_requests`,
+`rate_limit_window_seconds`). Auto-approved commands do not count, unless
+`rate_limit_count_allowlisted = true`. The window rolls.
 
-If you hit the rate limit:
-- **Wait 60 seconds** before retrying
-- Rate limit window is rolling (not fixed intervals)
-- Check if command can be added to allowlist instead (if safe)
+- Wait 60 s, then retry.
+- Batch the work into fewer requests.
+- If the command is safe and frequent, it may belong on the allowlist. A human installs that
+  drop-in (see `allowlist.md`). You do not edit `aisudo.toml`.
+
+## Emergency recovery
+
+**A failed install rolls back by itself.** Before it changes anything, `setup.sh` copies each
+file it will overwrite to `/var/backups/aisudo/<YYYYMMDD-HHMMSS>.<pid>/`, in the same layout,
+with a `MANIFEST` listing the paths. It keeps the last 5. If any step fails, or the new daemon
+does not answer `aisudo --status` within 10 s, a trap copies every MANIFEST path back, restarts
+the daemon and checks it again. The log says which result you got:
+
+- `Rolled back. The previous daemon is answering on its socket again.` — safe; the new build
+  stays in `target/release/` for debugging.
+- `ROLLED BACK, BUT THE RESTORED DAEMON IS NOT ANSWERING.` — a human must recover with the
+  real `/usr/bin/sudo`.
+- `no previous install to restore` — expected on a first install.
+
+Where to read it: Linux `/var/log/aisudo-setup.log`; macOS the terminal that ran `setup.sh`.
+
+Files in the backup: both binaries and `/etc/aisudo/aisudo.toml` on both OSes; plus
+`/etc/systemd/system/aisudo-daemon.service` (Linux), or the LaunchDaemon plist and
+`/etc/newsyslog.d/aisudo.conf` (macOS). **`conf.d/` drop-ins are not in the backup.**
+
+**Restore by hand.** Run this in a root shell. If aisudo is down, a human opens one with the real `/usr/bin/sudo -i`.
 
 ```bash
-# If you see this error:
-sudo: rate limit exceeded
-
-# Wait 60 seconds, then retry
-sleep 60 && sudo your-command
-
-# Or add to allowlist if it's a safe read-only command
-# Edit /etc/aisudo/aisudo.toml and add to [allowlist.commands]
+B=/var/backups/aisudo/<dir>           # root-only (mode 700); newest: sudo ls -1t /var/backups/aisudo
+cat "$B/MANIFEST"
+while read -r p; do cp -p "$B$p" "$p"; done < "$B/MANIFEST"
+# then restart the daemon (Platforms table) and run: aisudo --status
 ```
-
-**Why rate limiting?**
-- Prevents accidental DOS from scripts
-- Protects the approver's attention from a script that pages them once per loop iteration
-- Allowlisted commands bypass the limit (they're pre-approved as safe)
-
-**Pro tip:** Batch similar operations together or add frequently-used commands to the allowlist.
-
----
-## Emergency Recovery
-
-If sudo breaks:
-
-```bash
-# Restore previous config
-sudo cp /etc/aisudo/aisudo.toml.backup-YYYYMMDD-HHMMSS /etc/aisudo/aisudo.toml
-sudo systemctl restart aisudo-daemon
-```
-
----

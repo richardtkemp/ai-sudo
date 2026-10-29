@@ -6,149 +6,78 @@ description: Remote sudo approval routed to a human approver through foci. Run p
 
 # sudo — remote sudo approval via aisudo
 
-**Never call `/usr/bin/sudo` directly.** `sudo` on your PATH is `/home/foci/bin/sudo`, the aisudo client — it shadows the real binary, so a plain `sudo foo` already goes through the approval path. Do not reach past it.
+**Never call `/usr/bin/sudo` directly.** `sudo` on your PATH is a symlink to
+`/usr/local/bin/aisudo`, the aisudo client. It shadows the real binary, so a plain
+`sudo foo` already goes through the approval path.
 
-sudo sends an approval request to the approver with approve/deny buttons. On this host it travels over the
-`[askgw]` backend — a unix socket to foci, which posts the question into the approver's chat. Without
-approval, commands won't run. This is the only way to run privileged commands in this environment.
+The client sends the command to the aisudo daemon. The daemon either auto-approves it
+(allowlist) or asks the approver. The ask goes over the `[askgw]` backend: a unix socket to
+the local foci, which posts approve/deny buttons into the agent's chat. Without approval,
+the command does not run.
 
-**Approval is asynchronous.** The approver may not be at their phone. Always set a LONG timeout on sudo exec calls and be patient — don't retry or assume failure if approval takes minutes.
+**Approval is asynchronous.** The approver may not be at their phone. Set a long timeout and
+wait. Do not retry, and do not assume failure, while approval is pending.
 
-> **Claude Code Bash tool: `timeout` is MILLISECONDS, capped at 600000 (10 min).** So `timeout: 7200` means 7.2 **seconds** — use `timeout: 600000`, or `run_in_background: true`.
+> **Claude Code Bash tool: `timeout` is MILLISECONDS, capped at 600000 (10 min).**
+> `timeout: 7200` is 7.2 seconds. Use `timeout: 600000` or `run_in_background: true`.
 >
-> **If the aisudo client ever errors, the command may still have run.** Once the approver approves, the aisudo-DAEMON launches the command as root, independently of your client. Before reporting failure, check for the live process: `ps -eo pid,ppid,etimes,user,args | grep '[f]oo'` (guarded pattern avoids self-match). Bitten 2026-07-18 running `/root/bin/disk-report.sh` — told the approver "it never ran" while it had been running ~9 min.
+> **If the client errors, the command may still have run.** After approval the DAEMON runs
+> the command as root, independently of your client. Before you report failure, look for the
+> live process: `ps -eo pid,ppid,etime,user,args | grep '[f]oo'` (works on both OSes).
 
----
+## Platforms
 
-## Quick Reference
+Find your OS with `uname -s`. The sub-files refer to this table.
 
-### Basic Usage
+| | Linux (`Linux`, the NUC) | macOS (`Darwin`, the work Mac) |
+|---|---|---|
+| foci user | `foci` | `richardkemp` (foci `HOME` is `~/foci`) |
+| `sudo` shim | `/home/foci/bin/sudo` | `/Users/richardkemp/foci/bin/sudo` |
+| service | systemd unit `aisudo-daemon` | LaunchDaemon `system/ai.sudo.daemon` |
+| status | `systemctl status aisudo-daemon` | `launchctl print system/ai.sudo.daemon` |
+| restart | `sudo systemctl restart aisudo-daemon` | `sudo launchctl kickstart -k system/ai.sudo.daemon` (see `troubleshooting.md`) |
+| daemon log | `journalctl -u aisudo-daemon` | `/var/log/aisudo.log` (no journald) |
+| audit DB | `/var/lib/aisudo/aisudo.db` | `/var/db/aisudo/aisudo.db` |
+| askgw socket | `/home/foci/data/askgw.sock` | `/Users/richardkemp/foci/data/askgw.sock` |
+| foci log | `/home/foci/logs/foci.log` | `/Users/richardkemp/foci/logs/foci.log` |
+| socket peers | `ss -xp \| grep askgw` | `lsof -U \| grep askgw` (no `ss`) |
+| repo | `/home/rich/git/ai-sudo` | `/Users/richardkemp/git/ai-sudo` |
 
-```bash
-# Simple command
-sudo apt update
+Same on both: client `/usr/local/bin/aisudo`, daemon `/usr/local/bin/aisudo-daemon`,
+config `/etc/aisudo/aisudo.toml` plus drop-ins `/etc/aisudo/conf.d/*.toml`,
+`hot_reload = true`, `timeout_seconds = 7200` (2 h).
 
-# With reason (ALWAYS include for non-obvious commands)
-sudo -r "checking disk health" smartctl -a /dev/sda
+The allowlist is **different on each host**. Never assume a command auto-approves here
+because it did on the other host. Check with `sudo -n <cmd>` (see `allowlist.md`).
 
-# Multi-word commands
-sudo systemctl restart aisudo-daemon
-```
-
-### Before Running Commands
-
-**Verify syntax before using sudo:**
-
-```bash
-# Check command help first (without sudo)
-timeshift --help | grep -A5 -- --create
-
-# Then run with sudo
-sudo -r "reason" timeshift --create --comments "snapshot name"
-```
-
-This prevents sending bad syntax to the approver for approval.
-
-**If a command fails and you retry:**
-
-Include what changed in the `-r` reason:
+## Basic usage
 
 ```bash
-# First attempt failed
-sudo -r "creating snapshot" timeshift --create --comments "bad syntax"
-# (fails)
-
-# ❌ BAD - same reason, the approver can't tell what's different
-sudo -r "creating snapshot" timeshift --create --comments "Post-cleanup"
-
-# ✅ GOOD - explains what changed
-sudo -r "creating snapshot (fixed: escaped quotes in comments)" timeshift --create --comments "Post-cleanup"
+sudo whoami
+sudo -r "checking disk health" smartctl -a /dev/sda   # -r = reason, shown to the approver
+sudo -n journalctl -n 50                              # dry run: would it auto-approve?
+sudo -l                                               # list permanent and temp rules
+sudo df -h                                            # -h after the command name passes through
 ```
 
-### When to Wait vs Poll
+**Always give `-r "reason"` for a command that is not obvious.** The approver sees it in the
+request. On a retry, say what changed: `-r "create snapshot (fixed: quoting in --comments)"`.
 
-**Wait synchronously when:**
-- ✅ In active conversation with the approver
-- ✅ Command is quick (<30 seconds expected)
-- ✅ Next steps depend on this command's success
+**Check the syntax before you ask.** Run `<cmd> --help` without sudo first. A bad command
+line costs the approver a tap and gets you nothing.
 
-**Background + poll when:**
-- ✅ Running autonomously (heartbeat, cron job)
-- ✅ Command might take a while
-- ✅ You're doing other work in parallel
+## Wait or background?
 
-```bash
-# Wait (default - just run the command)
-sudo systemctl restart nginx
-# <blocks until approved/denied>
-
-# Background + poll (rarely needed for sudo)
-sudo -r "reason" long-running-command &
-# Check later with process monitoring
-```
-
----
-
-## The `-r` Flag (Reason)
-
-**Always include `-r "reason"` for non-obvious commands.**
-
-The approver is much more likely to approve if they know WHY you need elevated privileges.
-
-```bash
-# ❌ BAD - no context
-sudo apt install ripgrep
-
-# ✅ GOOD - explains why
-sudo -r "ripgrep is faster for log scanning in healthcheck" apt install ripgrep
-
-# ❌ BAD
-sudo cp /tmp/config /etc/myapp/config
-
-# ✅ GOOD
-sudo -r "deploying updated config after validation" cp /tmp/config /etc/myapp/config
-```
-
-**Reason shows in the approval request:**
-```
-🔐 sudo request
-
-User: rich
-Command: apt install ripgrep
-Reason: ripgrep is faster for log scanning in healthcheck
-
-[Approve] [Deny]
-```
-
----
+- **Wait** (plain call) when you talk with the approver now, the command is quick, and your
+  next step depends on it.
+- **Background** (`run_in_background: true`) when you run unattended (cron, heartbeat), or the
+  command is slow, or you have other work to do.
 
 ## Sub-files
 
 | File | Read it when |
 |---|---|
-| **`command-forms.md`** | Writing the command line — heredocs, compound commands, pipes, and why prepending `bash`/`sh` breaks allowlist matching. |
-| **`allowlist.md`** | What auto-approves and how to change it — checking with `sudo -n` before you run, permanent `conf.d` drop-ins, temporary rules. |
-| **`troubleshooting.md`** | The daemon or the approval path itself is broken — socket, permissions, approval delivery, timeouts, rate limits, config recovery. |
-| **`INSTALL.md`** | Installing or reconfiguring ai-sudo from scratch. |
-
-## Installation & Setup
-
-See [INSTALL.md](./INSTALL.md) for detailed setup instructions.
-
-**Quick summary:**
-1. Clone: `git clone https://github.com/richardtkemp/ai-sudo.git ~/git/ai-sudo`
-2. Configure: `cp aisudo.toml.example aisudo.toml`, then add an approval backend —
-   `[askgw]` with `socket_path` + `gateway_uid` is what this host uses.
-3. Build & install: `sudo ./setup.sh`
-4. Add user to group: `sudo usermod -aG aisudo rich`
-
-**`aisudo`, not `sudo`, in steps 2 and 4.** `sudo` is a real unrelated system group granting
-unrestricted root; joining it gives you root and does NOT give you aisudo access.
-
----
-
-## See Also
-
-- Installation guide: [INSTALL.md](./INSTALL.md)
-- Repository: `~/git/ai-sudo`
-- Approval transport: `[askgw]` — see `troubleshooting.md` for how to confirm which backend is live
+| `command-forms.md` | You write the command line: heredocs, compound commands, pipes, why `bash -c` breaks allowlist matching. |
+| `allowlist.md` | You need to know what auto-approves, or to change it: `sudo -n`, `conf.d` drop-ins, temporary rules. |
+| `troubleshooting.md` | The daemon or the approval path is broken: socket, group, approval delivery, timeouts, rate limit, recovery. |
+| `INSTALL.md` | You install, update or remove ai-sudo. |

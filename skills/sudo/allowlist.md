@@ -1,125 +1,78 @@
 # sudo — the allowlist and temporary rules
 
-What runs without paging the approver, and how to change that. For writing the command line itself
-see `command-forms.md`; a command that is on the allowlist but phrased wrong still asks.
+What runs without asking the approver, and how that changes. For the command line itself,
+read `command-forms.md`: an allowlisted command in the wrong form still asks.
+
+## Each host has its own allowlist
+
+The rules live in `/etc/aisudo/aisudo.toml` (`allowlist = [...]`, often empty) and in the
+drop-ins `/etc/aisudo/conf.d/*.toml`. The daemon merges every `.toml` drop-in over the base.
+Other suffixes (`.bak`, `~`) do not load. **The two hosts have different drop-ins.** A command
+that auto-approves on one host can ask on the other. So do not trust a list from memory or
+from a doc. Ask the host:
+
+```bash
+sudo -l                     # every permanent and temporary rule the daemon has now
+ls /etc/aisudo/conf.d/      # which drop-ins exist (filenames show the topic)
+sudo -n <cmd>               # would THIS command auto-approve?
+```
 
 ## Check before you run — `sudo -n`
 
-`sudo -n <cmd>` (`--dry-run`) reports whether the command would be approved **without
-requesting anything**. It prints one of `sudo: command would be auto-approved` or
-`sudo: command would require approval` and returns immediately. Nothing is recorded,
-nothing is executed, and no approval request is sent.
+`sudo -n <cmd>` (`--dry-run`) prints `sudo: command would be auto-approved` or
+`sudo: command would require approval` and returns at once. It runs nothing, records nothing
+and sends no ask.
 
-Use it before running anything that shells out to sudo **in a loop** — a script, a build
-target, a deploy. A headless `make dry-run` against the dotfiles repo sent the approver three
-approval prompts and then timed out, because it probes paths with `sudo test -d /etc/...`
-once per path. `-n` on one representative command would have shown that in advance.
+Use it before anything that calls sudo **in a loop**: a script, a build target, a deploy.
+A headless dotfiles `make dry-run` once sent the approver three asks and then timed out,
+because it probed paths with `sudo test -d /etc/...` once per path. One `-n` on a sample
+command would have shown that first.
 
-`journalctl -u aisudo-daemon` shows requests as they arrive, if you want to watch what a
-run is actually asking for.
+To watch what a run asks for, follow the daemon log (Platforms table in `SKILL.md`).
 
-## Allowlist (Auto-Approved Commands)
+## Permanent rules — the human installs them
 
-Many safe commands are **auto-approved** without asking the approver at all:
-
-### System Info (read-only)
-- `systemctl status`
-- `systemctl is-active`
-- `journalctl`
-- `df`, `du`, `lsblk`, `fdisk -l`
-- `free`, `ss`, `netstat`, `lsof`
-- `dmesg`, `lspci`, `lsusb`
-- `smartctl`
-
-### Package Info (not remove)
-- `apt search`
-- `apt list`
-- `apt show`
-- `apt-cache`
-
-### File Reading
-- `cat /etc/*`
-- `tail /var/log/*`
-- `ls /root`, `cat /root/*`
-
-**List all active rules:**
-```bash
-sudo -l
-```
-
-**Full list (config file):** `/etc/aisudo/aisudo.toml` (allowlist section)
-
-**Check if a specific command is allowlisted:**
-```bash
-# Ask without requesting anything — prints "would be auto-approved" or "would require approval"
-sudo -n journalctl -n 50
-```
-
----
-## Adding Allowlist Rules
-
-**Use drop-in files in `/etc/aisudo/conf.d/`** — don't edit the main config.
-
-Each `.toml` file in `conf.d/` is merged with the main config. This keeps changes modular and avoids editing the master file.
-
-### Adding a new allowlist entry
-
-```bash
-# 1. Write a drop-in file to /tmp
-cat > /tmp/my-rules.toml << 'EOF'
-allowlist = [
-    "/path/to/my/script.sh",
-    "some-command",
-]
-EOF
-
-# 2. Copy to conf.d (needs sudo approval)
-sudo cp /tmp/my-rules.toml /etc/aisudo/conf.d/my-rules.toml
-# No restart needed — aisudo hot-reloads config on each request
-```
-
-### Existing drop-in files
-
-```bash
-ls /etc/aisudo/conf.d/
-```
-## Temporary Rules
-
-Request a time-limited allowlist rule, approved the same way as any other request:
-
-```bash
-# Request a temp rule for 1 hour (3600 seconds)
-sudo --request-rule --duration 3600 -r "need timeshift access for disk cleanup" timeshift
-
-# Request for 24 hours
-sudo --request-rule --duration 86400 -r "debugging network" tcpdump
-```
-
-The approver gets an approval button in their chat. If approved, the pattern is allowlisted for the specified duration. No config files or restarts needed.
-
-**Check active temp rules:**
-```bash
-sudo -l  # shows both permanent and temp rules
-```
-
-### Current Development Rules
-
-These are already allowlisted for sudo development:
+A permanent rule is a drop-in file in `/etc/aisudo/conf.d/`. The key is `allowlist`:
 
 ```toml
-# sudo development (updating after build)
-"systemctl stop aisudo-daemon"
-"systemctl start aisudo-daemon"
-"systemctl daemon-reload"
-"cp /home/rich/git/ai-sudo/target/release/aisudo-daemon /usr/local/bin/aisudo-daemon"
-"cp /home/rich/git/ai-sudo/target/release/sudo /usr/local/bin/sudo"
-"chmod 755 /usr/local/bin/aisudo-daemon"
-"chmod 755 /usr/local/bin/sudo"
-
-# sudo config management
-"cp /etc/aisudo/aisudo.toml.backup"
-"ls /etc/aisudo"
-"cat /etc/aisudo/aisudo.toml"
+# /etc/aisudo/conf.d/<topic>.toml
+allowlist = [
+    "/path/to/my/script.sh",
+    "some-command --with-fixed-args",
+]
 ```
 
----
+`hot_reload = true` on both hosts, so a new or changed drop-in applies on the next request.
+No restart.
+
+**You cannot install a drop-in yourself, even with an approval tap.** Claude Code's auto-mode
+classifier sees a write into `conf.d` as a security weakening and denies the tool call before
+aisudo sees it. The denial is silent to the approver. So:
+
+1. Write the proposed file in `/tmp` and check its TOML.
+2. Send it to the human with the reason and the exact install command, for example
+   `sudo install -o 0 -g 0 -m 644 /tmp/<topic>.toml /etc/aisudo/conf.d/<topic>.toml`
+   (`-g 0`, not `-g root`: macOS has no group named `root`).
+3. After the human installs it, confirm with `sudo -n <cmd>`.
+
+**Linux (NUC): most drop-ins come from the dotfiles repo.** A file with the header
+`Managed by dotfiles` is a rendered template (`assets/aisudo/templates/conf.d/` in
+`/home/rich/git/dotfiles`). Propose the change to the template, not to the installed copy:
+a dotfiles run overwrites a hand edit. Check with `grep -l 'Managed by dotfiles' /etc/aisudo/conf.d/*.toml`.
+
+Keep each entry narrow. Matching is a prefix match on the whole command string, so
+`"systemctl"` allows every `systemctl` subcommand. Do not allowlist a command that can run
+arbitrary code or write arbitrary files as root (`apt install`, `cp` to any path, an
+interpreter).
+
+## Temporary rules
+
+A time-limited rule. The approver approves it like any other request:
+
+```bash
+sudo --request-rule --duration 3600 -r "timeshift access for disk cleanup" timeshift
+sudo --request-rule --duration 86400 -r "network debugging" tcpdump
+```
+
+If approved, the pattern auto-approves for that many seconds (the daemon caps it with
+`max_temp_rule_duration_seconds`). No file and no restart. `sudo -l` shows active temp rules.

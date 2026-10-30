@@ -11,6 +11,17 @@
         <string>/etc/aisudo/aisudo.toml</string>
     </array>
 
+    <!-- launchd's default PATH has no Homebrew, so allowlisted Homebrew tools
+         (dust, smartctl, borgmatic) were "command not found" (Dick 2026-10-30).
+         System dirs come FIRST so a root command never resolves to a
+         brew-owned copy of a system tool. Brew-owned binaries still need
+         approval: only root-owned ones pass check_binary_ownership. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/opt/homebrew/sbin</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
 

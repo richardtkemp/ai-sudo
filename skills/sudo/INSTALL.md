@@ -97,7 +97,7 @@ cd ~/git/ai-sudo && sudo ./setup.sh     # the real sudo: aisudo does not exist y
 | build (as the invoking user) | `cargo build --release --locked` | same |
 | back up files it overwrites | `/var/backups/aisudo/<ts>.<pid>/` + `MANIFEST` | same |
 | create group `aisudo` | `groupadd --system` (or `--gid N`) | `dseditgroup -o create` |
-| install service | `/etc/systemd/system/aisudo-daemon.service` | `/Library/LaunchDaemons/ai.sudo.daemon.plist` (starts at boot) |
+| install service | `/etc/systemd/system/aisudo-daemon.service`, on a first install only. After that the dotfiles aisudo role owns it: change the unit in the dotfiles template (#2654) | `/Library/LaunchDaemons/ai.sudo.daemon.plist` (starts at boot) |
 | log | journald; install log `/var/log/aisudo-setup.log` | `/var/log/aisudo.log`, rotated by `/etc/newsyslog.d/aisudo.conf` |
 | run the install | in a transient `systemd-run` unit (survives the daemon restart) | inline |
 | health gate | `aisudo --status` round trip, 10 tries; on failure it rolls back | same |

@@ -153,4 +153,10 @@ set -- $order
   || fail "wiring out of order (backup, trap, stop, health, disarm) = $order"
 echo "   ok: backup -> arm trap -> stop daemon -> health check -> disarm ($order)"
 
+# #2654: the dotfiles aisudo role owns the systemd unit after a first install,
+# so the unit install must be guarded by an existence check, not unconditional.
+grep -q '^if \[\[ -e /etc/systemd/system/aisudo-daemon.service \]\]; then' "$GEN" \
+  || fail "the generated install script overwrites an existing systemd unit (#2654)"
+echo "   ok: an existing systemd unit is kept (dotfiles owns it)"
+
 echo "install-rollback: all arms passed"

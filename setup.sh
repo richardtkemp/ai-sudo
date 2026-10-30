@@ -288,8 +288,16 @@ install -d -o root -g aisudo -m 750 /var/run/aisudo
 # enforces 0700 on this dir and 0600 on the DB file.
 install -d -o root -g root -m 700 /var/lib/aisudo
 
-info "Installing systemd service..."
-install -o root -g root -m 644 "$SCRIPT_DIR/aisudo-daemon.service" /etc/systemd/system/aisudo-daemon.service
+# The unit is installed only on a FIRST install. After that the dotfiles repo's
+# aisudo role owns it (Dick 2026-10-30, #2654): its provenance guard refuses to
+# rewrite a file someone else changed last, so overwriting it here would block
+# every later dotfiles deploy. A unit change belongs in the dotfiles template.
+if [[ -e /etc/systemd/system/aisudo-daemon.service ]]; then
+    info "Keeping existing systemd unit (owned by the dotfiles aisudo role)"
+else
+    info "Installing systemd service..."
+    install -o root -g root -m 644 "$SCRIPT_DIR/aisudo-daemon.service" /etc/systemd/system/aisudo-daemon.service
+fi
 systemctl daemon-reload
 
 info "Enabling and starting aisudo-daemon..."

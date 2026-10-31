@@ -62,8 +62,15 @@ a dotfiles run overwrites a hand edit. Check with `grep -l 'Managed by dotfiles'
 
 Keep each entry narrow. Matching is a prefix match on the whole command string, so
 `"systemctl"` allows every `systemctl` subcommand. Do not allowlist a command that can run
-arbitrary code or write arbitrary files as root (`apt install`, `cp` to any path, an
-interpreter).
+arbitrary code or write arbitrary files as root (`cp` to any path, an interpreter) unless an
+argument policy limits it.
+
+**Argument policies (`[allowlist_args."<entry>"]`).** An entry with a policy auto-approves only
+when every argument is a listed flag or a permitted operand. Anything else asks; it is not
+denied. The NUC's `apt install` has one: package names and a few flags (`-y`,
+`--no-install-recommends`, ...) run without a tap; `-o`, `-c`, a path or `.deb`, or `pkg-`
+(remove) asks. So `sudo -l` showing `apt install` does not mean every `apt install` form
+auto-approves: check with `sudo -n`. Keys and rules: `aisudo.toml.example`.
 
 ## Temporary rules
 

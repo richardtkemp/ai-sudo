@@ -44,8 +44,8 @@
 #
 # SECURITY: only list commands that CANNOT execute arbitrary code or write
 # arbitrary files as root. Do NOT auto-approve things like `apt install`
-# (runs package maintainer scripts / local .deb as root) — route those
-# through Telegram approval instead.
+# (a local .deb or an -o hook runs code as root) unless an argument policy
+# ([allowlist_args], below) limits it to package names and safe flags.
 # allowlist = [
 #     "systemctl status",
 #     "apt list",
@@ -60,6 +60,25 @@
 # usernames, values are lists of command patterns (same matching rules).
 # [allowlist_per_user]
 # alice = ["docker ps", "kubectl get"]
+
+# Argument policies for allowlist entries, keyed by the entry's exact pattern.
+# An entry with a policy auto-approves only when EVERY argument after the
+# pattern is a listed flag or a permitted operand; anything else is sent for
+# approval (not denied). Use this when a command is safe with plain arguments
+# but an option can run code as root: apt's -o/--option and -c/--config-file
+# can set DPkg::Pre-Invoke hooks, even grouped as -qoKEY=VAL.
+#   flags                  exact tokens allowed (any other "-..." needs approval)
+#   operand_chars          chars an operand may use, "a-z" ranges; absent = no operands
+#   operand_deny_prefixes  operands starting with one of these need approval
+#   operand_deny_suffixes  operands ending with one of these need approval
+# Quotes, $, backslash, globs, braces and ~ never pass in an operand. Unknown
+# keys are a config error. (TOML: a [table] header owns the keys below it, so
+# put these after every top-level key, or in their own conf.d drop-in.)
+# [allowlist_args."apt install"]
+# flags = ["-y", "--no-install-recommends"]
+# operand_chars = "a-z0-9+.:=-"
+# operand_deny_prefixes = ["."]
+# operand_deny_suffixes = ["-", ".deb"]
 
 # --- macOS allowlist (uncomment on Darwin) ---------------------------
 # These are read-only commands safe to auto-approve on macOS. Linux users:

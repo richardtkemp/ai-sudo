@@ -18,7 +18,9 @@ use tracing::{error, info, warn};
 
 use crate::bw_session::BwSessionManager;
 
-use crate::config::{BinaryOwnershipCheck, ConfigHolder, LimitsConfig, RateLimitMode};
+use crate::config::{
+    AllowlistArgs, ArgRule, BinaryOwnershipCheck, ConfigHolder, LimitsConfig, RateLimitMode,
+};
 use crate::db::Database;
 use crate::notification::{
     BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord,
@@ -499,18 +501,90 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
 }
 
 /// Check if a single (non-chained) command is allowed by the allowlist.
-fn is_single_command_allowed(command: &str, allowlist: &[String]) -> bool {
+///
+/// An entry with an argument policy in `args` matches only when every argument
+/// after the pattern passes that policy (#2699). If it fails, the other entries
+/// are still tried, so an unrestricted entry elsewhere keeps working.
+fn is_single_command_allowed(command: &str, allowlist: &[String], args: &AllowlistArgs) -> bool {
     for pattern in allowlist {
-        if command == pattern {
-            return true;
-        }
-        if command.starts_with(pattern.as_str())
+        let rest = if command == pattern {
+            ""
+        } else if command.starts_with(pattern.as_str())
             && command.as_bytes().get(pattern.len()) == Some(&b' ')
         {
-            return true;
+            &command[pattern.len() + 1..]
+        } else {
+            continue;
+        };
+        match args.get(pattern) {
+            None => return true,
+            Some(rule) if args_pass_rule(rest, rule) => return true,
+            Some(_) => {}
         }
     }
     false
+}
+
+/// Characters that never pass as an operand under an argument policy, even if
+/// the policy's `operand_chars` lists them. Each one can make a shell (the
+/// inner command of a stripped `bash -c` wrapper) produce different argv words
+/// than the whitespace split that the no-shell exec path uses: quoting and
+/// escapes, expansion (`$`, backtick, `~`, braces, globs), comments, and
+/// operators. With them excluded, both paths see the same tokens, so a hidden
+/// `-o` cannot appear after the check.
+const OPERAND_FORBIDDEN_CHARS: &[char] = &[
+    '\'', '"', '\\', '$', '`', '~', '{', '}', '*', '?', '[', ']', '!', '#', '&', '|', ';', '<',
+    '>', '(', ')',
+];
+
+/// True when `c` is in an `operand_chars` set. `a-z` is a range; a `-` at
+/// either end of the set (or not between two chars) is literal.
+fn charset_contains(set: &str, c: char) -> bool {
+    let chars: Vec<char> = set.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 2 < chars.len() && chars[i + 1] == '-' {
+            if chars[i] <= c && c <= chars[i + 2] {
+                return true;
+            }
+            i += 3;
+        } else {
+            if chars[i] == c {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Check the arguments after an allowlist pattern against its policy (#2699).
+/// Tokens are split on whitespace, as the no-shell exec path splits them.
+fn args_pass_rule(rest: &str, rule: &ArgRule) -> bool {
+    rest.split_whitespace().all(|tok| {
+        if rule.flags.iter().any(|f| f == tok) {
+            return true;
+        }
+        if tok.starts_with('-') {
+            return false;
+        }
+        let Some(set) = rule.operand_chars.as_deref() else {
+            return false;
+        };
+        if rule
+            .operand_deny_prefixes
+            .iter()
+            .any(|prefix| tok.starts_with(prefix.as_str()))
+            || rule
+                .operand_deny_suffixes
+                .iter()
+                .any(|suffix| tok.ends_with(suffix.as_str()))
+        {
+            return false;
+        }
+        tok.chars()
+            .all(|c| !OPERAND_FORBIDDEN_CHARS.contains(&c) && charset_contains(set, c))
+    })
 }
 
 /// Check if a single (non-chained) command is allowed by temp rules.
@@ -605,6 +679,7 @@ pub async fn run_socket_listener(
                 let allowlist = config.allowlist.clone();
                 let denylist = config.denylist.clone();
                 let allowlist_per_user = config.allowlist_per_user.clone();
+                let allowlist_args = config.allowlist_args.clone();
                 let limits = config.limits.clone();
 
                 let bw_ctx = bw_session.as_ref().and_then(|session| {
@@ -631,6 +706,7 @@ pub async fn run_socket_listener(
                         &allowlist,
                         &denylist,
                         &allowlist_per_user,
+                        &allowlist_args,
                         limits,
                         bw_ctx,
                     )
@@ -667,6 +743,7 @@ async fn handle_connection(
     allowlist: &[String],
     denylist: &[String],
     allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
+    allowlist_args: &AllowlistArgs,
     limits: LimitsConfig,
     bw_ctx: Option<Arc<BwHandlerContext>>,
 ) -> Result<()> {
@@ -716,6 +793,7 @@ async fn handle_connection(
                     allowlist,
                     denylist,
                     allowlist_per_user,
+                    allowlist_args,
                     &limits,
                 )
                 .await
@@ -812,6 +890,7 @@ async fn handle_connection(
                     allowlist,
                     denylist,
                     allowlist_per_user,
+                    allowlist_args,
                     &limits,
                 )
                 .await
@@ -884,6 +963,7 @@ async fn handle_sudo_request(
     allowlist: &[String],
     denylist: &[String],
     allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
+    allowlist_args: &AllowlistArgs,
     limits: &LimitsConfig,
 ) -> Result<()> {
     let mode = request.mode;
@@ -1023,8 +1103,12 @@ async fn handle_sudo_request(
     // can still run with explicit Telegram approval. A tamperable binary must
     // never be auto-run unattended, but a human in the loop is an acceptable gate.
     // (`&&` short-circuits, so ownership is only checked for allowlisted commands.)
-    if is_allowed_with_strip(&command, &effective_allowlist, limits.strip_shell_prefix)
-        && ownership_ok_or_log(&command, &match_command, limits, "Allowlisted")
+    if is_allowed_with_strip_args(
+        &command,
+        &effective_allowlist,
+        allowlist_args,
+        limits.strip_shell_prefix,
+    ) && ownership_ok_or_log(&command, &match_command, limits, "Allowlisted")
     {
         info!("Command auto-approved via allowlist: {}", command);
 
@@ -2588,8 +2672,9 @@ fn contains_non_embedded_operator(command: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn is_allowed(command: &str, allowlist: &[String]) -> bool {
-    is_allowed_guarded(command, allowlist, false)
+    is_allowed_guarded(command, allowlist, &AllowlistArgs::new(), false)
 }
 
 /// Allowlist check. `via_shell` is true when the text will be interpreted by a
@@ -2597,7 +2682,12 @@ fn is_allowed(command: &str, allowlist: &[String]) -> bool {
 /// operator char blocks auto-approve (#1484). When false, the command is exec'd
 /// as argv with no shell, and an operator char embedded inside one argument is
 /// allowed (#2562).
-fn is_allowed_guarded(command: &str, allowlist: &[String], via_shell: bool) -> bool {
+fn is_allowed_guarded(
+    command: &str,
+    allowlist: &[String],
+    args: &AllowlistArgs,
+    via_shell: bool,
+) -> bool {
     // Try parsing as a command chain. If parsing fails (rejected metacharacters,
     // unterminated quotes, etc.), deny the command.
     let segments = match parse_command_chain(command) {
@@ -2613,7 +2703,7 @@ fn is_allowed_guarded(command: &str, allowlist: &[String], via_shell: bool) -> b
         } else {
             contains_non_embedded_operator(&seg.command)
         };
-        !hidden && is_single_command_allowed(&seg.command, allowlist)
+        !hidden && is_single_command_allowed(&seg.command, allowlist, args)
     })
 }
 
@@ -2756,9 +2846,20 @@ fn normalize_for_match(command: &str, strip: bool) -> Option<Vec<String>> {
 /// stripping its own wrapper — must itself be fully allowlisted (each normalized
 /// part is re-parsed as a chain, so quoted operators inside `bash -c '...'` are
 /// caught too).
+#[cfg(test)]
 fn is_allowed_with_strip(command: &str, allowlist: &[String], strip: bool) -> bool {
+    is_allowed_with_strip_args(command, allowlist, &AllowlistArgs::new(), strip)
+}
+
+/// `is_allowed_with_strip` with the allowlist's argument policies (#2699).
+fn is_allowed_with_strip_args(
+    command: &str,
+    allowlist: &[String],
+    args: &AllowlistArgs,
+    strip: bool,
+) -> bool {
     if !strip {
-        return is_allowed(command, allowlist);
+        return is_allowed_guarded(command, allowlist, args, false);
     }
     // A part that was unwrapped from `bash -c '...'` is run by that shell, so
     // it keeps the full quoted-operator guard; an unwrapped part is argv-exec'd.
@@ -2770,7 +2871,7 @@ fn is_allowed_with_strip(command: &str, allowlist: &[String], strip: bool) -> bo
         && segments.iter().all(|seg| {
             let inner = strip_shell_wrapper(&seg.command);
             let via_shell = inner != seg.command;
-            is_allowed_guarded(&inner, allowlist, via_shell)
+            is_allowed_guarded(&inner, allowlist, args, via_shell)
         })
 }
 
@@ -2932,6 +3033,7 @@ mod tests {
                 &[],
                 &[],
                 &std::collections::HashMap::new(),
+                &AllowlistArgs::new(),
                 limits,
                 None,
             )
@@ -3228,6 +3330,32 @@ mod tests {
         allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
         limits: LimitsConfig,
     ) -> String {
+        send_and_receive_with_args(
+            db,
+            backend,
+            request_json,
+            allowlist,
+            denylist,
+            allowlist_per_user,
+            &AllowlistArgs::new(),
+            limits,
+        )
+        .await
+    }
+
+    /// `send_and_receive` with allowlist argument policies (#2699).
+    #[allow(clippy::too_many_arguments)]
+    async fn send_and_receive_with_args(
+        db: Arc<crate::db::Database>,
+        backend: Arc<dyn crate::notification::NotificationBackend>,
+        request_json: &str,
+        allowlist: &[String],
+        denylist: &[String],
+        allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
+        allowlist_args: &AllowlistArgs,
+        limits: LimitsConfig,
+    ) -> String {
+        let allowlist_args = allowlist_args.clone();
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
         let sudoers = Arc::new(SudoersCache::new(0)); // 0 TTL so cache is always stale
 
@@ -3246,6 +3374,7 @@ mod tests {
                 &allowlist,
                 &denylist,
                 &allowlist_per_user,
+                &allowlist_args,
                 limits,
                 None,
             )
@@ -4040,6 +4169,304 @@ mod tests {
     #[test]
     fn is_allowed_empty_allowlist() {
         assert!(!is_allowed("anything", &[]));
+    }
+
+    // --- #2699: argument policies on allowlist entries -------------------------
+
+    /// The apt policy the NUC ships (dotfiles assets/aisudo/templates/conf.d/apt.toml.j2).
+    fn apt_allowlist_and_args() -> (Vec<String>, AllowlistArgs) {
+        let toml_src = r#"
+            allowlist = ["apt search", "apt install", "apt update", "apt list", "apt show", "apt-cache"]
+
+            [allowlist_args."apt install"]
+            flags = ["-y", "--yes", "--assume-yes", "-q", "-qq", "--quiet",
+                     "--no-install-recommends", "--no-install-suggests", "--install-recommends",
+                     "-s", "--simulate", "--dry-run", "--reinstall", "--no-upgrade", "--only-upgrade",
+                     "-f", "--fix-broken", "-V", "--verbose-versions"]
+            operand_chars = "a-z0-9+.:=-"
+            operand_deny_prefixes = ["."]
+            operand_deny_suffixes = ["-", ".deb", ".ddeb", ".udeb", ".dsc", ".changes"]
+
+            [allowlist_args."apt update"]
+            flags = ["-q", "-qq", "--quiet"]
+
+            [allowlist_args."apt search"]
+            flags = ["-n", "--names-only", "--full"]
+            operand_chars = "A-Za-z0-9+.:=^,_-"
+
+            [allowlist_args."apt list"]
+            flags = ["--installed", "--upgradable", "--upgradeable", "--all-versions", "-a", "--manual-installed"]
+            operand_chars = "A-Za-z0-9+.:=^,_-"
+
+            [allowlist_args."apt show"]
+            flags = ["-a", "--all-versions", "--full"]
+            operand_chars = "a-z0-9+.:=-"
+
+            [allowlist_args."apt-cache"]
+            flags = ["-n", "--names-only", "--full", "-i", "--important", "--installed", "--recurse",
+                     "--no-recommends", "--no-suggests", "--no-conflicts", "--no-breaks",
+                     "--no-replaces", "--no-enhances", "--no-pre-depends"]
+            operand_chars = "A-Za-z0-9+.:=^,_-"
+        "#;
+        #[derive(serde::Deserialize)]
+        struct T {
+            allowlist: Vec<String>,
+            allowlist_args: AllowlistArgs,
+        }
+        let t: T = toml::from_str(toml_src).unwrap();
+        (t.allowlist, t.allowlist_args)
+    }
+
+    fn apt_allowed(cmd: &str) -> bool {
+        let (list, args) = apt_allowlist_and_args();
+        is_allowed_with_strip_args(cmd, &list, &args, false)
+    }
+
+    #[test]
+    fn arg_policy_keeps_plain_apt_commands_auto_approved() {
+        for cmd in [
+            "apt install",
+            "apt install vim",
+            "apt install -y vim curl",
+            "apt install --no-install-recommends -y build-essential",
+            "apt install vim=2:9.1.0016-1ubuntu7.8",
+            "apt install libc6:amd64 g++ python3.12",
+            "apt install -qq --reinstall vim",
+            "apt update",
+            "apt update -qq",
+            "apt search ripgrep",
+            "apt search -n ^libssl",
+            "apt list --installed",
+            "apt list --upgradable",
+            "apt show vim",
+            "apt-cache policy vim",
+            "apt-cache madison openssl",
+            "apt-cache depends --recurse vim",
+        ] {
+            assert!(apt_allowed(cmd), "should auto-approve: {cmd}");
+        }
+    }
+
+    #[test]
+    fn arg_policy_sends_apt_option_and_config_routes_to_a_human() {
+        // Every spelling apt's parser accepts (probed with apt-config 2026-10-31):
+        // separate, attached, long, long=, and grouped behind another short flag.
+        for cmd in [
+            "apt install -o DPkg::Pre-Invoke::=touch vim",
+            "apt install -oDPkg::Pre-Invoke::=touch vim",
+            "apt install --option DPkg::Pre-Invoke::=touch vim",
+            "apt install --option=DPkg::Pre-Invoke::=touch vim",
+            "apt install -qoDPkg::Pre-Invoke::=touch vim",
+            "apt install -yo DPkg::Post-Invoke::=touch vim",
+            "apt install vim -o DPkg::Pre-Invoke::=touch",
+            "apt install -c /tmp/evil.conf vim",
+            "apt install -c/tmp/evil.conf vim",
+            "apt install --config-file /tmp/evil.conf vim",
+            "apt install --config-file=/tmp/evil.conf vim",
+            "apt install -qc/tmp/evil.conf vim",
+            "apt install -- -o",
+            "apt install -t unstable vim",
+            "apt install --allow-unauthenticated vim",
+            "apt update -o APT::Update::Pre-Invoke::=touch",
+            "apt update -oAPT::Update::Pre-Invoke::=touch",
+            "apt update -c /tmp/evil.conf",
+            "apt search -o Dir::Cache::pkgcache=/etc/x foo",
+            "apt list -o Dir::Cache::pkgcache=/etc/x",
+            "apt show -c/tmp/evil.conf vim",
+            "apt-cache -o Dir::Cache::pkgcache=/etc/x gencaches",
+            "apt-cache policy -qovim",
+        ] {
+            assert!(!apt_allowed(cmd), "must need a tap: {cmd}");
+        }
+    }
+
+    #[test]
+    fn arg_policy_sends_apt_install_of_a_path_or_removal_to_a_human() {
+        for cmd in [
+            "apt install ./evil.deb",
+            "apt install /tmp/evil.deb",
+            "apt install evil.deb",
+            "apt install evil.udeb",
+            "apt install /tmp/pkgdir",
+            "apt install .",
+            "apt install ..",
+            "apt install pkg/unstable",
+            "apt install foo.dsc",
+            "apt install openssh-server-",
+            "apt install vim openssh-server-",
+            "apt install http://evil/x.deb",
+            "apt install VIM",
+        ] {
+            assert!(!apt_allowed(cmd), "must need a tap: {cmd}");
+        }
+    }
+
+    #[test]
+    fn arg_policy_rejects_shell_tricks_that_build_an_option_after_the_check() {
+        // A stripped `bash -c '...'` is run by a shell, which could turn these
+        // operands into `-o ...` words; the no-shell path splits on whitespace.
+        // Both must see the same tokens, so each of these needs a tap.
+        let (list, args) = apt_allowlist_and_args();
+        for inner in [
+            r#"apt install "-o" DPkg::Pre-Invoke::=touch vim"#,
+            "apt install '-oDPkg::Pre-Invoke::=touch' vim",
+            r"apt install \-oDPkg::Pre-Invoke::=touch vim",
+            "apt install x${IFS}-oDPkg::Pre-Invoke::=touch",
+            "apt install $X vim",
+            "apt install {-o,DPkg::Pre-Invoke::=touch} vim",
+            "apt install * vim",
+            "apt install ?o vim",
+            "apt install ~/evil.deb",
+        ] {
+            let wrapped = format!("bash -c '{}'", inner.replace('\'', r"'\''"));
+            assert!(
+                !is_allowed_with_strip_args(&wrapped, &list, &args, true),
+                "must need a tap (shell): {wrapped}"
+            );
+            assert!(
+                !is_allowed_with_strip_args(inner, &list, &args, false),
+                "must need a tap (no shell): {inner}"
+            );
+        }
+        // Control: the same wrapper around a clean command still auto-approves,
+        // so the rejections above are about the arguments, not the wrapper.
+        assert!(is_allowed_with_strip_args(
+            "bash -c 'apt install -y vim'",
+            &list,
+            &args,
+            true
+        ));
+    }
+
+    #[test]
+    fn arg_policy_applies_per_entry_and_other_entries_still_match() {
+        let (mut list, args) = apt_allowlist_and_args();
+        // No policy for "systemctl status": unchanged behaviour.
+        list.push("systemctl status".to_string());
+        assert!(is_allowed_with_strip_args(
+            "systemctl status -o json nginx",
+            &list,
+            &args,
+            false
+        ));
+        // A broader, unrestricted entry is the operator's choice and still wins.
+        list.push("apt".to_string());
+        assert!(is_allowed_with_strip_args(
+            "apt install -o DPkg::Pre-Invoke::=touch vim",
+            &list,
+            &args,
+            false
+        ));
+    }
+
+    #[test]
+    fn arg_policy_with_no_operand_chars_allows_flags_only() {
+        let (list, args) = apt_allowlist_and_args();
+        assert!(is_allowed_with_strip_args(
+            "apt update -q",
+            &list,
+            &args,
+            false
+        ));
+        assert!(!is_allowed_with_strip_args(
+            "apt update vim",
+            &list,
+            &args,
+            false
+        ));
+    }
+
+    #[test]
+    fn arg_policy_shell_special_chars_never_pass_even_when_listed() {
+        // An operator who lists every printable char still cannot let through
+        // an operand a shell would rewrite into different words.
+        let mut args = AllowlistArgs::new();
+        args.insert(
+            "tool".to_string(),
+            ArgRule {
+                flags: vec![],
+                operand_chars: Some(" -~".to_string()), // all printable ASCII
+                operand_deny_prefixes: vec![],
+                operand_deny_suffixes: vec![],
+            },
+        );
+        let list = vec!["tool".to_string()];
+        assert!(is_allowed_with_strip_args(
+            "tool a/b=c:d",
+            &list,
+            &args,
+            false
+        ));
+        for c in OPERAND_FORBIDDEN_CHARS {
+            if matches!(c, '&' | '|' | ';' | '<' | '>' | '(' | ')' | '`') {
+                continue; // the chain parser rejects these before the policy runs
+            }
+            let cmd = format!("tool x{c}y");
+            assert!(
+                !is_allowed_with_strip_args(&cmd, &list, &args, false),
+                "must need a tap: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn charset_ranges_and_literal_dash() {
+        assert!(charset_contains("a-z0-9-", 'q'));
+        assert!(charset_contains("a-z0-9-", '5'));
+        assert!(charset_contains("a-z0-9-", '-'));
+        assert!(!charset_contains("a-z0-9-", 'Q'));
+        assert!(!charset_contains("a-z0-9-", '/'));
+        assert!(charset_contains("-a", '-'));
+        assert!(!charset_contains("", 'a'));
+    }
+
+    #[tokio::test]
+    async fn arg_policy_dry_run_reports_approval_needed_not_denylist() {
+        let (list, args) = apt_allowlist_and_args();
+        for (cmd, expect_approved) in [
+            ("apt install -y vim", true),
+            ("apt install -qoDPkg::Pre-Invoke::=touch vim", false),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+            let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+            let request = SudoRequest {
+                user: "testuser".to_string(),
+                command: cmd.to_string(),
+                cwd: "/tmp".to_string(),
+                pid: 1,
+                mode: RequestMode::Pam,
+                reason: None,
+                stdin: None,
+                skip_nopasswd: false,
+                timeout_seconds: None,
+                dry_run: true,
+                wants_status: false,
+            };
+            let json = serde_json::to_string(&request).unwrap();
+            let resp_line = send_and_receive_with_args(
+                db,
+                backend,
+                &json,
+                &list,
+                &[],
+                &std::collections::HashMap::new(),
+                &args,
+                test_limits(),
+            )
+            .await;
+            let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+            if expect_approved {
+                assert_eq!(response.decision, Decision::Approved, "{cmd}");
+            } else {
+                assert_eq!(response.decision, Decision::Denied, "{cmd}");
+                assert_eq!(
+                    response.error.as_deref(),
+                    Some("dry-run: would require approval"),
+                    "{cmd}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5373,6 +5800,7 @@ mod tests {
                 &allowlist,
                 &denylist,
                 &std::collections::HashMap::new(),
+                &AllowlistArgs::new(),
                 test_limits(),
                 None,
             )
@@ -5591,6 +6019,7 @@ mod tests {
                 &[],
                 &[],
                 &std::collections::HashMap::new(),
+                &AllowlistArgs::new(),
                 test_limits(),
                 None,
             )

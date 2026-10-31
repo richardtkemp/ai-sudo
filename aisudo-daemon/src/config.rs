@@ -29,6 +29,15 @@ pub struct Config {
     #[serde(default)]
     pub allowlist_per_user: std::collections::HashMap<String, Vec<String>>,
 
+    /// Argument policies for allowlist entries, keyed by the entry's exact
+    /// pattern string (e.g. `[allowlist_args."apt install"]`). An entry with a
+    /// policy auto-approves only when EVERY argument after the pattern passes
+    /// it; otherwise the command goes to a human, it is not denied (#2699).
+    /// Applies to the global and the per-user allowlists. Temp rules are not
+    /// affected.
+    #[serde(default)]
+    pub allowlist_args: AllowlistArgs,
+
     pub telegram: Option<TelegramConfig>,
 
     pub askgw: Option<AskgwConfig>,
@@ -43,6 +52,44 @@ pub struct Config {
 
     pub bitwarden: Option<BitwardenConfig>,
 }
+
+/// Argument policy for one allowlist entry (#2699). Fail-closed: an argument
+/// that is not an exact listed flag and not a permitted operand needs a tap.
+///
+/// A prefix denylist of bad flags cannot do this job: apt accepts grouped
+/// short options (`-qoDPkg::Pre-Invoke::=cmd`), so `-o` hides inside a token
+/// that does not start with `-o`. Listing what IS allowed closes every
+/// spelling at once.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArgRule {
+    /// Exact argument tokens that are allowed, e.g. `"-y"`, `"--no-install-recommends"`.
+    /// Any other token starting with `-` needs a tap.
+    #[serde(default)]
+    pub flags: Vec<String>,
+
+    /// Characters an operand (a token not starting with `-`) may contain.
+    /// `a-z` style ranges are allowed; a `-` at either end is literal.
+    /// Absent means no operands are allowed. Shell-special characters (quotes,
+    /// `$`, `\`, globs, braces, `~`, whitespace...) never pass, even if listed:
+    /// an operand must read the same with and without a shell.
+    #[serde(default)]
+    pub operand_chars: Option<String>,
+
+    /// An operand starting with one of these needs a tap. For `apt install`,
+    /// `"."` stops `.` and `..` (a source directory, i.e. a path).
+    #[serde(default)]
+    pub operand_deny_prefixes: Vec<String>,
+
+    /// An operand ending in one of these needs a tap. For `apt install`,
+    /// `"-"` stops `pkg-` (apt's "remove pkg" syntax) and `".deb"` a local
+    /// package file.
+    #[serde(default)]
+    pub operand_deny_suffixes: Vec<String>,
+}
+
+/// Allowlist pattern -> its argument policy.
+pub type AllowlistArgs = std::collections::HashMap<String, ArgRule>;
 
 #[derive(Debug, Deserialize)]
 pub struct TelegramConfig {
@@ -801,6 +848,61 @@ max_stdin_bytes = 1024
             config.allowlist,
             vec!["apt list", "systemctl status", "docker ps", "ls -la"]
         );
+    }
+
+    #[test]
+    fn allowlist_args_load_from_a_dropin() {
+        let tmp = TempDir::new().unwrap();
+        let conf_d = tmp.path().join("conf.d");
+        fs::create_dir(&conf_d).unwrap();
+        fs::write(
+            conf_d.join("apt.toml"),
+            r#"
+allowlist = ["apt install"]
+
+[allowlist_args."apt install"]
+flags = ["-y"]
+operand_chars = "a-z0-9+.:=~-"
+operand_deny_prefixes = ["."]
+operand_deny_suffixes = ["-", ".deb"]
+"#,
+        )
+        .unwrap();
+
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+        let config = Config::load(&path).unwrap();
+        let rule = config.allowlist_args.get("apt install").unwrap();
+        assert_eq!(rule.flags, vec!["-y"]);
+        assert_eq!(rule.operand_chars.as_deref(), Some("a-z0-9+.:=~-"));
+        assert_eq!(rule.operand_deny_prefixes, vec!["."]);
+        assert_eq!(rule.operand_deny_suffixes, vec!["-", ".deb"]);
+    }
+
+    #[test]
+    fn allowlist_args_absent_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+        let config = Config::load(&path).unwrap();
+        assert!(config.allowlist_args.is_empty());
+    }
+
+    #[test]
+    fn allowlist_args_misspelt_key_is_an_error_not_a_silent_default() {
+        // A typo must not quietly drop a restriction (e.g. the deny suffixes).
+        let tmp = TempDir::new().unwrap();
+        let conf_d = tmp.path().join("conf.d");
+        fs::create_dir(&conf_d).unwrap();
+        fs::write(
+            conf_d.join("apt.toml"),
+            r#"
+[allowlist_args."apt install"]
+operand_deny_suffix = ["-"]
+"#,
+        )
+        .unwrap();
+        let path = write_main_config(tmp.path(), BASE_CONFIG);
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("operand_deny_suffix"), "{err}");
     }
 
     #[test]

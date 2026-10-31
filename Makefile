@@ -5,19 +5,20 @@
 #   test-only — tests without the lint gate, for a fast inner loop
 #   test-install-rollback — drives setup.sh's rollback through its failure paths
 #   test-target-ownership — setup.sh's pre-build check for a target/ split across users
+#   test-macos-install-job — setup.sh's macOS launcher never stops the daemon inline (#2652)
 #   lint      — rustfmt and clippy, both failing the build on any finding
 #   update    — build release + install via setup.sh (requires sudo)
 #   build     — build release only
 #   clean     — clean build artifacts
 
-.PHONY: test test-only test-install-rollback test-target-ownership lint update build clean
+.PHONY: test test-only test-install-rollback test-target-ownership test-macos-install-job lint update build clean
 
 # `test` depends on `lint` deliberately. Before this existed, commit 4b32e43 shipped five
 # unformatted hunks and nothing caught it; two further diffs had been sitting in the tree
 # since before that. A lint target nobody's workflow runs would not have caught it either,
 # so it goes on the path that is actually used before committing. Use `test-only` while
 # iterating.
-test: lint test-install-rollback test-target-ownership
+test: lint test-install-rollback test-target-ownership test-macos-install-job
 	cargo build --locked
 	cargo test --locked
 
@@ -35,6 +36,11 @@ test-install-rollback:
 # single-user test run never sets up. (#1647)
 test-target-ownership:
 	./scripts/test-target-ownership.sh
+
+# The bootout-kills-the-installer hazard only appears when setup.sh runs THROUGH aisudo on a
+# Mac, which no test host does. This pins the contract with launchctl stubbed. (#2652)
+test-macos-install-job:
+	./scripts/test-macos-install-job.sh
 
 # -D warnings makes clippy's exit code meaningful. The tree is clean as of #1820; the few
 # genuine exceptions carry a targeted #[allow] with a comment saying why, so future findings

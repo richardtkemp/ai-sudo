@@ -347,10 +347,21 @@ INSTALL_EOF
 # ---------------------------------------------------------------------
 # macOS install path
 # ---------------------------------------------------------------------
-# No systemd-run analogue needed — launchctl bootstrap doesn't share cgroup
-# kill semantics with the daemon, so we install inline. Logs go to a flat
-# file (rotated by newsyslog) instead of journald.
-install_macos() {
+# The install runs in its OWN one-shot launchd job, the macOS analogue of the
+# systemd-run fork on Linux (#2652). The normal agent path runs setup.sh as a
+# child of aisudo-daemon, so it sits in the daemon job's process group. On
+# `launchctl bootout`, launchd sends SIGTERM to that whole process group, not
+# only to the daemon. Verified on macOS 26 (work Mac, 2026-10-31): a child
+# that boots out its parent's job receives SIGTERM at the bootout; with only
+# an EXIT trap it dies there, so the trap starts a rollback while its stdout
+# (the dead daemon's pipe) is gone. A job that launchd starts has its own
+# process group and session, and the bootout does not reach it.
+#
+# aisudo_install_macos_job is the install itself and runs only inside that
+# job. install_macos below writes the job and starts it.
+#
+# Logs go to a flat file (rotated by newsyslog) instead of journald.
+aisudo_install_macos_job() {
     AISUDO_LOG_HINT="tail -50 /var/log/aisudo.log"
     # Snapshot every file below overwrites, THEN arm the trap — both before the
     # daemon is stopped, so any failure from here on has something to restore.
@@ -453,6 +464,101 @@ NEWSYSLOG_EOF
         # Falls through to the EXIT trap, which restores the previous install.
         exit 1
     fi
+}
+
+AISUDO_INSTALL_LABEL="ai.sudo.install"
+AISUDO_SETUP_LOG="/var/log/aisudo-setup.log"
+AISUDO_JOB_DIR_BASE="/tmp"
+
+# Write the install job (a script plus its launchd plist) and start it in the
+# system domain. This process may be a child of aisudo-daemon, so it does
+# nothing to the daemon itself: the job stops and restarts it.
+install_macos() {
+    # A job label is unique in a domain. A job from an earlier install stays
+    # loaded (state "not running") after it exits; remove it. A RUNNING one
+    # is a concurrent install, and a second one must not start beside it.
+    local state
+    if state=$(launchctl print "system/$AISUDO_INSTALL_LABEL" 2>/dev/null); then
+        if grep -q 'state = running' <<<"$state"; then
+            error "Another aisudo install is still running (launchd job $AISUDO_INSTALL_LABEL)."
+            error "Follow it: tail -f $AISUDO_SETUP_LOG"
+            exit 1
+        fi
+        launchctl bootout "system/$AISUDO_INSTALL_LABEL"
+    fi
+
+    # mktemp -d gives a fresh 0700 dir owned by root, so nobody else can
+    # change the script or the plist between this write and the job start.
+    local job_dir job_script job_plist
+    job_dir=$(mktemp -d "$AISUDO_JOB_DIR_BASE/aisudo-install.XXXXXX")
+    job_script="$job_dir/install.sh"
+    job_plist="$job_dir/$AISUDO_INSTALL_LABEL.plist"
+
+    # Functions go in via `declare -f` and values via `declare -p`, so the job
+    # runs the SAME definitions as this file, quoted exactly (as on Linux).
+    {
+        echo "#!$BASH"
+        echo "set -euo pipefail"
+        echo "echo \"=== aisudo setup started at \$(date) ===\""
+        declare -p SCRIPT_DIR CONFIG_FILE RED GREEN YELLOW NC AISUDO_GID \
+                   AISUDO_PLATFORM AISUDO_BACKUP_ROOT AISUDO_BACKUP_KEEP \
+                   DAEMON_BIN CLI_BIN BUILD_USER
+        echo "AISUDO_BACKUP_DIR=''"
+        echo "AISUDO_LOG_HINT=''"
+        declare -f info warn error aisudo_backup aisudo_prune_backups \
+                   aisudo_restart_daemon aisudo_health_check aisudo_rollback \
+                   aisudo_install_macos_job
+        # Start the real work only after the launching setup.sh has exited.
+        # Its parent may be aisudo-daemon, which still has to send the exit
+        # status to the aisudo client before the job stops the daemon.
+        echo "launcher_pid=$$"
+        # shellcheck disable=SC2016  # written for the job to expand, not this shell
+        echo 'for _ in $(seq 1 100); do kill -0 "$launcher_pid" 2>/dev/null || break; sleep 0.1; done'
+        echo 'sleep 1'
+        echo 'aisudo_install_macos_job'
+        # Only reached on success. A failed install keeps the script for a
+        # post-mortem, like the Linux path.
+        echo "rm -f \"\$0\" \"$job_plist\""
+        echo "rmdir \"$job_dir\""
+        echo "echo \"=== aisudo setup completed at \$(date) ===\""
+    } >"$job_script"
+    chmod 700 "$job_script"
+
+    # No KeepAlive: the job runs once. launchd writes its output to the log
+    # from the first line, so an error before the install starts is recorded too.
+    cat >"$job_plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$AISUDO_INSTALL_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$BASH</string>
+        <string>$job_script</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$AISUDO_SETUP_LOG</string>
+    <key>StandardErrorPath</key>
+    <string>$AISUDO_SETUP_LOG</string>
+</dict>
+</plist>
+PLIST_EOF
+    chmod 600 "$job_plist"
+
+    # Truncate, so the log holds this install only.
+    : >"$AISUDO_SETUP_LOG"
+    chmod 600 "$AISUDO_SETUP_LOG"
+
+    echo ""
+    echo "Installation launched as a one-shot launchd job ($AISUDO_INSTALL_LABEL)."
+    echo "Monitor progress: tail -f $AISUDO_SETUP_LOG"
+    echo "                  sudo launchctl print system/$AISUDO_INSTALL_LABEL"
+    echo ""
+    launchctl bootstrap system "$job_plist"
 }
 
 # =====================================================================

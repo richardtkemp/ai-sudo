@@ -2542,7 +2542,62 @@ fn contains_hidden_operator(command: &str) -> bool {
     command.chars().any(|c| HIDDEN_OPERATOR_CHARS.contains(&c))
 }
 
+/// The chain operator `|` may appear embedded inside ONE argv
+/// token without blocking auto-approve (#2562), e.g. docker's
+/// `--format "{{.Names}}|{{.Status}}"`. The other `HIDDEN_OPERATOR_CHARS`
+/// (substitution, grouping, redirection, newline) are never relaxed.
+const EMBEDDABLE_OPERATOR_CHARS: [char; 1] = ['|'];
+
+/// Binaries that interpret their arguments as shell text (or launch something
+/// that does). A segment led by one of these keeps the full #1484 guard: its
+/// "embedded" operators are live to the shell it starts.
+const SHELL_LIKE_BINARIES: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "env"];
+
+/// True if the operator char at `i` in `token` sits strictly inside the token,
+/// with a non-blank, non-operator character on each side.
+fn is_embedded_operator(token: &[char], i: usize) -> bool {
+    if !EMBEDDABLE_OPERATOR_CHARS.contains(&token[i]) || i == 0 || i + 1 >= token.len() {
+        return false;
+    }
+    let ok = |c: char| !c.is_whitespace() && !HIDDEN_OPERATOR_CHARS.contains(&c);
+    ok(token[i - 1]) && ok(token[i + 1])
+}
+
+/// Relaxed form of `contains_hidden_operator` for a segment that runs WITHOUT
+/// a shell (argv exec, #2562). Splits the segment the way the exec path does
+/// and reports a hidden operator unless every operator char found is embedded
+/// inside one argument (see `is_embedded_operator`). A standalone operator
+/// token (`'|'`, `";"`) still counts, as does any operator at a token edge,
+/// next to a blank, or doubled (`&&`, `||`). Falls back to the strict check if
+/// the segment cannot be split, or if its binary is shell-like.
+fn contains_non_embedded_operator(command: &str) -> bool {
+    let argv = match split_command_argv(command) {
+        Ok(a) => a,
+        Err(_) => return contains_hidden_operator(command),
+    };
+    let binary = argv[0].rsplit('/').next().unwrap_or(&argv[0]);
+    if SHELL_LIKE_BINARIES.contains(&binary) {
+        return contains_hidden_operator(command);
+    }
+    argv.iter().any(|arg| {
+        let token: Vec<char> = arg.chars().collect();
+        token
+            .iter()
+            .enumerate()
+            .any(|(i, c)| HIDDEN_OPERATOR_CHARS.contains(c) && !is_embedded_operator(&token, i))
+    })
+}
+
 fn is_allowed(command: &str, allowlist: &[String]) -> bool {
+    is_allowed_guarded(command, allowlist, false)
+}
+
+/// Allowlist check. `via_shell` is true when the text will be interpreted by a
+/// shell (the inner command of a stripped `bash -c` wrapper): then any quoted
+/// operator char blocks auto-approve (#1484). When false, the command is exec'd
+/// as argv with no shell, and an operator char embedded inside one argument is
+/// allowed (#2562).
+fn is_allowed_guarded(command: &str, allowlist: &[String], via_shell: bool) -> bool {
     // Try parsing as a command chain. If parsing fails (rejected metacharacters,
     // unterminated quotes, etc.), deny the command.
     let segments = match parse_command_chain(command) {
@@ -2553,8 +2608,12 @@ fn is_allowed(command: &str, allowlist: &[String]) -> bool {
     // quoted operator/metacharacter smuggling extra command-like content past
     // the leading-binary prefix match (#1484).
     segments.iter().all(|seg| {
-        !contains_hidden_operator(&seg.command)
-            && is_single_command_allowed(&seg.command, allowlist)
+        let hidden = if via_shell {
+            contains_hidden_operator(&seg.command)
+        } else {
+            contains_non_embedded_operator(&seg.command)
+        };
+        !hidden && is_single_command_allowed(&seg.command, allowlist)
     })
 }
 
@@ -2701,10 +2760,18 @@ fn is_allowed_with_strip(command: &str, allowlist: &[String], strip: bool) -> bo
     if !strip {
         return is_allowed(command, allowlist);
     }
-    match normalize_for_match(command, true) {
-        Some(parts) => !parts.is_empty() && parts.iter().all(|p| is_allowed(p, allowlist)),
-        None => false,
-    }
+    // A part that was unwrapped from `bash -c '...'` is run by that shell, so
+    // it keeps the full quoted-operator guard; an unwrapped part is argv-exec'd.
+    let segments = match parse_command_chain(command) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    !segments.is_empty()
+        && segments.iter().all(|seg| {
+            let inner = strip_shell_wrapper(&seg.command);
+            let via_shell = inner != seg.command;
+            is_allowed_guarded(&inner, allowlist, via_shell)
+        })
 }
 
 /// Denylist check with per-segment shell-wrapper stripping. Mirrors
@@ -4451,6 +4518,83 @@ mod tests {
         assert!(is_allowed("apt list --installed", &allow));
         assert!(is_allowed("ls -la /tmp", &allow));
         assert!(is_allowed("ls \"/tmp/some dir\"", &allow));
+    }
+
+    // ===== #2562: an operator char embedded inside ONE argument =====
+    //
+    // Dick's ruling (2026-10-31): a chain-operator character (`|`, `;`, `&`)
+    // embedded inside a single argv token, with a non-blank, non-operator
+    // character on both sides, does not block auto-approve on the direct-argv
+    // (no shell) path. A standalone operator token still needs a tap, and
+    // anything a shell will interpret keeps the full #1484 guard.
+    #[test]
+    fn is_allowed_permits_operator_embedded_in_one_argument() {
+        let allow = vec!["docker ps".to_string()];
+        // The ticket's repro.
+        assert!(is_allowed(
+            r#"docker ps -a --format "{{.Names}}|{{.Status}}""#,
+            &allow
+        ));
+        assert!(is_allowed(
+            r#"docker ps --filter name=homeassistant --format "{{.Names}}|{{.Image}}|{{.Status}}""#,
+            &allow
+        ));
+        assert!(!is_allowed("docker ps --format 'a;b'", &allow));
+        assert!(!is_allowed("docker ps --format 'a&b'", &allow));
+        // Same through the daemon's real call site, strip off and on (the
+        // segment carries no shell wrapper, so stripping changes nothing).
+        let repro = r#"docker ps -a --format "{{.Names}}|{{.Status}}""#;
+        assert!(is_allowed_with_strip(repro, &allow, false));
+        assert!(is_allowed_with_strip(repro, &allow, true));
+    }
+
+    #[test]
+    fn is_allowed_still_rejects_non_embedded_operators() {
+        let allow = vec!["docker ps".to_string(), "ls".to_string()];
+        // Standalone operator token, quoted.
+        assert!(!is_allowed("docker ps '|' touch /tmp/x", &allow));
+        assert!(!is_allowed(r#"docker ps --format "|""#, &allow));
+        // Operator at the start or end of a token.
+        assert!(!is_allowed("docker ps --format '|x'", &allow));
+        assert!(!is_allowed("docker ps --format 'x|'", &allow));
+        // Operator next to a blank inside a quoted argument.
+        assert!(!is_allowed("docker ps --format 'a | b'", &allow));
+        assert!(!is_allowed("ls 'x; touch /tmp/y'", &allow));
+        // Doubled operators (&&, ||) and mixed runs.
+        assert!(!is_allowed("docker ps --format 'a||b'", &allow));
+        assert!(!is_allowed("docker ps --format 'a&&b'", &allow));
+        assert!(!is_allowed("docker ps --format 'a|;b'", &allow));
+        // Substitution and redirection characters are not chain operators:
+        // they keep the full guard even when embedded.
+        assert!(!is_allowed("docker ps --format 'a$b'", &allow));
+        assert!(!is_allowed("docker ps --format 'a`b'", &allow));
+        assert!(!is_allowed("docker ps --format 'a(b'", &allow));
+        assert!(!is_allowed("docker ps --format 'a>b'", &allow));
+        assert!(!is_allowed("docker ps --format 'a<b'", &allow));
+    }
+
+    #[test]
+    fn is_allowed_keeps_full_guard_when_a_shell_runs_the_text() {
+        // A segment whose binary is a shell hands its arguments to that
+        // shell, so an embedded operator is live there.
+        let allow = vec!["bash".to_string(), "/bin/sh".to_string(), "env".to_string()];
+        assert!(!is_allowed("bash -c 'id|tee /tmp/x'", &allow));
+        assert!(!is_allowed("/bin/sh -c 'id;id'", &allow));
+        assert!(!is_allowed("env bash -c 'id;id'", &allow));
+        // strip_shell_prefix: the inner command is what bash executes, so an
+        // embedded operator in it keeps the full guard.
+        let allow2 = vec!["docker ps".to_string()];
+        assert!(!is_allowed_with_strip(
+            r#"bash -c 'docker ps --format "{{.Names}}|{{.Status}}"'"#,
+            &allow2,
+            true
+        ));
+        // Control: the same inner command with no operator still matches.
+        assert!(is_allowed_with_strip(
+            r#"bash -c 'docker ps --format "{{.Names}}"'"#,
+            &allow2,
+            true
+        ));
     }
 
     #[test]

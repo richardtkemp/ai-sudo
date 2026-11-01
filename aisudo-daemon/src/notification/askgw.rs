@@ -75,6 +75,14 @@ struct NotifyFrame<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<&'a str>,
     text: String,
+    /// foci renders a notify from these three fields, under the answered ask
+    /// whose id is `id` (foci internal/askgw NotifyFrame, #2741).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +157,32 @@ impl AskgwBackend {
         deny_desc: String,
     ) -> Result<Decision> {
         let id = Uuid::new_v4().to_string();
+        self.ask_and_wait_with_id(
+            id,
+            header,
+            question,
+            approve_label,
+            deny_label,
+            approve_desc,
+            deny_desc,
+        )
+        .await
+    }
+
+    /// [`Self::ask_and_wait`] under a caller-chosen ask id. A sudo ask uses its request
+    /// id, so the completion `notify` (which carries only the request id) names the
+    /// answered ask, which is how foci finds the message to report on (#2741).
+    #[allow(clippy::too_many_arguments)]
+    async fn ask_and_wait_with_id(
+        &self,
+        id: String,
+        header: &str,
+        question: String,
+        approve_label: &str,
+        deny_label: &str,
+        approve_desc: String,
+        deny_desc: String,
+    ) -> Result<Decision> {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(id.clone(), tx);
 
@@ -223,19 +257,37 @@ impl AskgwBackend {
         text: String,
     ) -> Result<()> {
         let frame = NotifyFrame {
-            protocol: PROTOCOL,
-            frame_type: "notify",
-            id: Uuid::new_v4().to_string(),
             kind,
             level,
             title,
-            text,
+            ..self.notify_frame(text)
         };
-        let json = serde_json::to_string(&frame)?;
+        self.deliver_notify(frame).await;
+        Ok(())
+    }
+
+    /// A bare `notify` frame under a fresh id, for callers to fill in.
+    fn notify_frame<'a>(&self, text: String) -> NotifyFrame<'a> {
+        NotifyFrame {
+            protocol: PROTOCOL,
+            frame_type: "notify",
+            id: Uuid::new_v4().to_string(),
+            kind: None,
+            level: None,
+            title: None,
+            text,
+            status: None,
+            exit_code: None,
+            message: None,
+        }
+    }
+
+    async fn deliver_notify(&self, frame: NotifyFrame<'_>) {
         // Notifications are best-effort: drop rather than block if the outbox is
         // full/disconnected (try_send, not send().await).
-        let _ = self.outbox.try_send(json);
-        Ok(())
+        if let Ok(json) = serde_json::to_string(&frame) {
+            let _ = self.outbox.try_send(json);
+        }
     }
 }
 
@@ -447,7 +499,8 @@ async fn verify_and_connect(socket_path: &PathBuf, gateway_uid: u32) -> Result<U
 impl NotificationBackend for AskgwBackend {
     async fn send_and_wait(&self, record: &SudoRequestRecord) -> Result<Decision> {
         let question = super::askgw_sudo_question(record);
-        self.ask_and_wait(
+        self.ask_and_wait_with_id(
+            record.id.clone(),
             "Sudo",
             question,
             "Approve",
@@ -538,22 +591,18 @@ impl NotificationBackend for AskgwBackend {
     }
 
     async fn update_completion_status(&self, info: &CompletionInfo) {
-        let text = if info.exit_code == 0 {
-            format!("Command completed: exit 0 (request {})", info.request_id)
-        } else {
-            let detail = info
-                .last_lines
-                .as_ref()
-                .map(|l| format!(": {l}"))
-                .unwrap_or_default();
-            format!(
-                "Command failed: exit {} (request {}){}",
-                info.exit_code, info.request_id, detail
-            )
+        let (level, text) = super::askgw_completion_notice(info);
+        let (status, exit_code, message) = super::askgw_completion_fields(info);
+        let frame = NotifyFrame {
+            id: info.request_id.clone(),
+            kind: Some("completion"),
+            level: Some(level),
+            status,
+            exit_code,
+            message,
+            ..self.notify_frame(text)
         };
-        let _ = self
-            .send_notify(Some("completion"), Some("info"), None, text)
-            .await;
+        self.deliver_notify(frame).await;
     }
 
     fn name(&self) -> &'static str {
@@ -655,6 +704,9 @@ mod tests {
             level: Some("success"),
             title: None,
             text: "exit 0".into(),
+            status: None,
+            exit_code: None,
+            message: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert!(json.contains("\"type\":\"notify\""));
@@ -953,5 +1005,58 @@ mod tests {
         assert_eq!(ask(&backend).await.unwrap(), Decision::Approved);
         let mut rx = answerer.await.unwrap();
         assert!(rx.try_recv().is_err(), "unexpected frame after an answer");
+    }
+
+    /// #2741: a sudo ask goes out under its request id, so the completion notify, which
+    /// knows only the request id, names the answered ask (how foci finds the message).
+    /// Its outcome rides in the fields foci renders: exit_code, status, message.
+    #[tokio::test]
+    async fn test_completion_notify_names_the_sudo_ask() {
+        let (backend, mut rx) = backend_with_outbox();
+        let record = SudoRequestRecord {
+            id: "req-42".to_string(),
+            user: "rich".to_string(),
+            command: "ls".to_string(),
+            cwd: "/".to_string(),
+            pid: 1,
+            timestamp: chrono::Utc::now(),
+            status: Decision::Pending,
+            timeout_seconds: 60,
+            nonce: "n".to_string(),
+            decided_at: None,
+            decided_by: None,
+            reason: None,
+            stdin: None,
+            stdin_bytes: None,
+        };
+        let waited =
+            tokio::time::timeout(Duration::from_millis(20), backend.send_and_wait(&record)).await;
+        assert!(waited.is_err());
+        let ask: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(ask["id"], "req-42");
+        while rx.try_recv().is_ok() {} // the withdrawal
+
+        backend
+            .update_completion_status(&CompletionInfo {
+                request_id: "req-42".into(),
+                outcome: super::super::RunOutcome::NotRun {
+                    reason: "the requester disconnected".into(),
+                },
+            })
+            .await;
+        let n: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(n["type"], "notify");
+        assert_eq!(n["id"], "req-42");
+        assert_eq!(n["status"], "\u{274c} NOT run");
+        assert_eq!(n["message"], "the requester disconnected");
+        assert!(n.get("exit_code").is_none());
+
+        backend
+            .update_completion_status(&CompletionInfo::exited("req-42", 2, Some("boom".into())))
+            .await;
+        let n: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(n["id"], "req-42");
+        assert_eq!(n["exit_code"], 2);
+        assert_eq!(n["message"], "boom");
     }
 }

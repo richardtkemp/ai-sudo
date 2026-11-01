@@ -135,6 +135,14 @@ struct NotifyFrame<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<&'a str>,
     text: String,
+    /// foci renders a notify from these three fields, under the answered ask
+    /// whose id is `id` (foci internal/askgw NotifyFrame, #2741).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 /// Terminal or in-progress answer, as returned by `GET /askgw/ask/{id}`.
@@ -570,6 +578,32 @@ impl AskgwHttpBackend {
         deny_desc: String,
     ) -> Result<Decision> {
         let id = Uuid::new_v4().to_string();
+        self.ask_and_wait_with_id(
+            id,
+            header,
+            question,
+            approve_label,
+            deny_label,
+            approve_desc,
+            deny_desc,
+        )
+        .await
+    }
+
+    /// [`Self::ask_and_wait`] under a caller-chosen ask id. A sudo ask uses its request
+    /// id, so the completion `notify` (which carries only the request id) names the
+    /// answered ask, which is how foci finds the message to report on (#2741).
+    #[allow(clippy::too_many_arguments)]
+    async fn ask_and_wait_with_id(
+        &self,
+        id: String,
+        header: &str,
+        question: String,
+        approve_label: &str,
+        deny_label: &str,
+        approve_desc: String,
+        deny_desc: String,
+    ) -> Result<Decision> {
         let frame = AskFrame {
             protocol: PROTOCOL,
             frame_type: "ask",
@@ -670,20 +704,37 @@ impl AskgwHttpBackend {
         text: String,
     ) -> Result<()> {
         let frame = NotifyFrame {
+            kind,
+            level,
+            title,
+            ..self.notify_frame(text)
+        };
+        self.deliver_notify(frame).await;
+        Ok(())
+    }
+
+    /// A bare `notify` frame under a fresh id, for callers to fill in.
+    fn notify_frame(&self, text: String) -> NotifyFrame<'_> {
+        NotifyFrame {
             protocol: PROTOCOL,
             frame_type: "notify",
             id: Uuid::new_v4().to_string(),
             source: "aisudo",
             agent: self.agent.as_deref(),
-            kind,
-            level,
-            title,
+            kind: None,
+            level: None,
+            title: None,
             text,
-        };
+            status: None,
+            exit_code: None,
+            message: None,
+        }
+    }
+
+    async fn deliver_notify(&self, frame: NotifyFrame<'_>) {
         if let Err(e) = self.transport.notify(&frame).await {
             warn!("askgw_http: notify delivery failed: {e:#}");
         }
-        Ok(())
     }
 }
 
@@ -691,7 +742,8 @@ impl AskgwHttpBackend {
 impl NotificationBackend for AskgwHttpBackend {
     async fn send_and_wait(&self, record: &SudoRequestRecord) -> Result<Decision> {
         let question = super::askgw_sudo_question(record);
-        self.ask_and_wait(
+        self.ask_and_wait_with_id(
+            record.id.clone(),
             "Sudo",
             question,
             "Approve",
@@ -782,22 +834,18 @@ impl NotificationBackend for AskgwHttpBackend {
     }
 
     async fn update_completion_status(&self, info: &CompletionInfo) {
-        let text = if info.exit_code == 0 {
-            format!("Command completed: exit 0 (request {})", info.request_id)
-        } else {
-            let detail = info
-                .last_lines
-                .as_ref()
-                .map(|l| format!(": {l}"))
-                .unwrap_or_default();
-            format!(
-                "Command failed: exit {} (request {}){}",
-                info.exit_code, info.request_id, detail
-            )
+        let (level, text) = super::askgw_completion_notice(info);
+        let (status, exit_code, message) = super::askgw_completion_fields(info);
+        let frame = NotifyFrame {
+            id: info.request_id.clone(),
+            kind: Some("completion"),
+            level: Some(level),
+            status,
+            exit_code,
+            message,
+            ..self.notify_frame(text)
         };
-        let _ = self
-            .send_notify(Some("completion"), Some("info"), None, text)
-            .await;
+        self.deliver_notify(frame).await;
     }
 
     fn name(&self) -> &'static str {
@@ -897,6 +945,9 @@ mod tests {
             level: Some("success"),
             title: None,
             text: "exit 0".into(),
+            status: None,
+            exit_code: None,
+            message: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert!(json.contains("\"type\":\"notify\""));
@@ -918,6 +969,9 @@ mod tests {
             level: None,
             title: None,
             text: "hi".into(),
+            status: None,
+            exit_code: None,
+            message: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert!(!json.contains("agent"));
@@ -1342,11 +1396,7 @@ mod tests {
     async fn test_update_completion_status_success_delivers_notify() {
         let (backend, notify_calls, notify_frames) = notify_backend_with(Ok(()));
         backend
-            .update_completion_status(&CompletionInfo {
-                request_id: "req-1".into(),
-                exit_code: 0,
-                last_lines: None,
-            })
+            .update_completion_status(&CompletionInfo::exited("req-1", 0, None))
             .await;
         assert_eq!(notify_calls.load(Ordering::SeqCst), 1);
         let frames = notify_frames.lock().unwrap();
@@ -1360,11 +1410,7 @@ mod tests {
     async fn test_update_completion_status_failure_includes_last_lines() {
         let (backend, _calls, notify_frames) = notify_backend_with(Ok(()));
         backend
-            .update_completion_status(&CompletionInfo {
-                request_id: "req-2".into(),
-                exit_code: 1,
-                last_lines: Some("boom".into()),
-            })
+            .update_completion_status(&CompletionInfo::exited("req-2", 1, Some("boom".into())))
             .await;
         let frames = notify_frames.lock().unwrap();
         assert!(frames[0].3.contains("exit 1"));
@@ -1377,11 +1423,7 @@ mod tests {
         // caller (update_completion_status returns (), not Result).
         let (backend, notify_calls, _frames) = notify_backend_with(Err("network down".into()));
         backend
-            .update_completion_status(&CompletionInfo {
-                request_id: "req-3".into(),
-                exit_code: 0,
-                last_lines: None,
-            })
+            .update_completion_status(&CompletionInfo::exited("req-3", 0, None))
             .await;
         assert_eq!(notify_calls.load(Ordering::SeqCst), 1);
     }
@@ -1562,6 +1604,9 @@ mod tests {
             level: None,
             title: None,
             text: "t".into(),
+            status: None,
+            exit_code: None,
+            message: None,
         }
     }
 

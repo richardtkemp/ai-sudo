@@ -1,5 +1,6 @@
 use super::{
-    BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord,
+    BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, RunOutcome,
+    TempRuleRecord,
 };
 use crate::config::ConfigHolder;
 use crate::db::Database;
@@ -1151,19 +1152,32 @@ impl NotificationBackend for TelegramBackend {
         if let Some((_, (msg_id, original_text, approved_status, _))) =
             self.completion_map.remove(&info.request_id)
         {
-            let completion_text = if info.exit_code == 0 {
-                format!("{} \u{2192} Exit 0", approved_status)
-            } else {
-                let error_indicator = "\u{274c}";
-                let base = format!(
-                    "{} \u{2192} {} Exit {}",
-                    approved_status, error_indicator, info.exit_code
-                );
-                if let Some(ref last_lines) = info.last_lines {
-                    format!("{}\n<pre>{}</pre>", base, escape_html(last_lines))
-                } else {
-                    base
+            let completion_text = match &info.outcome {
+                RunOutcome::Exited { exit_code: 0, .. } => {
+                    format!("{} \u{2192} Exit 0", approved_status)
                 }
+                RunOutcome::Exited {
+                    exit_code,
+                    last_lines,
+                } => {
+                    let base = format!("{} \u{2192} \u{274c} Exit {}", approved_status, exit_code);
+                    if let Some(last_lines) = last_lines {
+                        format!("{}\n<pre>{}</pre>", base, escape_html(last_lines))
+                    } else {
+                        base
+                    }
+                }
+                // #2741: an approval that never became a run says so.
+                RunOutcome::NotRun { reason } => format!(
+                    "{} \u{2192} \u{274c} NOT run: {}",
+                    approved_status,
+                    escape_html(reason)
+                ),
+                RunOutcome::Unfinished { reason } => format!(
+                    "{} \u{2192} \u{26a0}\u{fe0f} Did not finish: {}",
+                    approved_status,
+                    escape_html(reason)
+                ),
             };
 
             let body = serde_json::json!({

@@ -18,7 +18,7 @@ Every frame includes `"protocol": "askgw/1"`.
 |-----------|------|---------|
 | Client → foci | `ask` | Present one or more questions to the human |
 | Client → foci | `cancel` | Withdraw a pending question |
-| Client → foci | `notify` | Informational (tolerated, no action taken) |
+| Client → foci | `notify` | Outcome of an answered ask: `id` = that ask's id; foci shows `exit_code` (✅/❌ "completed, exit N") or `status`, then `message`, on the ask's message |
 | foci → Client | `answer` | The human's response (or timeout/dismissed/unavailable) |
 | foci → Client | `ack` | Question accepted and presented to the human |
 | foci → Client | `error` | Validation failure or server error |

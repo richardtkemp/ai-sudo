@@ -190,11 +190,7 @@ mod tests {
             .is_ok());
         assert!(NoBackend.send_scrub_complete("id", "item").await.is_ok());
         NoBackend
-            .update_completion_status(&CompletionInfo {
-                request_id: "id".to_string(),
-                exit_code: 0,
-                last_lines: None,
-            })
+            .update_completion_status(&CompletionInfo::exited("id", 0, None))
             .await;
     }
 }

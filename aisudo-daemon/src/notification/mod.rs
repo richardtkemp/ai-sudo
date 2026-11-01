@@ -6,11 +6,71 @@ pub mod telegram;
 use aisudo_common::{Decision, SudoRequestRecord};
 use anyhow::Result;
 
-/// Information needed to update a notification with command completion status.
+/// Information needed to tell the approver what became of an approved command.
 pub struct CompletionInfo {
     pub request_id: String,
-    pub exit_code: i32,
-    pub last_lines: Option<String>,
+    pub outcome: RunOutcome,
+}
+
+/// What happened to a command after a human approved it (#2741). Before, the approver
+/// heard only about a command that ran to an exit; one that never ran said nothing,
+/// so an approval lost to a dead requester looked exactly like one that worked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// It ran and exited. `last_lines` is set only on a non-zero exit.
+    Exited {
+        exit_code: i32,
+        last_lines: Option<String>,
+    },
+    /// It never started (e.g. the requester was gone before it could run).
+    NotRun { reason: String },
+    /// It started but did not finish normally (e.g. killed when the requester left).
+    Unfinished { reason: String },
+}
+
+impl CompletionInfo {
+    #[cfg(test)]
+    pub fn exited(request_id: &str, exit_code: i32, last_lines: Option<String>) -> Self {
+        Self {
+            request_id: request_id.to_string(),
+            outcome: RunOutcome::Exited {
+                exit_code,
+                last_lines,
+            },
+        }
+    }
+}
+
+/// (level, text) of the askgw `notify` frame that reports a [`CompletionInfo`]; shared
+/// by the socket and HTTP askgw backends.
+pub(crate) fn askgw_completion_notice(info: &CompletionInfo) -> (&'static str, String) {
+    let id = &info.request_id;
+    match &info.outcome {
+        RunOutcome::Exited { exit_code: 0, .. } => {
+            ("info", format!("Command completed: exit 0 (request {id})"))
+        }
+        RunOutcome::Exited {
+            exit_code,
+            last_lines,
+        } => {
+            let detail = last_lines
+                .as_ref()
+                .map(|l| format!(": {l}"))
+                .unwrap_or_default();
+            (
+                "info",
+                format!("Command failed: exit {exit_code} (request {id}){detail}"),
+            )
+        }
+        RunOutcome::NotRun { reason } => (
+            "warning",
+            format!("\u{274c} Approved command NOT run: {reason} (request {id})"),
+        ),
+        RunOutcome::Unfinished { reason } => (
+            "warning",
+            format!("\u{26a0}\u{fe0f} Approved command did not finish: {reason} (request {id})"),
+        ),
+    }
 }
 
 /// Daemon-internal record for a pending temp rule request.
@@ -71,6 +131,28 @@ fn code_fence(command: &str) -> String {
     let longest = command.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat((longest + 1).max(3));
     format!("{fence}\n{command}\n{fence}")
+}
+
+/// (status, exit_code, message) of the completion `notify`, in the fields foci renders
+/// (foci internal/askgw NotifyFrame): an exit code gives "completed, exit N" with a tick
+/// or a cross; otherwise foci shows `status`, then `message` on its own line.
+pub(crate) fn askgw_completion_fields(
+    info: &CompletionInfo,
+) -> (Option<String>, Option<i32>, Option<String>) {
+    match &info.outcome {
+        RunOutcome::Exited {
+            exit_code,
+            last_lines,
+        } => (None, Some(*exit_code), last_lines.clone()),
+        RunOutcome::NotRun { reason } => {
+            (Some("\u{274c} NOT run".into()), None, Some(reason.clone()))
+        }
+        RunOutcome::Unfinished { reason } => (
+            Some("\u{26a0}\u{fe0f} did not finish".into()),
+            None,
+            Some(reason.clone()),
+        ),
+    }
 }
 
 /// Question text for a sudo request on the askgw backends (socket and HTTP).

@@ -24,7 +24,8 @@ use crate::config::{
 };
 use crate::db::Database;
 use crate::notification::{
-    BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord,
+    BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, RunOutcome,
+    TempRuleRecord,
 };
 use crate::sudoers::SudoersCache;
 
@@ -804,6 +805,7 @@ async fn handle_connection(
                 override_user_from_peer(&mut request.user, peer_uid);
                 handle_temp_rule_request(
                     request,
+                    &mut buf_reader,
                     &mut writer,
                     db,
                     backend,
@@ -826,7 +828,9 @@ async fn handle_connection(
             SocketMessage::BwGet(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
                 match &bw_ctx {
-                    Some(ctx) => handle_bw_get(request, &mut writer, db, backend, ctx).await,
+                    Some(ctx) => {
+                        handle_bw_get(request, &mut buf_reader, &mut writer, db, backend, ctx).await
+                    }
                     None => {
                         let resp = BwGetResponse {
                             request_id: String::new(),
@@ -947,6 +951,20 @@ async fn client_gone(reader: &mut BufReader<OwnedReadHalf>) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
+    }
+}
+
+/// `fut`, unless the client goes away first; then `None` and `fut` is dropped (#2741).
+/// Dropping a backend wait is what withdraws its prompt (see the askgw drop guards).
+/// `biased` so an answer already in hand wins over an EOF seen in the same poll.
+async fn unless_client_gone<F: std::future::Future>(
+    reader: &mut BufReader<OwnedReadHalf>,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        r = fut => Some(r),
+        () = client_gone(reader) => None,
     }
 }
 
@@ -1341,16 +1359,8 @@ async fn handle_sudo_request(
         // warn about (#1719). Sent before the wait, not after, or it would arrive too
         // late to be useful.
         send_status(writer, wants_status, RequestStatus::WaitingForHuman).await?;
-        // Race the human against the client going away (#2741). `biased` so an answer
-        // that is already in hand wins over an EOF seen in the same poll.
-        let waited = tokio::select! {
-            biased;
-            r = backend.send_and_wait(&record) => Some(r),
-            () = client_gone(reader) => None,
-        };
-        // Dropping the losing send_and_wait future is what withdraws the prompt: each
-        // askgw backend sends a cancel when its wait is abandoned (see their drop guards).
-        let Some(waited) = waited else {
+        // Race the human against the client going away (#2741).
+        let Some(waited) = unless_client_gone(reader, backend.send_and_wait(&record)).await else {
             warn!(
                 "Client disconnected while request {} awaited approval; withdrawing it",
                 record.id
@@ -1386,41 +1396,120 @@ async fn handle_sudo_request(
         error: error_msg,
     };
     let resp_json = serde_json::to_string(&response)?;
-    writer.write_all(resp_json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-
-    // If exec mode and approved, execute via shell (human approved the exact command)
-    if mode == RequestMode::Exec && decision == Decision::Approved {
-        // If check_binary_ownership is "all", validate even human-approved commands
-        if limits.check_binary_ownership == BinaryOwnershipCheck::All {
-            if let Err(reason) = check_ownership_with_strip(&command, &match_command, limits) {
-                deny_ownership(
-                    writer,
-                    request_id.clone(),
-                    &format!("Human-approved command rejected (ownership): {reason}"),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-        let exec_result = exec_command(&command, &cwd, stdin_bytes, writer, true, &user).await?;
-
-        // Update Telegram notification with completion status
-        backend
-            .update_completion_status(&CompletionInfo {
-                request_id,
-                exit_code: exec_result.exit_code,
-                last_lines: if exec_result.exit_code != 0 {
-                    exec_result.last_lines
-                } else {
-                    None
-                },
-            })
-            .await;
+    let sent = write_line(writer, &resp_json).await;
+    if decision != Decision::Approved {
+        return sent;
     }
 
+    // A human said yes: from here they are told what became of it, whatever happens
+    // (#2741). Before, an approval whose requester had just died ended in a Broken pipe
+    // here and the approver never heard that nothing ran.
+    let (outcome, result) = match sent {
+        Err(e) => {
+            warn!("Request {request_id} approved, but the requester is gone: not run ({e})");
+            (
+                RunOutcome::NotRun {
+                    reason: "the requester disconnected before it could run".to_string(),
+                },
+                Ok(()),
+            )
+        }
+        // PAM mode: the client runs the command itself, so the daemon cannot see whether
+        // it ran. The decision did reach the client.
+        Ok(()) if mode != RequestMode::Exec => return Ok(()),
+        Ok(()) => {
+            run_approved(
+                &command,
+                &match_command,
+                &cwd,
+                stdin_bytes,
+                writer,
+                &user,
+                &request_id,
+                limits,
+            )
+            .await
+        }
+    };
+    backend
+        .update_completion_status(&CompletionInfo {
+            request_id,
+            outcome,
+        })
+        .await;
+    result
+}
+
+/// Run a human-approved command (Exec mode) and say what became of it, for the approver.
+/// The `Result` is what the connection handler logs, as before #2741.
+#[allow(clippy::too_many_arguments)]
+async fn run_approved(
+    command: &str,
+    match_command: &str,
+    cwd: &str,
+    stdin_bytes: Option<Vec<u8>>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    user: &str,
+    request_id: &str,
+    limits: &LimitsConfig,
+) -> (RunOutcome, Result<()>) {
+    // If check_binary_ownership is "all", validate even human-approved commands
+    if limits.check_binary_ownership == BinaryOwnershipCheck::All {
+        if let Err(reason) = check_ownership_with_strip(command, match_command, limits) {
+            let result = deny_ownership(
+                writer,
+                request_id.to_string(),
+                &format!("Human-approved command rejected (ownership): {reason}"),
+            )
+            .await;
+            let outcome = RunOutcome::NotRun {
+                reason: format!("rejected by the binary ownership check: {reason}"),
+            };
+            return (outcome, result);
+        }
+    }
+    match exec_command(command, cwd, stdin_bytes, writer, true, user).await {
+        Ok(r) => (
+            RunOutcome::Exited {
+                exit_code: r.exit_code,
+                last_lines: if r.exit_code != 0 { r.last_lines } else { None },
+            },
+            Ok(()),
+        ),
+        Err(e) if e.is::<ClientGoneMidRun>() => (
+            RunOutcome::Unfinished {
+                reason: "the requester disconnected mid-run, so it was killed".to_string(),
+            },
+            Err(e),
+        ),
+        Err(e) => (
+            RunOutcome::Unfinished {
+                reason: format!("daemon error, it may not have run: {e:#}"),
+            },
+            Err(e),
+        ),
+    }
+}
+
+/// Write one protocol line to the client.
+async fn write_line(writer: &mut tokio::net::unix::OwnedWriteHalf, json: &str) -> Result<()> {
+    writer.write_all(json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
     Ok(())
 }
+
+/// `exec_command`'s error when the client went away mid-run and the child was killed, so
+/// the approver can be told it started but did not finish (#2741).
+#[derive(Debug)]
+struct ClientGoneMidRun;
+
+impl std::fmt::Display for ClientGoneMidRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("client disconnected")
+    }
+}
+
+impl std::error::Error for ClientGoneMidRun {}
 
 fn is_temp_rule_allowed(db: &Database, user: &str, command: &str) -> Result<bool> {
     // Try parsing as a command chain. If parsing fails, deny.
@@ -1442,6 +1531,7 @@ fn is_temp_rule_allowed(db: &Database, user: &str, command: &str) -> Result<bool
 
 async fn handle_temp_rule_request(
     request: TempRuleRequest,
+    reader: &mut BufReader<OwnedReadHalf>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     db: Arc<Database>,
     backend: Arc<dyn NotificationBackend>,
@@ -1517,7 +1607,15 @@ async fn handle_temp_rule_request(
         warn_no_backend_usage();
         (Decision::Denied, Some(NO_BACKEND_DENIAL_MSG.to_string()))
     } else {
-        match backend.send_temp_rule_and_wait(&record).await {
+        // Withdraw the ask if the requester goes away while it waits (#2741).
+        let Some(waited) =
+            unless_client_gone(reader, backend.send_temp_rule_and_wait(&record)).await
+        else {
+            warn!("Client disconnected while temp rule {id} awaited approval; withdrawing it");
+            db.update_temp_rule_decision(&id, Decision::Denied, Database::DECIDED_BY_CLIENT_GONE)?;
+            return Ok(());
+        };
+        match waited {
             Ok(d) => (d, None),
             Err(e) => {
                 error!("Notification backend error for temp rule {id}: {e:#}");
@@ -1649,6 +1747,7 @@ async fn handle_history(
 
 async fn handle_bw_get(
     request: aisudo_common::BwGetRequest,
+    reader: &mut BufReader<OwnedReadHalf>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     db: Arc<Database>,
     backend: Arc<dyn NotificationBackend>,
@@ -1729,7 +1828,14 @@ async fn handle_bw_get(
         bw_ctx.pending_unlocks.insert(id.clone(), tx);
 
         let timeout = std::time::Duration::from_secs(bw_ctx.timeout_seconds as u64);
-        match tokio::time::timeout(timeout, rx).await {
+        // Withdraw the request if the requester goes away while it waits (#2741): the
+        // unlock would otherwise approve a release nobody is left to receive.
+        let Some(unlocked) = unless_client_gone(reader, tokio::time::timeout(timeout, rx)).await
+        else {
+            bw_ctx.pending_unlocks.remove(&id);
+            return bw_client_gone(&db, &id);
+        };
+        match unlocked {
             Ok(Ok(())) => {
                 // Vault unlocked and request approved via web UI
                 info!("BW request {id} approved via web UI unlock");
@@ -1773,7 +1879,12 @@ async fn handle_bw_get(
         return Ok(());
     } else {
         // Vault unlocked: send Telegram approval request and wait
-        let decision = match backend.send_bw_request_and_wait(&record).await {
+        let Some(waited) =
+            unless_client_gone(reader, backend.send_bw_request_and_wait(&record)).await
+        else {
+            return bw_client_gone(&db, &id);
+        };
+        let decision = match waited {
             Ok(d) => d,
             Err(e) => {
                 error!("Notification backend error for BW request {id}: {e:#}");
@@ -1877,7 +1988,12 @@ async fn handle_bw_get(
             warn_no_backend_usage();
             (Decision::Denied, Some(NO_BACKEND_DENIAL_MSG.to_string()))
         } else {
-            match backend.send_bw_confirm_and_wait(&confirm_record).await {
+            let Some(waited) =
+                unless_client_gone(reader, backend.send_bw_confirm_and_wait(&confirm_record)).await
+            else {
+                return bw_client_gone(&db, &id);
+            };
+            match waited {
                 Ok(d) => (d, None),
                 Err(e) => {
                     error!("Confirmation notification error for BW request {id}: {e:#}");
@@ -1975,6 +2091,15 @@ async fn handle_bw_get(
         request.field
     );
 
+    Ok(())
+}
+
+/// A BW request whose requester disconnected while it waited for a human: record it as
+/// cancelled and stop (#2741). The caller has already dropped the wait, which withdraws
+/// the prompt on the askgw backends.
+fn bw_client_gone(db: &Database, id: &str) -> Result<()> {
+    warn!("Client disconnected while BW request {id} awaited approval; withdrawing it");
+    db.update_bw_request_status(id, "cancelled", Database::DECIDED_BY_CLIENT_GONE)?;
     Ok(())
 }
 
@@ -2209,7 +2334,7 @@ async fn exec_command(
             warn!("Client disconnected during command execution, killing child process");
             child.kill().await.ok();
             let _ = child.wait().await;
-            return Err(anyhow::anyhow!("client disconnected"));
+            return Err(ClientGoneMidRun.into());
         }
     }
 
@@ -6236,18 +6361,21 @@ mod tests {
             &self,
             _record: &crate::notification::TempRuleRecord,
         ) -> anyhow::Result<Decision> {
+            let _guard = SetOnDrop(Arc::clone(&self.abandoned));
             std::future::pending().await
         }
         async fn send_bw_request_and_wait(
             &self,
             _record: &crate::notification::BwRequestRecord,
         ) -> anyhow::Result<Decision> {
+            let _guard = SetOnDrop(Arc::clone(&self.abandoned));
             std::future::pending().await
         }
         async fn send_bw_confirm_and_wait(
             &self,
             _record: &crate::notification::BwConfirmRecord,
         ) -> anyhow::Result<Decision> {
+            let _guard = SetOnDrop(Arc::clone(&self.abandoned));
             std::future::pending().await
         }
         async fn send_bw_locked_notification(
@@ -6362,5 +6490,281 @@ mod tests {
             .unwrap();
         assert_eq!(status, "denied");
         assert_eq!(decided_by, crate::db::Database::DECIDED_BY_CLIENT_GONE);
+    }
+
+    /// Connect to a fresh handler like aisudo-cli does (send one line, keep the socket
+    /// open) and return the client's halves plus the handler task.
+    fn connect_handler(
+        db: Arc<crate::db::Database>,
+        backend: Arc<dyn crate::notification::NotificationBackend>,
+        bw_ctx: Option<Arc<BwHandlerContext>>,
+    ) -> (tokio::net::UnixStream, tokio::task::JoinHandle<Result<()>>) {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let sudoers = Arc::new(SudoersCache::new(0));
+        let handler = tokio::spawn(async move {
+            handle_connection(
+                server,
+                db,
+                backend,
+                sudoers,
+                60,
+                &[],
+                &[],
+                &std::collections::HashMap::new(),
+                &AllowlistArgs::new(),
+                test_limits(),
+                bw_ctx,
+            )
+            .await
+        });
+        (client, handler)
+    }
+
+    async fn send_line(client: &mut tokio::net::UnixStream, json: &str) {
+        client.write_all(json.as_bytes()).await.unwrap();
+        client.write_all(b"\n").await.unwrap();
+        client.flush().await.unwrap();
+    }
+
+    async fn handler_ends(handler: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), handler)
+            .await
+            .expect("daemon kept waiting for a human after the requester died")
+            .unwrap()
+    }
+
+    fn row(db_path: &std::path::Path, sql: &str) -> (String, String) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+    }
+
+    /// #2741, temp rules: the requester dies while its rule waits for a human.
+    #[tokio::test]
+    async fn client_disconnect_while_waiting_withdraws_temp_rule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(crate::db::Database::open(&db_path).unwrap());
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = Arc::new(MockHangBackend {
+            abandoned: Arc::clone(&abandoned),
+        });
+        let (mut client, handler) = connect_handler(db, backend, None);
+        send_line(
+            &mut client,
+            r#"{"type":"temp_rule_request","user":"u","patterns":["ls *"],"duration_seconds":60}"#,
+        )
+        .await;
+        // Let the handler reach the wait, then the client dies.
+        while !db_has_row(&db_path, "SELECT COUNT(*) FROM temp_rules") {
+            tokio::task::yield_now().await;
+        }
+        drop(client);
+
+        handler_ends(handler).await.unwrap();
+        assert!(abandoned.load(std::sync::atomic::Ordering::SeqCst));
+        let (status, by) = row(&db_path, "SELECT status, decided_by FROM temp_rules");
+        assert_eq!(status, "denied");
+        assert_eq!(by, crate::db::Database::DECIDED_BY_CLIENT_GONE);
+    }
+
+    fn db_has_row(db_path: &std::path::Path, count_sql: &str) -> bool {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(count_sql, [], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
+    /// #2741, Bitwarden (locked vault): the requester dies while the request waits for
+    /// a web unlock. The unlock must find nothing to release.
+    #[tokio::test]
+    async fn client_disconnect_while_waiting_withdraws_bw_request() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(crate::db::Database::open(&db_path).unwrap());
+        let pending_unlocks = Arc::new(DashMap::new());
+        let ctx = Arc::new(BwHandlerContext {
+            session: Arc::new(BwSessionManager::new(
+                std::path::PathBuf::from("/nonexistent/bw"),
+                900,
+            )),
+            max_rpm: 30,
+            session_log_dir: dir.path().to_path_buf(),
+            scrub_delay: 60,
+            pending_unlocks: Arc::clone(&pending_unlocks),
+            timeout_seconds: 60,
+            web_auth: Arc::new(crate::web_auth::WebAuth::new(None, 600, 900, 30)),
+        });
+        let backend = Arc::new(MockHangBackend {
+            abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let (mut client, handler) = connect_handler(db, backend, Some(ctx));
+        send_line(
+            &mut client,
+            r#"{"type":"bw_get","user":"u","item_name":"AWS"}"#,
+        )
+        .await;
+        while pending_unlocks.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        drop(client);
+
+        handler_ends(handler).await.unwrap();
+        assert!(
+            pending_unlocks.is_empty(),
+            "the unlock waiter was left behind"
+        );
+        let (status, by) = row(&db_path, "SELECT status, decided_by FROM bw_requests");
+        assert_eq!(status, "cancelled");
+        assert_eq!(by, crate::db::Database::DECIDED_BY_CLIENT_GONE);
+    }
+
+    /// Backend whose human answers when the test says so; records each completion
+    /// report the daemon sends to the approver.
+    struct MockGateBackend {
+        gate: std::sync::Mutex<Option<oneshot::Receiver<Decision>>>,
+        completions: Arc<std::sync::Mutex<Vec<RunOutcome>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::notification::NotificationBackend for MockGateBackend {
+        async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
+            let rx = self.gate.lock().unwrap().take().unwrap();
+            Ok(rx.await.unwrap_or(Decision::Denied))
+        }
+        async fn send_temp_rule_and_wait(
+            &self,
+            _record: &crate::notification::TempRuleRecord,
+        ) -> anyhow::Result<Decision> {
+            Ok(Decision::Denied)
+        }
+        async fn send_bw_request_and_wait(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<Decision> {
+            Ok(Decision::Denied)
+        }
+        async fn send_bw_confirm_and_wait(
+            &self,
+            _record: &crate::notification::BwConfirmRecord,
+        ) -> anyhow::Result<Decision> {
+            Ok(Decision::Denied)
+        }
+        async fn send_bw_locked_notification(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_scrub_complete(
+            &self,
+            _request_id: &str,
+            _item_name: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_completion_status(&self, info: &crate::notification::CompletionInfo) {
+            self.completions.lock().unwrap().push(info.outcome.clone());
+        }
+        fn name(&self) -> &'static str {
+            "mock_gate"
+        }
+    }
+
+    fn exec_request(command: &str) -> String {
+        serde_json::to_string(&SudoRequest {
+            user: "testuser".to_string(),
+            command: command.to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Exec,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
+            wants_status: true,
+        })
+        .unwrap()
+    }
+
+    /// #2741, the same-instant race: Dick taps Approve just as the requester dies, so
+    /// the answer wins the race but the command cannot run. He must be told it did not.
+    #[tokio::test]
+    async fn approval_for_a_dead_requester_reports_not_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("t.db")).unwrap());
+        let (approve, gate) = oneshot::channel();
+        let completions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = Arc::new(MockGateBackend {
+            gate: std::sync::Mutex::new(Some(gate)),
+            completions: Arc::clone(&completions),
+        });
+        let (client, handler) = connect_handler(db, backend, None);
+        let (reader, mut writer) = client.into_split();
+        writer
+            .write_all(format!("{}\n", exec_request("true")).as_bytes())
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("waiting_for_human"), "{line}");
+
+        // Both happen before the handler next runs: the approval is in hand when it
+        // sees the requester is gone.
+        drop(reader);
+        drop(writer);
+        approve.send(Decision::Approved).unwrap();
+
+        handler_ends(handler).await.unwrap();
+        let got = completions.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "approver not told: {got:?}");
+        assert!(
+            matches!(&got[0], RunOutcome::NotRun { .. }),
+            "approver told {got:?}"
+        );
+    }
+
+    /// The other side of the report: an approved command that runs says it exited.
+    #[tokio::test]
+    async fn approval_that_runs_reports_exit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("t.db")).unwrap());
+        let (approve, gate) = oneshot::channel();
+        approve.send(Decision::Approved).unwrap();
+        let completions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = Arc::new(MockGateBackend {
+            gate: std::sync::Mutex::new(Some(gate)),
+            completions: Arc::clone(&completions),
+        });
+        let (client, handler) = connect_handler(db, backend, None);
+        let (reader, mut writer) = client.into_split();
+        writer
+            .write_all(format!("{}\n", exec_request("exit 3")).as_bytes())
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut rest = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reader.read_to_string(&mut rest),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        handler_ends(handler).await.unwrap();
+        let got = completions.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            [RunOutcome::Exited {
+                exit_code: 3,
+                last_lines: None
+            }]
+        );
+        drop(writer);
     }
 }

@@ -82,7 +82,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -340,6 +340,40 @@ impl Transport for LongPollTransport {
     }
 }
 
+/// Withdraws a live ask when its wait is abandoned (#2741): the future was dropped, or the
+/// poll failed. `Transport::cancel` is async and `Drop` is not, so the cancel runs on a
+/// spawned task; with no runtime (never the case in the daemon) it is skipped and logged.
+struct HttpCancelOnDrop {
+    id: String,
+    reason: &'static str,
+    transport: Arc<dyn Transport>,
+    armed: bool,
+}
+
+impl Drop for HttpCancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (id, reason, transport) = (
+            std::mem::take(&mut self.id),
+            self.reason,
+            Arc::clone(&self.transport),
+        );
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tracing::info!("askgw_http: withdrawing ask {id} ({reason})");
+                handle.spawn(async move {
+                    if let Err(e) = transport.cancel(&id, reason).await {
+                        warn!("askgw_http: cancel {id} failed: {e:#}");
+                    }
+                });
+            }
+            Err(_) => warn!("askgw_http: no runtime to withdraw ask {id} ({reason})"),
+        }
+    }
+}
+
 /// Tries an ordered list of endpoints (primary first) — see the module doc
 /// "Primary + fallback endpoint" for when it moves to the next one. With a
 /// single endpoint it behaves exactly like that endpoint's transport.
@@ -347,8 +381,10 @@ struct FallbackTransport {
     /// (base URL for logs, transport), in preference order.
     endpoints: Vec<(String, Box<dyn Transport>)>,
     /// Ask id -> index of the endpoint that accepted its submit (or last
-    /// answered its poll). Removed when the ask reaches a terminal state,
-    /// is cancelled, or its poll fails on every endpoint.
+    /// answered its poll). Removed when the ask reaches a terminal state or
+    /// is cancelled. A failed poll keeps it: the backend cancels after a
+    /// failed poll (#2741), and that cancel must reach the endpoint holding
+    /// the ask first.
     pinned: Mutex<HashMap<String, usize>>,
 }
 
@@ -415,10 +451,8 @@ impl Transport for FallbackTransport {
                 Err(e) if send_failure_kind(&e).is_some() && self.has_next(pos, n) => {
                     warn!("askgw_http: {url} gave no response to poll {id}, trying next endpoint: {e:#}");
                 }
-                Err(e) => {
-                    self.pinned.lock().unwrap().remove(id);
-                    return Err(e);
-                }
+                // The pin stays: a cancel follows, and it clears the pin.
+                Err(e) => return Err(e),
             }
         }
         unreachable!("the last endpoint always returns")
@@ -460,7 +494,8 @@ impl Transport for FallbackTransport {
 }
 
 pub struct AskgwHttpBackend {
-    transport: Box<dyn Transport>,
+    /// `Arc` so [`HttpCancelOnDrop`] can run the cancel on a spawned task.
+    transport: Arc<dyn Transport>,
     /// Overall wait for a human decision — bounds the submit+poll loop.
     /// Mirrors the socket backend's `timeout` field/semantics exactly.
     timeout: Duration,
@@ -503,7 +538,7 @@ impl AskgwHttpBackend {
             })
             .collect();
         Ok(Self {
-            transport: Box::new(FallbackTransport::new(endpoints)),
+            transport: Arc::new(FallbackTransport::new(endpoints)),
             timeout,
             poll_wait,
             agent,
@@ -518,7 +553,7 @@ impl AskgwHttpBackend {
         agent: Option<String>,
     ) -> Self {
         Self {
-            transport,
+            transport: Arc::from(transport),
             timeout,
             poll_wait,
             agent,
@@ -561,10 +596,23 @@ impl AskgwHttpBackend {
 
         self.transport.submit(&frame).await?;
 
+        // From here the ask is live on the approver's device. If this future is dropped
+        // before a terminal answer (the requester disconnected, #2741) or the poll fails,
+        // the guard withdraws it so nobody can approve a request whose answer goes nowhere.
+        // The cancel goes through the same transport, so with a fallback endpoint it
+        // reaches the endpoint that accepted the ask first.
+        let mut guard = HttpCancelOnDrop {
+            id: id.clone(),
+            reason: "requester disconnected",
+            transport: Arc::clone(&self.transport),
+            armed: true,
+        };
+
         let deadline = Instant::now() + self.timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                guard.armed = false;
                 if let Err(e) = self.transport.cancel(&id, "timeout").await {
                     warn!("askgw_http: cancel {id} failed: {e:#}");
                 }
@@ -572,7 +620,12 @@ impl AskgwHttpBackend {
             }
             let wait = self.poll_wait.min(remaining);
 
-            match self.transport.poll(&id, wait).await {
+            let polled = self.transport.poll(&id, wait).await;
+            // Any status other than pending is terminal on the server: nothing to withdraw.
+            if matches!(&polled, Ok(a) if a.status != STATUS_PENDING) {
+                guard.armed = false;
+            }
+            match polled {
                 Ok(answer) => match answer.status.as_str() {
                     STATUS_PENDING => continue,
                     "answered" => {
@@ -597,6 +650,8 @@ impl AskgwHttpBackend {
                 Err(e) => {
                     // Fail closed at the call site (Err -> Decision::Denied),
                     // same convention as the socket backend on a hard failure.
+                    // The guard withdraws the ask: we have stopped listening for it.
+                    guard.reason = "poll failed";
                     return Err(e);
                 }
             }
@@ -906,16 +961,22 @@ mod tests {
             self.submit_result.clone().map_err(|e| anyhow!(e))
         }
 
-        async fn poll(&self, _id: &str, _wait: Duration) -> Result<AnswerFrame> {
+        async fn poll(&self, _id: &str, wait: Duration) -> Result<AnswerFrame> {
             self.poll_calls.fetch_add(1, Ordering::SeqCst);
-            let mut results = self.poll_results.lock().unwrap();
-            if results.is_empty() {
-                return Ok(AnswerFrame {
-                    status: STATUS_PENDING.into(),
-                    answers: HashMap::new(),
-                });
+            let next = {
+                let mut results = self.poll_results.lock().unwrap();
+                (!results.is_empty()).then(|| results.remove(0))
+            };
+            if let Some(r) = next {
+                return r.map_err(|e| anyhow!(e));
             }
-            results.remove(0).map_err(|e| anyhow!(e))
+            // Out of scripted answers: a long-poll that elapses with nothing, as the real
+            // server's does. Sleeping (not returning at once) lets a caller's timeout fire.
+            tokio::time::sleep(wait).await;
+            Ok(AnswerFrame {
+                status: STATUS_PENDING.into(),
+                answers: HashMap::new(),
+            })
         }
 
         async fn cancel(&self, _id: &str, _reason: &str) -> Result<()> {
@@ -1189,7 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_and_wait_poll_error_errs() {
-        let (backend, ..) = backend_with(
+        let (backend, _poll_calls, cancel_calls) = backend_with(
             FakeTransportSpec {
                 submit_result: Ok(()),
                 poll_results: vec![Err("network blip".into())],
@@ -1208,6 +1269,73 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+        // We stopped listening, so the ask must not stay approvable (#2741).
+        settle().await;
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Lets a cancel spawned from a drop guard run to completion.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// #2741: the caller drops the wait (the requester disconnected) while the ask is
+    /// live. The ask must be withdrawn, or the approver can approve into the void.
+    #[tokio::test]
+    async fn test_ask_and_wait_dropped_mid_wait_cancels() {
+        let (backend, poll_calls, cancel_calls) = backend_with(
+            FakeTransportSpec {
+                submit_result: Ok(()),
+                poll_results: vec![],
+            },
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+        );
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            backend.ask_and_wait(
+                "Sudo",
+                "q".into(),
+                "Approve",
+                "Deny",
+                "a".into(),
+                "d".into(),
+            ),
+        )
+        .await;
+        assert!(waited.is_err(), "the wait should still have been pending");
+        assert!(poll_calls.load(Ordering::SeqCst) > 0, "ask was never live");
+        settle().await;
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// An answered ask is finished on the server: no cancel follows it.
+    #[tokio::test]
+    async fn test_ask_and_wait_answered_does_not_cancel() {
+        let (backend, _poll_calls, cancel_calls) = backend_with(
+            FakeTransportSpec {
+                submit_result: Ok(()),
+                poll_results: FakeTransport::answered("Approve"),
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
+        let decision = backend
+            .ask_and_wait(
+                "Sudo",
+                "q".into(),
+                "Approve",
+                "Deny",
+                "a".into(),
+                "d".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, Decision::Approved);
+        settle().await;
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1368,8 +1496,12 @@ mod tests {
         async fn submit(&self, _frame: &AskFrame<'_>) -> Result<()> {
             self.result("submit").await
         }
-        async fn poll(&self, _id: &str, _wait: Duration) -> Result<AnswerFrame> {
+        async fn poll(&self, _id: &str, wait: Duration) -> Result<AnswerFrame> {
             self.result("poll").await?;
+            if matches!(self.outcome, Outcome::Pending) {
+                // A long-poll that elapses with no answer, so a caller's timeout can fire.
+                tokio::time::sleep(wait).await;
+            }
             Ok(AnswerFrame {
                 status: match self.outcome {
                     Outcome::Pending => STATUS_PENDING.into(),
@@ -1525,6 +1657,49 @@ mod tests {
         t.submit(&ask_frame("b")).await.unwrap();
         t.cancel("b", "timeout").await.unwrap();
         assert!(t.pinned.lock().unwrap().is_empty());
+    }
+
+    /// #2741: a failed poll keeps the pin, so the cancel that follows it goes to the
+    /// endpoint holding the ask first, not to the primary.
+    #[tokio::test]
+    async fn fallback_cancel_after_failed_poll_goes_to_pinned_endpoint() {
+        let (t, log) = fallback(Outcome::Ok, Outcome::HttpError);
+        t.pinned.lock().unwrap().insert("a".into(), 1);
+        t.poll("a", Duration::ZERO).await.unwrap_err();
+        t.cancel("a", "poll failed").await.unwrap_err();
+        assert_eq!(calls(&log), ["ts:poll", "ts:cancel"]);
+        assert!(t.pinned.lock().unwrap().is_empty());
+    }
+
+    /// #2741 with a fallback: the ask was accepted by the fallback (primary down), then
+    /// the requester disconnects. The withdrawal must reach the fallback, which holds it.
+    #[tokio::test]
+    async fn fallback_dropped_wait_cancels_on_accepting_endpoint() {
+        let (t, log) = fallback(Outcome::NotSent, Outcome::Pending);
+        let backend = AskgwHttpBackend::with_transport(
+            Box::new(t),
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+            None,
+        );
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            backend.ask_and_wait(
+                "Sudo",
+                "q".into(),
+                "Approve",
+                "Deny",
+                "a".into(),
+                "d".into(),
+            ),
+        )
+        .await;
+        assert!(waited.is_err(), "the wait should still have been pending");
+        settle().await;
+        let log = calls(&log);
+        assert_eq!(&log[..2], ["lan:submit", "ts:submit"]);
+        assert_eq!(log.last().map(String::as_str), Some("ts:cancel"), "{log:?}");
+        assert!(!log.contains(&"lan:cancel".to_string()), "{log:?}");
     }
 
     /// End to end over real sockets: the primary is a closed localhost port

@@ -187,6 +187,17 @@ impl AskgwBackend {
             ));
         }
 
+        // Armed from here until the wait ends by itself. If the caller drops this future
+        // first (the requester disconnected, #2741), the guard withdraws the prompt so
+        // nobody can approve a request whose answer would go nowhere.
+        let mut guard = CancelOnDrop {
+            id: id.clone(),
+            reason: "requester disconnected",
+            outbox: self.outbox.clone(),
+            pending: Arc::clone(&self.pending),
+            armed: true,
+        };
+
         let result = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(gateway_frame)) => map_answer(gateway_frame, approve_label),
             Ok(Err(_)) => {
@@ -194,17 +205,12 @@ impl AskgwBackend {
                 Ok(Decision::Denied)
             }
             Err(_) => {
-                self.pending.remove(&id);
-                let cancel = CancelFrame {
-                    protocol: PROTOCOL,
-                    frame_type: "cancel",
-                    id,
-                    reason: "timeout",
-                };
-                let _ = serde_json::to_string(&cancel).map(|j| self.outbox.try_send(j));
-                Ok(Decision::Timeout)
+                // Same withdrawal as a drop, with the timeout as the reason.
+                guard.reason = "timeout";
+                return Ok(Decision::Timeout);
             }
         };
+        guard.armed = false;
 
         result
     }
@@ -258,6 +264,48 @@ fn map_answer(frame: GatewayFrame, approve_label: &str) -> Result<Decision> {
             Ok(Decision::Denied)
         }
         _ => Ok(Decision::Denied),
+    }
+}
+
+/// Withdraws a pending ask when its wait ends without an answer: on timeout, or when the
+/// waiting future is dropped because the requester went away (#2741). Sync on purpose:
+/// `try_send` needs no runtime, so the cancel goes out even from a drop.
+struct CancelOnDrop {
+    id: String,
+    reason: &'static str,
+    outbox: mpsc::Sender<String>,
+    pending: Arc<DashMap<String, oneshot::Sender<GatewayFrame>>>,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn frame(&self) -> Option<String> {
+        serde_json::to_string(&CancelFrame {
+            protocol: PROTOCOL,
+            frame_type: "cancel",
+            id: self.id.clone(),
+            reason: self.reason,
+        })
+        .ok()
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.pending.remove(&self.id);
+        if let Some(json) = self.frame() {
+            if self.outbox.try_send(json).is_err() {
+                warn!(
+                    "askgw: could not send cancel for {} ({}): backend unavailable",
+                    self.id, self.reason
+                );
+            } else {
+                info!("askgw: withdrew ask {} ({})", self.id, self.reason);
+            }
+        }
     }
 }
 
@@ -840,5 +888,70 @@ mod tests {
             msg.contains("not a socket"),
             "error should mention socket: {msg}"
         );
+    }
+
+    fn backend_with_outbox() -> (AskgwBackend, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
+        let backend = AskgwBackend {
+            timeout: Duration::from_secs(60),
+            agent: None,
+            outbox: tx,
+            pending: Arc::new(DashMap::new()),
+        };
+        (backend, rx)
+    }
+
+    async fn ask(backend: &AskgwBackend) -> Result<Decision> {
+        backend
+            .ask_and_wait(
+                "Sudo",
+                "q".into(),
+                "Approve",
+                "Deny",
+                "a".into(),
+                "d".into(),
+            )
+            .await
+    }
+
+    /// #2741: the caller drops the wait (the requester disconnected). A cancel frame for
+    /// the same id must go to the gateway, so the prompt leaves the approver's device.
+    #[tokio::test]
+    async fn test_ask_dropped_mid_wait_sends_cancel() {
+        let (backend, mut rx) = backend_with_outbox();
+        let waited = tokio::time::timeout(Duration::from_millis(50), ask(&backend)).await;
+        assert!(waited.is_err(), "the wait should still have been pending");
+
+        let ask_frame: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(ask_frame["type"], "ask");
+        let cancel: serde_json::Value = serde_json::from_str(
+            &rx.try_recv()
+                .expect("no cancel frame after the wait was dropped"),
+        )
+        .unwrap();
+        assert_eq!(cancel["type"], "cancel");
+        assert_eq!(cancel["id"], ask_frame["id"]);
+        assert_eq!(cancel["reason"], "requester disconnected");
+        assert!(backend.pending.is_empty());
+    }
+
+    /// An answered ask is finished on the gateway: no cancel follows it.
+    #[tokio::test]
+    async fn test_ask_answered_sends_no_cancel() {
+        let (backend, mut rx) = backend_with_outbox();
+        let pending = Arc::clone(&backend.pending);
+        let answerer = tokio::spawn(async move {
+            let ask_frame: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            let id = ask_frame["id"].as_str().unwrap().to_string();
+            let answer = format!(
+                r#"{{"protocol":"askgw/1","type":"answer","id":"{id}","status":"answered","answers":{{"decision":"Approve"}}}}"#
+            );
+            handle_gateway_frame(&answer, &pending);
+            rx
+        });
+        assert_eq!(ask(&backend).await.unwrap(), Decision::Approved);
+        let mut rx = answerer.await.unwrap();
+        assert!(rx.try_recv().is_err(), "unexpected frame after an answer");
     }
 }

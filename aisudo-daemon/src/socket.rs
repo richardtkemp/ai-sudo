@@ -11,7 +11,8 @@ use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
@@ -785,6 +786,7 @@ async fn handle_connection(
                 override_user_from_peer(&mut request.user, peer_uid);
                 handle_sudo_request(
                     request,
+                    &mut buf_reader,
                     &mut writer,
                     db,
                     backend,
@@ -882,6 +884,7 @@ async fn handle_connection(
                 override_user_from_peer(&mut request.user, peer_uid);
                 handle_sudo_request(
                     request,
+                    &mut buf_reader,
                     &mut writer,
                     db,
                     backend,
@@ -929,6 +932,24 @@ fn override_user_from_peer(user: &mut String, peer_uid: u32) {
     *user = real_user;
 }
 
+/// Resolves once the client has gone away (#2741).
+///
+/// The protocol is one request line, then the daemon talks and the client only reads, so
+/// the client never writes again and never half-closes (aisudo-cli and aibw-cli are the
+/// only clients). EOF or a read error on the request socket therefore means the requester
+/// is dead: nobody is left to receive a decision or run the command. Stray bytes are
+/// ignored. Before this, a request whose client had died stayed approvable on the
+/// approver's device, and the approval was then lost to a Broken pipe.
+async fn client_gone(reader: &mut BufReader<OwnedReadHalf>) {
+    let mut buf = [0u8; 64];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
 /// Tell the client which path this request took, before the decision goes out (#1719).
 ///
 /// A no-op unless the client set `wants_status`, so an older CLI keeps seeing exactly the
@@ -955,6 +976,7 @@ async fn send_status(
 #[allow(clippy::too_many_arguments)]
 async fn handle_sudo_request(
     request: SudoRequest,
+    reader: &mut BufReader<OwnedReadHalf>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     db: Arc<Database>,
     backend: Arc<dyn NotificationBackend>,
@@ -1319,7 +1341,28 @@ async fn handle_sudo_request(
         // warn about (#1719). Sent before the wait, not after, or it would arrive too
         // late to be useful.
         send_status(writer, wants_status, RequestStatus::WaitingForHuman).await?;
-        match backend.send_and_wait(&record).await {
+        // Race the human against the client going away (#2741). `biased` so an answer
+        // that is already in hand wins over an EOF seen in the same poll.
+        let waited = tokio::select! {
+            biased;
+            r = backend.send_and_wait(&record) => Some(r),
+            () = client_gone(reader) => None,
+        };
+        // Dropping the losing send_and_wait future is what withdraws the prompt: each
+        // askgw backend sends a cancel when its wait is abandoned (see their drop guards).
+        let Some(waited) = waited else {
+            warn!(
+                "Client disconnected while request {} awaited approval; withdrawing it",
+                record.id
+            );
+            db.update_decision(
+                &record.id,
+                Decision::Denied,
+                Database::DECIDED_BY_CLIENT_GONE,
+            )?;
+            return Ok(());
+        };
+        match waited {
             Ok(d) => (d, None),
             Err(e) => {
                 error!(
@@ -3385,7 +3428,8 @@ mod tests {
         writer.write_all(request_json.as_bytes()).await.unwrap();
         writer.write_all(b"\n").await.unwrap();
         writer.flush().await.unwrap();
-        drop(writer); // close write end so handler knows there's no more data
+        // Keep the write half open until the reply is read, as aisudo-cli does: the daemon
+        // reads EOF on the request socket as the requester having died (#2741).
 
         let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
@@ -3397,6 +3441,7 @@ mod tests {
         .expect("timed out waiting for response")
         .unwrap();
 
+        drop(writer);
         let _ = handler.await;
         line.trim().to_string()
     }
@@ -5811,7 +5856,8 @@ mod tests {
         writer.write_all(request_json.as_bytes()).await.unwrap();
         writer.write_all(b"\n").await.unwrap();
         writer.flush().await.unwrap();
-        drop(writer);
+        // Keep the write half open until the reply is read, as aisudo-cli does: the daemon
+        // reads EOF on the request socket as the requester having died (#2741).
 
         let mut buf_reader = BufReader::new(reader);
         let mut out = Vec::new();
@@ -5832,6 +5878,7 @@ mod tests {
                 out.push(t);
             }
         }
+        drop(writer);
         let _ = handler.await;
         out
     }
@@ -6163,5 +6210,157 @@ mod tests {
             .await;
             assert_eq!(out.trim(), "0022", "{what}");
         }
+    }
+
+    /// Backend whose human never answers. Records when the daemon abandons the wait,
+    /// i.e. drops the `send_and_wait` future (which is what withdraws a real prompt).
+    struct MockHangBackend {
+        abandoned: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::notification::NotificationBackend for MockHangBackend {
+        async fn send_and_wait(&self, _record: &SudoRequestRecord) -> anyhow::Result<Decision> {
+            let _guard = SetOnDrop(Arc::clone(&self.abandoned));
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn send_temp_rule_and_wait(
+            &self,
+            _record: &crate::notification::TempRuleRecord,
+        ) -> anyhow::Result<Decision> {
+            std::future::pending().await
+        }
+        async fn send_bw_request_and_wait(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<Decision> {
+            std::future::pending().await
+        }
+        async fn send_bw_confirm_and_wait(
+            &self,
+            _record: &crate::notification::BwConfirmRecord,
+        ) -> anyhow::Result<Decision> {
+            std::future::pending().await
+        }
+        async fn send_bw_locked_notification(
+            &self,
+            _record: &crate::notification::BwRequestRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_access_link(&self, _url: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_scrub_complete(
+            &self,
+            _request_id: &str,
+            _item_name: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_completion_status(&self, _info: &crate::notification::CompletionInfo) {}
+        fn name(&self) -> &'static str {
+            "mock_hang"
+        }
+    }
+
+    /// #2741: the requester dies while its request waits for a human. The daemon must
+    /// abandon the wait (withdrawing the prompt) and record the request as withdrawn,
+    /// instead of leaving it approvable until a tap that then hits a Broken pipe.
+    #[tokio::test]
+    async fn client_disconnect_while_waiting_withdraws_request() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(crate::db::Database::open(&db_path).unwrap());
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend: Arc<dyn crate::notification::NotificationBackend> =
+            Arc::new(MockHangBackend {
+                abandoned: Arc::clone(&abandoned),
+            });
+
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: "ls /root".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Exec,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
+            wants_status: true,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let sudoers = Arc::new(SudoersCache::new(0));
+        let db2 = Arc::clone(&db);
+        let handler = tokio::spawn(async move {
+            handle_connection(
+                server,
+                db2,
+                backend,
+                sudoers,
+                60,
+                &[],
+                &[],
+                &std::collections::HashMap::new(),
+                &AllowlistArgs::new(),
+                test_limits(),
+                None,
+            )
+            .await
+        });
+
+        // Behave like aisudo-cli: send the request, keep the socket open, read.
+        let (reader, mut writer) = client.into_split();
+        writer.write_all(json.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            buf_reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out waiting for the status frame")
+        .unwrap();
+        assert!(line.contains("waiting_for_human"), "{line}");
+        assert!(!abandoned.load(std::sync::atomic::Ordering::SeqCst));
+
+        // The client dies (its Bash tool call was stopped).
+        drop(buf_reader);
+        drop(writer);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), handler)
+            .await
+            .expect("daemon kept waiting for a human after the requester died")
+            .unwrap()
+            .unwrap();
+        assert!(
+            abandoned.load(std::sync::atomic::Ordering::SeqCst),
+            "the backend wait (and so the prompt) was not abandoned"
+        );
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (status, decided_by): (String, String) = conn
+            .query_row(
+                "SELECT status, decided_by FROM requests WHERE command = 'ls /root'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "denied");
+        assert_eq!(decided_by, crate::db::Database::DECIDED_BY_CLIENT_GONE);
     }
 }

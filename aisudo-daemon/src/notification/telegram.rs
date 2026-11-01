@@ -828,10 +828,30 @@ impl TelegramBackend {
             _ => return,
         };
 
+        // Deliver the decision FIRST, so the approver is told whether it landed (#2741).
+        // A waiter that is gone (its requester disconnected, or the request already timed
+        // out) cannot act on the tap; saying "Approved!" then would claim a command ran
+        // when it never did.
+        let delivered = match self.pending.remove(&pending_key) {
+            Some((_, sender)) => {
+                info!("Delivering {decision:?} for {pending_key}");
+                sender.send(decision).is_ok()
+            }
+            None => false,
+        };
+        if !delivered {
+            warn!("No live request for callback {pending_key}: requester gone, nothing run");
+        }
+
         // Answer the callback query to dismiss the loading indicator
+        let answer_text = match (delivered, decision) {
+            (false, _) => "Request no longer pending: NOT run.",
+            (true, Decision::Approved) => "Approved!",
+            (true, _) => "Denied.",
+        };
         let answer_body = serde_json::json!({
             "callback_query_id": cb.id,
-            "text": if decision == Decision::Approved { "Approved!" } else { "Denied." }
+            "text": answer_text
         });
         let _ = self
             .client
@@ -842,13 +862,16 @@ impl TelegramBackend {
 
         // Edit the message to replace buttons with status
         let time = Local::now().format("%H:%M:%S");
-        let status_line = match decision {
-            Decision::Approved => format!("\u{2705} Approved at {time}"),
-            Decision::Denied => format!("\u{274c} Denied at {time}"),
-            _ => format!("{decision:?} at {time}"),
+        let status_line = match (delivered, decision) {
+            (false, _) => {
+                format!("\u{26a0}\u{fe0f} Requester gone at {time}: request withdrawn, NOT run")
+            }
+            (true, Decision::Approved) => format!("\u{2705} Approved at {time}"),
+            (true, Decision::Denied) => format!("\u{274c} Denied at {time}"),
+            (true, _) => format!("{decision:?} at {time}"),
         };
         if let Some((_, (msg_id, original_text, _))) = self.message_map.remove(&pending_key) {
-            if decision == Decision::Approved {
+            if delivered && decision == Decision::Approved {
                 self.completion_map.insert(
                     pending_key.clone(),
                     (
@@ -862,14 +885,6 @@ impl TelegramBackend {
             let _ = self
                 .edit_message_status(msg_id, &original_text, &status_line)
                 .await;
-        }
-
-        // Deliver the decision to the waiting request
-        if let Some((_, sender)) = self.pending.remove(&pending_key) {
-            info!("Delivering {decision:?} for {pending_key}");
-            let _ = sender.send(decision);
-        } else {
-            warn!("No pending request for callback: {pending_key}");
         }
     }
 }

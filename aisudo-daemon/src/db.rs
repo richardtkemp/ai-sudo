@@ -200,13 +200,17 @@ impl Database {
 
     /// `decided_by` values the daemon writes when it approves a request WITHOUT
     /// involving a human: an allowlist match, an active temp rule, and a sudoers
-    /// NOPASSWD match. Every other value is a backend name (telegram, askgw), i.e. a
-    /// human said yes. socket.rs must write exactly these, which is why they are
+    /// NOPASSWD match. Every other value is either a backend name (telegram, askgw),
+    /// i.e. a human decided, or [`Self::DECIDED_BY_CLIENT_GONE`]. socket.rs must write exactly these, which is why they are
     /// constants here rather than literals at the call sites — `rate_limit_filter`
     /// reads them back out of the DB and a drift would silently stop excluding.
     pub const DECIDED_BY_ALLOWLIST: &'static str = "allowlist";
     pub const DECIDED_BY_TEMP_RULE: &'static str = "temp_rule";
     pub const DECIDED_BY_NOPASSWD: &'static str = "nopasswd";
+    /// The requester disconnected while its request waited for a human, so the daemon
+    /// withdrew it (#2741). Recorded as denied. It still counts towards the rate limit:
+    /// a human was paged.
+    pub const DECIDED_BY_CLIENT_GONE: &'static str = "client_disconnected";
 
     /// Extra WHERE clause for the rate-limit COUNT, implementing
     /// `limits.rate_limit_count_allowlisted`.

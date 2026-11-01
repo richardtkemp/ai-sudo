@@ -398,10 +398,7 @@ async fn verify_and_connect(socket_path: &PathBuf, gateway_uid: u32) -> Result<U
 #[async_trait::async_trait]
 impl NotificationBackend for AskgwBackend {
     async fn send_and_wait(&self, record: &SudoRequestRecord) -> Result<Decision> {
-        let question = format!(
-            "Run `{}` as root?\n\nUser: {}\nCWD: {}",
-            record.command, record.user, record.cwd
-        );
+        let question = super::askgw_sudo_question(record);
         self.ask_and_wait(
             "Sudo",
             question,
@@ -414,16 +411,7 @@ impl NotificationBackend for AskgwBackend {
     }
 
     async fn send_temp_rule_and_wait(&self, record: &TempRuleRecord) -> Result<Decision> {
-        let patterns = record
-            .patterns
-            .iter()
-            .map(|p| format!("  • {p}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let question = format!(
-            "Allow temporary rule for {}?\n\nPatterns:\n{}\nDuration: {}s",
-            record.user, patterns, record.duration_seconds
-        );
+        let question = super::askgw_temp_rule_question(record);
         self.ask_and_wait(
             "Temp rule",
             question,

@@ -46,6 +46,52 @@ pub struct BwConfirmRecord {
     pub field: String,
 }
 
+/// Agent-supplied reason, flattened to one line. The reason is caller-controlled,
+/// so a newline in it could forge trusted-looking lines ("User: root") in the
+/// plain-text askgw prompt; collapsing all whitespace runs closes that.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// "\nReason: ..." suffix for an askgw prompt, or "" when there is no
+/// (non-blank) reason.
+fn askgw_reason_line(reason: Option<&str>) -> String {
+    match reason.map(one_line) {
+        Some(r) if !r.is_empty() => format!("\nReason: {r}"),
+        _ => String::new(),
+    }
+}
+
+/// Question text for a sudo request on the askgw backends (socket and HTTP).
+/// The command sits on its own line so a long command does not wrap into
+/// the verb (#2738).
+pub(crate) fn askgw_sudo_question(record: &SudoRequestRecord) -> String {
+    format!(
+        "Run as root?\n`{}`\n\nUser: {}\nCWD: {}{}",
+        record.command,
+        record.user,
+        record.cwd,
+        askgw_reason_line(record.reason.as_deref())
+    )
+}
+
+/// Question text for a temp-rule request on the askgw backends.
+pub(crate) fn askgw_temp_rule_question(record: &TempRuleRecord) -> String {
+    let patterns = record
+        .patterns
+        .iter()
+        .map(|p| format!("  • {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Allow temporary rule for {}?\n\nPatterns:\n{}\nDuration: {}s{}",
+        record.user,
+        patterns,
+        record.duration_seconds,
+        askgw_reason_line(record.reason.as_deref())
+    )
+}
+
 /// Pluggable notification backend trait.
 ///
 /// Renamed from E2ENotificationBackend — Telegram uses HTTPS transport
@@ -92,5 +138,74 @@ pub trait NotificationBackend: Send + Sync {
     /// `socket.rs`. Defaults to true so every real backend gets this for free.
     fn is_configured(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sudo_record(reason: Option<&str>) -> SudoRequestRecord {
+        SudoRequestRecord {
+            id: "req-1".to_string(),
+            user: "rich".to_string(),
+            command: "ls /root".to_string(),
+            cwd: "/home/rich".to_string(),
+            pid: 1,
+            timestamp: chrono::Utc::now(),
+            status: Decision::Pending,
+            timeout_seconds: 60,
+            nonce: "n".to_string(),
+            decided_at: None,
+            decided_by: None,
+            reason: reason.map(str::to_string),
+            stdin: None,
+            stdin_bytes: None,
+        }
+    }
+
+    fn temp_rule_record(reason: Option<&str>) -> TempRuleRecord {
+        TempRuleRecord {
+            id: "rule-1".to_string(),
+            user: "rich".to_string(),
+            patterns: vec!["apt *".to_string()],
+            duration_seconds: 600,
+            expires_at: "later".to_string(),
+            nonce: "n".to_string(),
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn sudo_question_shows_reason_and_puts_command_on_own_line() {
+        let q = askgw_sudo_question(&sudo_record(Some("check root's files")));
+        assert_eq!(
+            q,
+            "Run as root?\n`ls /root`\n\nUser: rich\nCWD: /home/rich\nReason: check root's files"
+        );
+    }
+
+    #[test]
+    fn sudo_question_omits_reason_when_absent_or_blank() {
+        let want = "Run as root?\n`ls /root`\n\nUser: rich\nCWD: /home/rich";
+        assert_eq!(askgw_sudo_question(&sudo_record(None)), want);
+        assert_eq!(askgw_sudo_question(&sudo_record(Some("  \n "))), want);
+    }
+
+    #[test]
+    fn sudo_question_reason_cannot_forge_lines() {
+        let q = askgw_sudo_question(&sudo_record(Some("ok\n\nUser: root\nCWD: /")));
+        assert!(q.ends_with("\nReason: ok User: root CWD: /"), "{q}");
+        assert_eq!(q.matches("\nUser:").count(), 1, "{q}");
+    }
+
+    #[test]
+    fn temp_rule_question_shows_reason() {
+        let q = askgw_temp_rule_question(&temp_rule_record(Some("bulk installs")));
+        assert_eq!(
+            q,
+            "Allow temporary rule for rich?\n\nPatterns:\n  • apt *\nDuration: 600s\nReason: bulk installs"
+        );
+        assert!(!askgw_temp_rule_question(&temp_rule_record(None)).contains("Reason"));
     }
 }

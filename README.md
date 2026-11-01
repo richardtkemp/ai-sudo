@@ -145,10 +145,12 @@ chat_id = 123456789
 # [askgw] wins if both are set. Requires foci's [askgw] http_enabled = true.
 # [askgw_http]
 # endpoint = "https://foci.example.ts.net"  # foci's HTTP server base URL
+# fallback_endpoint = "http://100.x.y.z:8080"  # optional: tried when endpoint is unreachable
 # api_key = "your-foci-http-api-key"        # same value as foci's http.api_key
 # agent = "clutch"                          # optional: route asks to a specific agent
 # poll_wait_seconds = 20                    # long-poll GET wait
 # request_timeout_seconds = 30              # HTTP client timeout per request
+# connect_timeout_seconds = 5               # bounds the wait before trying fallback_endpoint
 
 [limits]
 check_binary_ownership = "auto"  # "off", "auto" (allowlist/temp rules only), or "all" (including Telegram-approved)

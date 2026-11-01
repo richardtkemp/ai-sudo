@@ -147,6 +147,10 @@
 # Base URL of foci's HTTP server. No trailing slash.
 # endpoint = "https://foci.example.ts.net"
 #
+# Optional fallback base URL, tried only when `endpoint` cannot be reached
+# (e.g. endpoint = foci's LAN address, fallback = its Tailscale address).
+# fallback_endpoint = "https://foci.example.ts.net"
+#
 # SAME value as foci's `http.api_key` secret. Sent as a bearer token.
 # api_key = "your-foci-http-api-key"
 #
@@ -160,6 +164,10 @@
 # HTTP client timeout per request (submit/poll/cancel), in seconds. Should
 # exceed poll_wait_seconds by a margin.
 # request_timeout_seconds = 30
+#
+# Connect timeout per request, in seconds: how long an unreachable endpoint
+# delays the move to fallback_endpoint.
+# connect_timeout_seconds = 5
 
 # Telegram backend: the original approval channel, and the simplest to set
 # up for a single standalone host (no foci install needed).

@@ -58,17 +58,19 @@ async fn main() -> Result<()> {
         );
         Arc::new(askgw)
     } else if let Some(ref http_config) = config.askgw_http {
+        let endpoints = http_config.endpoints();
         let askgw_http = AskgwHttpBackend::new(
-            http_config.endpoint.clone(),
+            endpoints.clone(),
             http_config.api_key.clone(),
             http_config.agent.clone(),
             std::time::Duration::from_secs(config.timeout_seconds as u64),
             std::time::Duration::from_secs(http_config.poll_wait_seconds as u64),
             std::time::Duration::from_secs(http_config.request_timeout_seconds as u64),
+            std::time::Duration::from_secs(http_config.connect_timeout_seconds as u64),
         )?;
         info!(
-            "askgw_http notification backend enabled (endpoint: {})",
-            http_config.endpoint
+            "askgw_http notification backend enabled (endpoints, in order: {})",
+            endpoints.join(", ")
         );
         Arc::new(askgw_http)
     } else if let Some(ref tg_config) = config.telegram {

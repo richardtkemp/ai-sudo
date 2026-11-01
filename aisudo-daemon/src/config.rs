@@ -133,8 +133,16 @@ pub struct AskgwConfig {
 pub struct AskgwHttpConfig {
     /// Base URL of foci's HTTP server, e.g. "https://foci.example.ts.net".
     /// No trailing slash. The backend appends /askgw/ask, /askgw/ask/{id},
-    /// and /askgw/ask/{id}/cancel.
+    /// and /askgw/ask/{id}/cancel. The PRIMARY endpoint when
+    /// `fallback_endpoint` is set.
     pub endpoint: String,
+
+    /// Optional second base URL, tried when `endpoint` cannot be reached
+    /// (e.g. `endpoint` = foci's LAN address, this = its Tailscale address,
+    /// so approvals still work off the home LAN). See notification::askgw_http
+    /// "Primary + fallback endpoint" for exactly when a request moves here.
+    #[serde(default)]
+    pub fallback_endpoint: Option<String>,
 
     /// Bearer token — the SAME value as foci's `http.api_key` secret. Sent as
     /// `Authorization: Bearer <api_key>` on every request, mirroring foci's
@@ -158,6 +166,21 @@ pub struct AskgwHttpConfig {
     /// response itself isn't cut off by the client's own request timeout.
     #[serde(default = "default_askgw_http_request_timeout")]
     pub request_timeout_seconds: u32,
+
+    /// TCP/TLS connect timeout per request, in seconds. Bounds how long an
+    /// unreachable endpoint (e.g. a LAN address blackholed on a foreign
+    /// network) delays the move to `fallback_endpoint`.
+    #[serde(default = "default_askgw_http_connect_timeout")]
+    pub connect_timeout_seconds: u32,
+}
+
+impl AskgwHttpConfig {
+    /// Base URLs in preference order: `endpoint`, then `fallback_endpoint`.
+    pub fn endpoints(&self) -> Vec<String> {
+        std::iter::once(self.endpoint.clone())
+            .chain(self.fallback_endpoint.clone())
+            .collect()
+    }
 }
 
 fn default_askgw_http_poll_wait() -> u32 {
@@ -166,6 +189,10 @@ fn default_askgw_http_poll_wait() -> u32 {
 
 fn default_askgw_http_request_timeout() -> u32 {
     30
+}
+
+fn default_askgw_http_connect_timeout() -> u32 {
+    5
 }
 
 fn default_socket_path() -> PathBuf {
@@ -1379,5 +1406,27 @@ scrub_delay = 300
                 i + 1
             );
         }
+    }
+
+    #[test]
+    fn askgw_http_endpoint_only_still_parses() {
+        // A pre-#2742 config: only `endpoint`, no fallback/connect timeout.
+        let c: AskgwHttpConfig =
+            toml::from_str("endpoint = \"http://a:1\"\napi_key = \"k\"\n").unwrap();
+        assert_eq!(c.endpoints(), vec!["http://a:1".to_string()]);
+        assert_eq!(c.connect_timeout_seconds, 5);
+    }
+
+    #[test]
+    fn askgw_http_fallback_endpoint_comes_second() {
+        let c: AskgwHttpConfig = toml::from_str(
+            "endpoint = \"http://lan:1\"\nfallback_endpoint = \"http://ts:1\"\napi_key = \"k\"\nconnect_timeout_seconds = 2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.endpoints(),
+            vec!["http://lan:1".to_string(), "http://ts:1".to_string()]
+        );
+        assert_eq!(c.connect_timeout_seconds, 2);
     }
 }

@@ -68,11 +68,7 @@ fn askgw_reason_line(reason: Option<&str>) -> String {
 /// fence is longer than any backtick run in the command, so no line of the
 /// (caller-controlled) command can close it early and spill text out as prose.
 fn code_fence(command: &str) -> String {
-    let longest = command
-        .split(|c| c != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
+    let longest = command.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat((longest + 1).max(3));
     format!("{fence}\n{command}\n{fence}")
 }

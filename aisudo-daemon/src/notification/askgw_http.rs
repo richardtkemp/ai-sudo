@@ -48,6 +48,31 @@
 //! error or non-2xx) is logged and swallowed, never propagated to the
 //! caller — these are informational, same as the socket backend's
 //! `try_send`-and-drop.
+//!
+//! # Primary + fallback endpoint (#2742)
+//!
+//! `[askgw_http]` takes an optional `fallback_endpoint` next to `endpoint`
+//! (e.g. foci's LAN address primary, its Tailscale address fallback, so an
+//! approval still reaches Dick when the host is off the home LAN).
+//! [`FallbackTransport`] tries the endpoints in order, and moves on ONLY when
+//! the request cannot have had an effect on the endpoint it left:
+//!
+//! - `submit` and `notify` move on only when the request was NOT SENT (the
+//!   connection could not be made: refused, no route, DNS, connect timeout).
+//!   A request that was sent but got no response may already have created
+//!   the ask or posted the message; resubmitting it elsewhere would show
+//!   Dick a duplicate (two servers) or be rejected as `duplicate_id` (one
+//!   server reached by two addresses — foci's askgw HTTP handler keys on the
+//!   ask id). So that failure is returned as before.
+//! - `poll` and `cancel` are idempotent, so they move on after any failure
+//!   that produced no HTTP response. They start at the endpoint that
+//!   accepted the submit (the ask lives there), then try the others. Any
+//!   HTTP response (e.g. 404 unknown id from a different server) ends the
+//!   attempt as before — fail closed.
+//!
+//! A `connect_timeout` on the HTTP client bounds how long an unreachable
+//! address (a LAN IP blackholed on a foreign network) holds up the move to
+//! the next endpoint.
 
 use super::{
     BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, TempRuleRecord,
@@ -57,6 +82,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -153,14 +179,62 @@ trait Transport: Send + Sync {
     async fn poll(&self, id: &str, wait: Duration) -> Result<AnswerFrame>;
 
     /// Best-effort withdrawal of a pending ask (e.g. on client-side timeout).
-    /// Errors are logged, not propagated — cancellation is a courtesy to free
-    /// server-side state, not required for correctness on this side.
-    async fn cancel(&self, id: &str, reason: &str);
+    /// The caller logs an `Err`, never propagates it — cancellation is a
+    /// courtesy to free server-side state, not required for correctness on
+    /// this side. (It returns `Result` so [`FallbackTransport`] can tell an
+    /// unreachable endpoint from a delivered cancel.)
+    async fn cancel(&self, id: &str, reason: &str) -> Result<()>;
 
     /// Deliver a fire-and-forget `notify` frame. `Err` means delivery failed
     /// (network error or non-2xx) — the caller logs and swallows it, same
     /// convention as `cancel`.
     async fn notify(&self, frame: &NotifyFrame<'_>) -> Result<()>;
+}
+
+/// Why a request produced no HTTP response. Carried inside the `anyhow::Error`
+/// a [`LongPollTransport`] call returns, so [`FallbackTransport`] can decide
+/// whether moving to the next endpoint is safe (see module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFailureKind {
+    /// The connection was never made, so the server saw nothing.
+    NotSent,
+    /// The request may have reached the server (e.g. timed out waiting for
+    /// the response). Its effect on the server is unknown.
+    NoResponse,
+}
+
+#[derive(Debug)]
+struct SendFailure {
+    kind: SendFailureKind,
+    op: &'static str,
+    source: reqwest::Error,
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "askgw_http: {} request failed: {}", self.op, self.source)
+    }
+}
+
+impl std::error::Error for SendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn send_failure(op: &'static str, source: reqwest::Error) -> anyhow::Error {
+    let kind = if source.is_connect() {
+        SendFailureKind::NotSent
+    } else {
+        SendFailureKind::NoResponse
+    };
+    anyhow::Error::new(SendFailure { kind, op, source })
+}
+
+/// The [`SendFailureKind`] of `e`, or `None` when `e` is not a send failure
+/// (an HTTP error response, a malformed body, ...).
+fn send_failure_kind(e: &anyhow::Error) -> Option<SendFailureKind> {
+    e.downcast_ref::<SendFailure>().map(|f| f.kind)
 }
 
 /// [`Transport`] impl for the ASSUMED contract: `POST /askgw/ask`, `GET
@@ -187,7 +261,7 @@ impl Transport for LongPollTransport {
             .json(frame)
             .send()
             .await
-            .map_err(|e| anyhow!("askgw_http: submit request failed: {e}"))?;
+            .map_err(|e| send_failure("submit", e))?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -214,7 +288,7 @@ impl Transport for LongPollTransport {
             .query(&[("wait", wait.as_secs().to_string())])
             .send()
             .await
-            .map_err(|e| anyhow!("askgw_http: poll request failed: {e}"))?;
+            .map_err(|e| send_failure("poll", e))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(anyhow!("askgw_http: poll: unknown ask id {id:?}"));
@@ -227,25 +301,23 @@ impl Transport for LongPollTransport {
             .map_err(|e| anyhow!("askgw_http: poll: malformed answer body: {e}"))
     }
 
-    async fn cancel(&self, id: &str, reason: &str) {
-        let result = self
+    async fn cancel(&self, id: &str, reason: &str) -> Result<()> {
+        let resp = self
             .client
             .post(self.url(&format!("/askgw/ask/{id}/cancel")))
             .bearer_auth(&self.api_key)
             .json(&serde_json::json!({"reason": reason}))
             .send()
-            .await;
-        match result {
-            Ok(resp) if resp.status().is_success() => {
-                debug!("askgw_http: cancelled {id} ({reason})");
-            }
-            Ok(resp) => {
-                warn!("askgw_http: cancel {id} returned HTTP {}", resp.status());
-            }
-            Err(e) => {
-                warn!("askgw_http: cancel {id} request failed: {e}");
-            }
+            .await
+            .map_err(|e| send_failure("cancel", e))?;
+        if resp.status().is_success() {
+            debug!("askgw_http: cancelled {id} ({reason})");
+            return Ok(());
         }
+        Err(anyhow!(
+            "askgw_http: cancel {id} returned HTTP {}",
+            resp.status()
+        ))
     }
 
     async fn notify(&self, frame: &NotifyFrame<'_>) -> Result<()> {
@@ -256,7 +328,7 @@ impl Transport for LongPollTransport {
             .json(frame)
             .send()
             .await
-            .map_err(|e| anyhow!("askgw_http: notify request failed: {e}"))?;
+            .map_err(|e| send_failure("notify", e))?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -265,6 +337,125 @@ impl Transport for LongPollTransport {
             "askgw_http: notify rejected: HTTP {}",
             resp.status()
         ))
+    }
+}
+
+/// Tries an ordered list of endpoints (primary first) — see the module doc
+/// "Primary + fallback endpoint" for when it moves to the next one. With a
+/// single endpoint it behaves exactly like that endpoint's transport.
+struct FallbackTransport {
+    /// (base URL for logs, transport), in preference order.
+    endpoints: Vec<(String, Box<dyn Transport>)>,
+    /// Ask id -> index of the endpoint that accepted its submit (or last
+    /// answered its poll). Removed when the ask reaches a terminal state,
+    /// is cancelled, or its poll fails on every endpoint.
+    pinned: Mutex<HashMap<String, usize>>,
+}
+
+impl FallbackTransport {
+    fn new(endpoints: Vec<(String, Box<dyn Transport>)>) -> Self {
+        assert!(!endpoints.is_empty(), "FallbackTransport needs an endpoint");
+        Self {
+            endpoints,
+            pinned: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Endpoint indices to try for an existing ask: its pinned endpoint
+    /// first, then the rest in preference order.
+    fn order_for(&self, id: &str) -> Vec<usize> {
+        let first = self.pinned.lock().unwrap().get(id).copied().unwrap_or(0);
+        std::iter::once(first)
+            .chain((0..self.endpoints.len()).filter(|&i| i != first))
+            .collect()
+    }
+
+    fn has_next(&self, pos: usize, total: usize) -> bool {
+        pos + 1 < total
+    }
+}
+
+#[async_trait::async_trait]
+impl Transport for FallbackTransport {
+    async fn submit(&self, frame: &AskFrame<'_>) -> Result<()> {
+        let n = self.endpoints.len();
+        for (i, (url, t)) in self.endpoints.iter().enumerate() {
+            match t.submit(frame).await {
+                Ok(()) => {
+                    self.pinned.lock().unwrap().insert(frame.id.clone(), i);
+                    return Ok(());
+                }
+                Err(e)
+                    if send_failure_kind(&e) == Some(SendFailureKind::NotSent)
+                        && self.has_next(i, n) =>
+                {
+                    warn!("askgw_http: {url} unreachable for submit, trying next endpoint: {e:#}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("the last endpoint always returns")
+    }
+
+    async fn poll(&self, id: &str, wait: Duration) -> Result<AnswerFrame> {
+        let order = self.order_for(id);
+        let n = order.len();
+        for (pos, &i) in order.iter().enumerate() {
+            let (url, t) = &self.endpoints[i];
+            match t.poll(id, wait).await {
+                Ok(answer) => {
+                    let mut pinned = self.pinned.lock().unwrap();
+                    if answer.status == STATUS_PENDING {
+                        pinned.insert(id.to_string(), i);
+                    } else {
+                        pinned.remove(id);
+                    }
+                    return Ok(answer);
+                }
+                Err(e) if send_failure_kind(&e).is_some() && self.has_next(pos, n) => {
+                    warn!("askgw_http: {url} gave no response to poll {id}, trying next endpoint: {e:#}");
+                }
+                Err(e) => {
+                    self.pinned.lock().unwrap().remove(id);
+                    return Err(e);
+                }
+            }
+        }
+        unreachable!("the last endpoint always returns")
+    }
+
+    async fn cancel(&self, id: &str, reason: &str) -> Result<()> {
+        let order = self.order_for(id);
+        let n = order.len();
+        let mut result = Ok(());
+        for (pos, &i) in order.iter().enumerate() {
+            let (url, t) = &self.endpoints[i];
+            result = t.cancel(id, reason).await;
+            match &result {
+                Err(e) if send_failure_kind(e).is_some() && self.has_next(pos, n) => {
+                    warn!("askgw_http: {url} gave no response to cancel {id}, trying next endpoint: {e:#}");
+                }
+                _ => break,
+            }
+        }
+        self.pinned.lock().unwrap().remove(id);
+        result
+    }
+
+    async fn notify(&self, frame: &NotifyFrame<'_>) -> Result<()> {
+        let n = self.endpoints.len();
+        for (i, (url, t)) in self.endpoints.iter().enumerate() {
+            match t.notify(frame).await {
+                Err(e)
+                    if send_failure_kind(&e) == Some(SendFailureKind::NotSent)
+                        && self.has_next(i, n) =>
+                {
+                    warn!("askgw_http: {url} unreachable for notify, trying next endpoint: {e:#}");
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the last endpoint always returns")
     }
 }
 
@@ -279,24 +470,40 @@ pub struct AskgwHttpBackend {
 }
 
 impl AskgwHttpBackend {
+    /// `endpoints` is the preference order: `[askgw_http].endpoint`, then
+    /// `fallback_endpoint` if set (see module doc "Primary + fallback
+    /// endpoint").
     pub fn new(
-        endpoint: String,
+        endpoints: Vec<String>,
         api_key: String,
         agent: Option<String>,
         timeout: Duration,
         poll_wait: Duration,
         request_timeout: Duration,
+        connect_timeout: Duration,
     ) -> Result<Self> {
+        if endpoints.is_empty() {
+            return Err(anyhow!("askgw_http: no endpoint configured"));
+        }
         let client = Client::builder()
             .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| anyhow!("askgw_http: failed to build HTTP client: {e}"))?;
+        let endpoints = endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let t: Box<dyn Transport> = Box::new(LongPollTransport {
+                    // reqwest's Client is an Arc handle: clones share one pool.
+                    client: client.clone(),
+                    endpoint: endpoint.clone(),
+                    api_key: api_key.clone(),
+                });
+                (endpoint, t)
+            })
+            .collect();
         Ok(Self {
-            transport: Box::new(LongPollTransport {
-                client,
-                endpoint,
-                api_key,
-            }),
+            transport: Box::new(FallbackTransport::new(endpoints)),
             timeout,
             poll_wait,
             agent,
@@ -358,7 +565,9 @@ impl AskgwHttpBackend {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.transport.cancel(&id, "timeout").await;
+                if let Err(e) = self.transport.cancel(&id, "timeout").await {
+                    warn!("askgw_http: cancel {id} failed: {e:#}");
+                }
                 return Ok(Decision::Timeout);
             }
             let wait = self.poll_wait.min(remaining);
@@ -709,8 +918,9 @@ mod tests {
             results.remove(0).map_err(|e| anyhow!(e))
         }
 
-        async fn cancel(&self, _id: &str, _reason: &str) {
+        async fn cancel(&self, _id: &str, _reason: &str) -> Result<()> {
             self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn notify(&self, frame: &NotifyFrame<'_>) -> Result<()> {
@@ -1104,5 +1314,298 @@ mod tests {
             unlock_url: None,
         };
         assert!(backend.send_bw_locked_notification(&record).await.is_ok());
+    }
+
+    // ---- FallbackTransport (#2742) ----
+
+    /// A real `SendFailure` of the given kind, built from a genuine reqwest
+    /// error (reqwest errors cannot be constructed directly).
+    async fn real_send_failure(kind: SendFailureKind) -> anyhow::Error {
+        let source = Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("port 1 must refuse");
+        anyhow::Error::new(SendFailure {
+            kind,
+            op: "test",
+            source,
+        })
+    }
+
+    /// One scripted outcome for a [`ScriptedEndpoint`] call.
+    #[derive(Clone, Copy)]
+    enum Outcome {
+        Ok,
+        Pending,
+        NotSent,
+        NoResponse,
+        HttpError,
+    }
+
+    /// Inner transport for FallbackTransport tests: every call returns the
+    /// endpoint's fixed outcome and is recorded as "<name>:<op>".
+    struct ScriptedEndpoint {
+        name: &'static str,
+        outcome: Outcome,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedEndpoint {
+        async fn result(&self, op: &str) -> Result<()> {
+            self.log.lock().unwrap().push(format!("{}:{op}", self.name));
+            match self.outcome {
+                Outcome::Ok | Outcome::Pending => Ok(()),
+                Outcome::NotSent => Err(real_send_failure(SendFailureKind::NotSent).await),
+                Outcome::NoResponse => Err(real_send_failure(SendFailureKind::NoResponse).await),
+                Outcome::HttpError => Err(anyhow!("HTTP 404")),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for ScriptedEndpoint {
+        async fn submit(&self, _frame: &AskFrame<'_>) -> Result<()> {
+            self.result("submit").await
+        }
+        async fn poll(&self, _id: &str, _wait: Duration) -> Result<AnswerFrame> {
+            self.result("poll").await?;
+            Ok(AnswerFrame {
+                status: match self.outcome {
+                    Outcome::Pending => STATUS_PENDING.into(),
+                    _ => "answered".into(),
+                },
+                answers: HashMap::new(),
+            })
+        }
+        async fn cancel(&self, _id: &str, _reason: &str) -> Result<()> {
+            self.result("cancel").await
+        }
+        async fn notify(&self, _frame: &NotifyFrame<'_>) -> Result<()> {
+            self.result("notify").await
+        }
+    }
+
+    fn fallback(
+        primary: Outcome,
+        secondary: Outcome,
+    ) -> (FallbackTransport, Arc<Mutex<Vec<String>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ep = |name: &'static str, outcome: Outcome| -> (String, Box<dyn Transport>) {
+            (
+                name.to_string(),
+                Box::new(ScriptedEndpoint {
+                    name,
+                    outcome,
+                    log: Arc::clone(&log),
+                }),
+            )
+        };
+        (
+            FallbackTransport::new(vec![ep("lan", primary), ep("ts", secondary)]),
+            log,
+        )
+    }
+
+    fn ask_frame(id: &str) -> AskFrame<'static> {
+        AskFrame {
+            protocol: PROTOCOL,
+            frame_type: "ask",
+            id: id.into(),
+            source: "aisudo",
+            timeout_seconds: 60.0,
+            questions: vec![],
+            agent: None,
+        }
+    }
+
+    fn notify_frame() -> NotifyFrame<'static> {
+        NotifyFrame {
+            protocol: PROTOCOL,
+            frame_type: "notify",
+            id: "n".into(),
+            source: "aisudo",
+            agent: None,
+            kind: None,
+            level: None,
+            title: None,
+            text: "t".into(),
+        }
+    }
+
+    fn calls(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn fallback_primary_reachable_never_touches_fallback() {
+        let (t, log) = fallback(Outcome::Ok, Outcome::Ok);
+        t.submit(&ask_frame("a")).await.unwrap();
+        t.poll("a", Duration::ZERO).await.unwrap();
+        t.notify(&notify_frame()).await.unwrap();
+        assert_eq!(calls(&log), ["lan:submit", "lan:poll", "lan:notify"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_submit_moves_on_when_primary_not_sent_and_pins_ask() {
+        // Primary down for submit; both reachable later would still poll the
+        // endpoint that holds the ask. Here the primary stays down, so poll
+        // goes straight to the pinned fallback without retrying the primary.
+        let (t, log) = fallback(Outcome::NotSent, Outcome::Pending);
+        t.submit(&ask_frame("a")).await.unwrap();
+        t.poll("a", Duration::ZERO).await.unwrap();
+        t.cancel("a", "timeout").await.unwrap();
+        assert_eq!(
+            calls(&log),
+            ["lan:submit", "ts:submit", "ts:poll", "ts:cancel"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_submit_does_not_resubmit_after_no_response() {
+        // The primary may hold the ask already: resubmitting would duplicate
+        // it, so the failure is returned and the fallback is not touched.
+        let (t, log) = fallback(Outcome::NoResponse, Outcome::Ok);
+        let err = t.submit(&ask_frame("a")).await.unwrap_err();
+        assert_eq!(send_failure_kind(&err), Some(SendFailureKind::NoResponse));
+        assert_eq!(calls(&log), ["lan:submit"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_submit_does_not_move_on_http_rejection() {
+        let (t, log) = fallback(Outcome::HttpError, Outcome::Ok);
+        t.submit(&ask_frame("a")).await.unwrap_err();
+        assert_eq!(calls(&log), ["lan:submit"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_both_unreachable_returns_last_error() {
+        let (t, log) = fallback(Outcome::NotSent, Outcome::NotSent);
+        let err = t.submit(&ask_frame("a")).await.unwrap_err();
+        assert_eq!(send_failure_kind(&err), Some(SendFailureKind::NotSent));
+        assert_eq!(calls(&log), ["lan:submit", "ts:submit"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_poll_moves_on_after_no_response() {
+        // Poll is idempotent, so even an ambiguous failure moves on.
+        let (t, log) = fallback(Outcome::NoResponse, Outcome::Ok);
+        let answer = t.poll("a", Duration::ZERO).await.unwrap();
+        assert_eq!(answer.status, "answered");
+        assert_eq!(calls(&log), ["lan:poll", "ts:poll"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_poll_does_not_move_on_http_error() {
+        // A 404 from the endpoint that should hold the ask fails closed.
+        let (t, log) = fallback(Outcome::HttpError, Outcome::Ok);
+        t.poll("a", Duration::ZERO).await.unwrap_err();
+        assert_eq!(calls(&log), ["lan:poll"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_notify_moves_on_only_when_not_sent() {
+        let (t, log) = fallback(Outcome::NotSent, Outcome::Ok);
+        t.notify(&notify_frame()).await.unwrap();
+        assert_eq!(calls(&log), ["lan:notify", "ts:notify"]);
+
+        let (t, log) = fallback(Outcome::NoResponse, Outcome::Ok);
+        t.notify(&notify_frame()).await.unwrap_err();
+        assert_eq!(calls(&log), ["lan:notify"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_terminal_poll_and_cancel_clear_pin() {
+        let (t, _log) = fallback(Outcome::NotSent, Outcome::Ok);
+        t.submit(&ask_frame("a")).await.unwrap();
+        assert_eq!(t.pinned.lock().unwrap().get("a"), Some(&1));
+        t.poll("a", Duration::ZERO).await.unwrap(); // "answered" = terminal
+        assert!(t.pinned.lock().unwrap().is_empty());
+
+        t.submit(&ask_frame("b")).await.unwrap();
+        t.cancel("b", "timeout").await.unwrap();
+        assert!(t.pinned.lock().unwrap().is_empty());
+    }
+
+    /// End to end over real sockets: the primary is a closed localhost port
+    /// (connection refused), the fallback a real HTTP server speaking the
+    /// askgw contract. The approval must arrive through the fallback.
+    #[tokio::test]
+    async fn backend_approval_arrives_via_fallback_when_primary_refuses() {
+        use axum::routing::{get, post};
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let primary = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+
+        let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (h1, h2) = (Arc::clone(&hits), Arc::clone(&hits));
+        let app = axum::Router::new()
+            .route(
+                "/askgw/ask",
+                post(move || async move {
+                    h1.lock().unwrap().push("submit".into());
+                    (
+                        axum::http::StatusCode::ACCEPTED,
+                        axum::Json(serde_json::json!({"status": "pending"})),
+                    )
+                }),
+            )
+            .route(
+                "/askgw/ask/:id",
+                get(move || async move {
+                    h2.lock().unwrap().push("poll".into());
+                    axum::Json(serde_json::json!({
+                        "status": "answered",
+                        "answers": {"decision": "Approve"}
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let backend = AskgwHttpBackend::new(
+            vec![primary, fallback_url],
+            "k".into(),
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let decision = backend
+            .ask_and_wait(
+                "Sudo",
+                "q".into(),
+                "Approve",
+                "Deny",
+                "a".into(),
+                "d".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, Decision::Approved);
+        assert_eq!(*hits.lock().unwrap(), ["submit", "poll"]);
+    }
+
+    /// The classification the fallback rests on: a refused connection is
+    /// NotSent (safe to resubmit elsewhere).
+    #[tokio::test]
+    async fn refused_connection_is_classified_not_sent() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let t = LongPollTransport {
+            client: Client::new(),
+            endpoint: url,
+            api_key: "k".into(),
+        };
+        let err = t.submit(&ask_frame("a")).await.unwrap_err();
+        assert_eq!(send_failure_kind(&err), Some(SendFailureKind::NotSent));
+        assert!(err
+            .to_string()
+            .starts_with("askgw_http: submit request failed:"));
     }
 }

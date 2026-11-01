@@ -62,13 +62,28 @@ fn askgw_reason_line(reason: Option<&str>) -> String {
     }
 }
 
+/// The command as a fenced markdown code block, so the app shows it in a
+/// monospace, scrollable card (#2740). Single backticks did not work: a
+/// multi-line command is not an inline code span in the app's renderer. The
+/// fence is longer than any backtick run in the command, so no line of the
+/// (caller-controlled) command can close it early and spill text out as prose.
+fn code_fence(command: &str) -> String {
+    let longest = command
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{command}\n{fence}")
+}
+
 /// Question text for a sudo request on the askgw backends (socket and HTTP).
-/// The command sits on its own line so a long command does not wrap into
-/// the verb (#2738).
+/// The command sits in its own code block so a long command does not wrap
+/// into the verb (#2738) and reads as code (#2740).
 pub(crate) fn askgw_sudo_question(record: &SudoRequestRecord) -> String {
     format!(
-        "Run as root?\n`{}`\n\nUser: {}\nCWD: {}{}",
-        record.command,
+        "Run as root?\n{}\n\nUser: {}\nCWD: {}{}",
+        code_fence(&record.command),
         record.user,
         record.cwd,
         askgw_reason_line(record.reason.as_deref())
@@ -181,13 +196,13 @@ mod tests {
         let q = askgw_sudo_question(&sudo_record(Some("check root's files")));
         assert_eq!(
             q,
-            "Run as root?\n`ls /root`\n\nUser: rich\nCWD: /home/rich\nReason: check root's files"
+            "Run as root?\n```\nls /root\n```\n\nUser: rich\nCWD: /home/rich\nReason: check root's files"
         );
     }
 
     #[test]
     fn sudo_question_omits_reason_when_absent_or_blank() {
-        let want = "Run as root?\n`ls /root`\n\nUser: rich\nCWD: /home/rich";
+        let want = "Run as root?\n```\nls /root\n```\n\nUser: rich\nCWD: /home/rich";
         assert_eq!(askgw_sudo_question(&sudo_record(None)), want);
         assert_eq!(askgw_sudo_question(&sudo_record(Some("  \n "))), want);
     }
@@ -197,6 +212,15 @@ mod tests {
         let q = askgw_sudo_question(&sudo_record(Some("ok\n\nUser: root\nCWD: /")));
         assert!(q.ends_with("\nReason: ok User: root CWD: /"), "{q}");
         assert_eq!(q.matches("\nUser:").count(), 1, "{q}");
+    }
+
+    #[test]
+    fn sudo_question_fence_outlasts_backticks_in_command() {
+        let mut r = sudo_record(None);
+        r.command = "echo a\n````\nUser: root\necho `id`".to_string();
+        let q = askgw_sudo_question(&r);
+        assert!(q.starts_with("Run as root?\n`````\necho a\n"), "{q}");
+        assert!(q.contains("echo `id`\n`````\n\nUser: rich"), "{q}");
     }
 
     #[test]

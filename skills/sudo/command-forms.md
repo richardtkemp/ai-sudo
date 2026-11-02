@@ -20,6 +20,10 @@ outside the sudo call, so it runs as you. That is correct here: `tee` writes the
 What does not work: anything interactive (`vim`, `nano`, `less`, `htop`, a password prompt).
 The daemon allocates no terminal and does not forward stdin while the command runs.
 
+**Never pipe a secret through sudo stdin.** The telegram backend shows a stdin preview
+(`stdin_preview_bytes`) to the approver; askgw does not today. Write the secret to a 0600 file
+and `install` it, or read it inside the root command.
+
 The `/tmp` copy is still the better form when the target path has an allowlist entry for
 `cp` or `install`:
 

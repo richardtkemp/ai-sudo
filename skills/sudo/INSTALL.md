@@ -154,9 +154,14 @@ tail -5 /var/log/aisudo-setup.log      # want "=== aisudo setup completed at", n
 
 ### macOS
 
-**Do not run `setup.sh` through aisudo.** It restarts the daemon that runs it. A full update
-(daemon, plist) needs a human in a terminal with the real password:
-`cd ~/git/ai-sudo && sudo ./setup.sh`.
+A full update (daemon, plist) runs through aisudo with one tap. `setup.sh` does the install in a
+one-shot launchd job, so the daemon restart does not kill it (#2652):
+
+```bash
+sudo env SUDO_USER=$USER "$HOME/git/ai-sudo/setup.sh"
+```
+
+Verified on the work Mac on 2026-11-03. Check `stat -f %Sm /usr/local/bin/aisudo-daemon` afterwards.
 
 For a change to the client only, build and install the client:
 

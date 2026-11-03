@@ -54,6 +54,20 @@ impl SudoersCache {
         false
     }
 
+    /// Answer for `user` as if sudoers granted them `command_spec`, without running sudo.
+    #[cfg(test)]
+    pub fn seed_for_test(&self, user: &str, command_spec: &str) {
+        self.cache.insert(
+            user.to_string(),
+            (
+                Instant::now(),
+                vec![NopasswdRule {
+                    command_spec: command_spec.to_string(),
+                }],
+            ),
+        );
+    }
+
     /// Get the raw NOPASSWD rule specs for a user (for --list-rules display).
     pub fn get_nopasswd_rules(&self, user: &str) -> Vec<String> {
         self.get_rules(user)

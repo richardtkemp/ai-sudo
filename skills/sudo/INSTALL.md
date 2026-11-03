@@ -194,7 +194,7 @@ Run as root (a human with the real `/usr/bin/sudo`; aisudo goes away during thes
 
 ## Security notes
 
-- The daemon runs as root and runs approved commands as root.
+- The daemon runs as root and runs approved commands as root, or as the `-u` user.
 - With `[askgw]` the request stays on the machine, but the question text goes into a chat.
   Do not put secrets in a command line.
 - Only members of `aisudo` can connect to `/var/run/aisudo/aisudo.sock`. The socket

@@ -8,6 +8,20 @@ use uuid::Uuid;
 pub enum RequestMode {
     Pam,
     Exec,
+    /// `Exec`, for a request that carries [`SudoRequest::run_as`] (#2799).
+    ///
+    /// A separate mode because serde ignores unknown fields: a daemon that predates
+    /// `run_as` would read `{"mode":"exec","run_as":"rich"}` as a plain root request and
+    /// run the command as ROOT. It cannot parse this variant, so it refuses the whole
+    /// request. The work Mac has run a new CLI against an older daemon, so this is real.
+    ExecAs,
+}
+
+impl RequestMode {
+    /// True when the daemon itself runs the command once approved.
+    pub fn daemon_runs(self) -> bool {
+        matches!(self, RequestMode::Exec | RequestMode::ExecAs)
+    }
 }
 
 /// Request sent from the PAM module or CLI wrapper to the daemon over the Unix socket.
@@ -39,6 +53,10 @@ pub struct SudoRequest {
     /// to a newer daemon sees the wire format it expects, unchanged.
     #[serde(default)]
     pub wants_status: bool,
+    /// Run the command as this user instead of root (`sudo -u`, #2799). None means root.
+    /// The client must send it with [`RequestMode::ExecAs`]; see that variant for why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<String>,
 }
 
 fn default_mode() -> RequestMode {
@@ -78,6 +96,9 @@ pub struct SudoRequestRecord {
     /// Size of decoded stdin in bytes (logged to audit DB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin_bytes: Option<usize>,
+    /// The user the command runs as (#2799). None means root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<String>,
 }
 
 impl SudoRequestRecord {
@@ -99,6 +120,7 @@ impl SudoRequestRecord {
             reason: req.reason,
             stdin: req.stdin,
             stdin_bytes,
+            run_as: req.run_as,
         }
     }
 }
@@ -181,6 +203,9 @@ pub struct HistoryEntry {
     pub timestamp: String,
     pub status: String,
     pub decided_by: Option<String>,
+    /// The user the command ran as (#2799). None means root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<String>,
 }
 
 /// Response with command history.
@@ -202,6 +227,9 @@ pub struct ListRulesResponse {
     pub allowlist: Vec<String>,
     pub temp_rules: Vec<ActiveTempRule>,
     pub nopasswd_rules: Vec<String>,
+    /// Rules that auto-approve a command as a named user, keyed by that user (#2799).
+    #[serde(default)]
+    pub allowlist_run_as: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Request to retrieve a Bitwarden vault item.
@@ -353,6 +381,67 @@ pub const DEFAULT_TIMEOUT_SECONDS: u32 = 60;
 mod tests {
     use super::*;
 
+    /// A daemon that predates run_as must refuse a -u request, not run it as root (#2799).
+    #[test]
+    fn a_daemon_that_predates_run_as_cannot_parse_a_run_as_request() {
+        // RequestMode as it stood before #2799.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        #[allow(dead_code)]
+        enum OldMode {
+            Pam,
+            Exec,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldRequest {
+            mode: OldMode,
+        }
+        let mut req = SudoRequest {
+            user: "alice".to_string(),
+            command: "id".to_string(),
+            cwd: "/".to_string(),
+            pid: 1,
+            mode: RequestMode::ExecAs,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
+            wants_status: true,
+            run_as: Some("rich".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(serde_json::from_str::<OldRequest>(&json).is_err(), "{json}");
+
+        // Control: the plain modes still parse, so the check above can tell them apart.
+        req.mode = RequestMode::Exec;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(serde_json::from_str::<OldRequest>(&json).is_ok(), "{json}");
+    }
+
+    /// Without -u the bytes on the wire do not change.
+    #[test]
+    fn a_root_request_serializes_without_any_run_as_field() {
+        let req = SudoRequest {
+            user: "alice".to_string(),
+            command: "id".to_string(),
+            cwd: "/".to_string(),
+            pid: 1,
+            mode: RequestMode::Exec,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
+            wants_status: true,
+            run_as: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("run_as"), "{json}");
+        assert!(json.contains(r#""mode":"exec""#), "{json}");
+    }
+
     #[test]
     fn decision_as_str_all_variants() {
         assert_eq!(Decision::Pending.as_str(), "pending");
@@ -387,6 +476,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let record = SudoRequestRecord::new(req, 60);
         assert_eq!(record.user, "alice");
@@ -416,6 +506,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let record = SudoRequestRecord::new(req, 30);
         assert_eq!(record.user, "bob");
@@ -446,6 +537,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"sudo_request\""));
@@ -640,6 +732,7 @@ mod tests {
     #[test]
     fn list_rules_response_serde() {
         let resp = ListRulesResponse {
+            allowlist_run_as: Default::default(),
             allowlist: vec!["apt list".to_string()],
             temp_rules: vec![ActiveTempRule {
                 patterns: vec!["docker ps".to_string()],

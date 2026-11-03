@@ -1247,6 +1247,14 @@ fn render_template(
     };
 
     let mut out = String::with_capacity(template.len() + 64);
+    // Outside the template, so a custom template cannot leave the approver thinking
+    // this runs as root (#2799). Nothing is added for a root request.
+    if let Some(target) = &record.run_as {
+        out.push_str(&format!(
+            "<b>Run as:</b> <code>{}</code>\n",
+            escape_html(target)
+        ));
+    }
     let mut rest = template;
     while let Some(i) = rest.find("{{") {
         out.push_str(&rest[..i]);
@@ -1544,6 +1552,7 @@ chat_id = 1
 
     fn make_test_record() -> SudoRequestRecord {
         SudoRequestRecord {
+            run_as: None,
             id: "req-123".to_string(),
             user: "alice".to_string(),
             command: "apt install nginx".to_string(),
@@ -1559,6 +1568,21 @@ chat_id = 1
             stdin: None,
             stdin_bytes: None,
         }
+    }
+
+    #[test]
+    fn a_custom_template_still_shows_the_target_user() {
+        let mut record = make_test_record();
+        let tmpl = "{{user}} wants {{command}}";
+        assert_eq!(
+            render_template(tmpl, &record, 2048),
+            "alice wants apt install nginx"
+        );
+        record.run_as = Some("rich".to_string());
+        assert_eq!(
+            render_template(tmpl, &record, 2048),
+            "<b>Run as:</b> <code>rich</code>\nalice wants apt install nginx"
+        );
     }
 
     #[test]

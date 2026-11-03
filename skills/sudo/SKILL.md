@@ -22,7 +22,7 @@ wait. Do not retry, and do not assume failure, while approval is pending.
 > `timeout: 7200` is 7.2 seconds. Use `timeout: 600000` or `run_in_background: true`.
 >
 > **If the client errors, the command may still have run.** After approval the DAEMON runs
-> the command as root, independently of your client. Before you report failure, look for the
+> the command (as root, or as the `-u` user), independently of your client. Before you report failure, look for the
 > live process: `ps -eo pid,ppid,etime,user,args | grep '[f]oo'` (works on both OSes).
 
 ## Platforms
@@ -56,6 +56,7 @@ because it did on the other host. Check with `sudo -n <cmd>` (see `allowlist.md`
 sudo whoami
 sudo -r "checking disk health" smartctl -a /dev/sda   # -r = reason, shown to the approver
 sudo -n journalctl -n 50                              # dry run: would it auto-approve?
+sudo -u rich ls ~rich/.config                         # run as another user, not root
 sudo -l                                               # list permanent and temp rules
 sudo df -h                                            # -h after the command name passes through
 ```
@@ -65,6 +66,20 @@ request. On a retry, say what changed: `-r "create snapshot (fixed: quoting in -
 
 **Check the syntax before you ask.** Run `<cmd> --help` without sudo first. A bad command
 line costs the approver a tap and gets you nothing.
+
+## Run as another user: `-u`
+
+`sudo -u <user> <cmd>` runs the command as that user, after the same approval. The request
+shows `Run as <user>?` and the audit DB records the user. Options go before the command name.
+
+- **An allowlist entry means "as root".** It does not auto-approve `-u`, so expect a tap.
+  Only `[allowlist_run_as]` does (`allowlist.md`). `sudo -n -u <user> <cmd>` tells you which.
+- **The user must be able to enter your current directory.** If not, nothing runs and the error
+  says so. `cd` first, for example `(cd /tmp && sudo -u nobody id)`.
+- **The environment is the target's.** `HOME`, `USER`, `LOGNAME` and `SHELL` are that user's,
+  `SUDO_USER` is you, and only `PATH`, `LANG` and `LC_ALL` come from the daemon.
+- **An older daemon refuses `-u`** with `request failed`. It does not run the command as root.
+- A numeric `-u '#1000'` is not supported. `-u root` is the same as no `-u`.
 
 ## Wait or background?
 

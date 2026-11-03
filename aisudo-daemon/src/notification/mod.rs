@@ -160,7 +160,8 @@ pub(crate) fn askgw_completion_fields(
 /// into the verb (#2738) and reads as code (#2740).
 pub(crate) fn askgw_sudo_question(record: &SudoRequestRecord) -> String {
     format!(
-        "Run as root?\n{}\n\nUser: {}\nCWD: {}{}",
+        "Run as {}?\n{}\n\nUser: {}\nCWD: {}{}",
+        record.run_as.as_deref().unwrap_or("root"),
         code_fence(&record.command),
         record.user,
         record.cwd,
@@ -240,6 +241,7 @@ mod tests {
 
     fn sudo_record(reason: Option<&str>) -> SudoRequestRecord {
         SudoRequestRecord {
+            run_as: None,
             id: "req-1".to_string(),
             user: "rich".to_string(),
             command: "ls /root".to_string(),
@@ -276,6 +278,15 @@ mod tests {
             q,
             "Run as root?\n```\nls /root\n```\n\nUser: rich\nCWD: /home/rich\nReason: check root's files"
         );
+    }
+
+    #[test]
+    fn sudo_question_names_the_target_user() {
+        let mut r = sudo_record(None);
+        assert!(askgw_sudo_question(&r).starts_with("Run as root?\n"));
+        r.run_as = Some("rich".to_string());
+        let q = askgw_sudo_question(&r);
+        assert!(q.starts_with("Run as rich?\n"), "{q}");
     }
 
     #[test]

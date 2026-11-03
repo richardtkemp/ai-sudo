@@ -118,7 +118,8 @@ impl Database {
                 decided_at TEXT,
                 decided_by TEXT,
                 nonce TEXT NOT NULL,
-                stdin_bytes INTEGER
+                stdin_bytes INTEGER,
+                run_as TEXT
             );
 
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -195,6 +196,8 @@ impl Database {
         )?;
         // Migration: add stdin_bytes column to existing databases
         let _ = conn.execute_batch("ALTER TABLE requests ADD COLUMN stdin_bytes INTEGER;");
+        // Migration: the target user of `sudo -u` (#2799). NULL means root.
+        let _ = conn.execute_batch("ALTER TABLE requests ADD COLUMN run_as TEXT;");
         Ok(())
     }
 
@@ -245,8 +248,8 @@ impl Database {
     pub fn insert_request(&self, record: &SudoRequestRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "INSERT INTO requests (id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, stdin_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO requests (id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, stdin_bytes, run_as)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 record.id,
                 record.user,
@@ -258,6 +261,7 @@ impl Database {
                 record.timeout_seconds,
                 record.nonce,
                 record.stdin_bytes.map(|n| n as i64),
+                record.run_as,
             ],
         )?;
         drop(conn); // Release mutex before audit_log (which also locks it)
@@ -265,12 +269,16 @@ impl Database {
             Some(n) => format!(" stdin_bytes={n}"),
             None => String::new(),
         };
+        let run_as_info = match &record.run_as {
+            Some(u) => format!(" run_as={u}"),
+            None => String::new(),
+        };
         self.audit_log(
             &record.id,
             "request_created",
             &format!(
-                "user={} command={}{}",
-                record.user, record.command, stdin_info
+                "user={}{} command={}{}",
+                record.user, run_as_info, record.command, stdin_info
             ),
         )?;
         Ok(())
@@ -316,8 +324,8 @@ impl Database {
             return Ok(false);
         }
         conn.execute(
-            "INSERT INTO requests (id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, stdin_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO requests (id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, stdin_bytes, run_as)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 record.id,
                 record.user,
@@ -329,6 +337,7 @@ impl Database {
                 record.timeout_seconds,
                 record.nonce,
                 record.stdin_bytes.map(|n| n as i64),
+                record.run_as,
             ],
         )?;
         drop(conn); // release before audit_log (which also locks)
@@ -336,12 +345,16 @@ impl Database {
             Some(n) => format!(" stdin_bytes={n}"),
             None => String::new(),
         };
+        let run_as_info = match &record.run_as {
+            Some(u) => format!(" run_as={u}"),
+            None => String::new(),
+        };
         self.audit_log(
             &record.id,
             "request_created",
             &format!(
-                "user={} command={}{}",
-                record.user, record.command, stdin_info
+                "user={}{} command={}{}",
+                record.user, run_as_info, record.command, stdin_info
             ),
         )?;
         Ok(true)
@@ -378,7 +391,7 @@ impl Database {
     pub fn get_request(&self, request_id: &str) -> Result<Option<SudoRequestRecord>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
-            "SELECT id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, decided_at, decided_by, stdin_bytes
+            "SELECT id, user, command, cwd, pid, timestamp, status, timeout_seconds, nonce, decided_at, decided_by, stdin_bytes, run_as
              FROM requests WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![request_id])?;
@@ -402,6 +415,7 @@ impl Database {
                 reason: None,
                 stdin: None, // Not stored in DB
                 stdin_bytes: stdin_bytes.map(|n| n as usize),
+                run_as: row.get(12)?,
             }))
         } else {
             Ok(None)
@@ -1037,10 +1051,23 @@ impl Database {
     }
 
     /// Get recent request history for a user.
+    /// The audit_log details of one request, oldest first.
+    #[cfg(test)]
+    pub fn audit_details_for_test(&self, request_id: &str) -> Vec<String> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT details FROM audit_log WHERE request_id = ?1 ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![request_id], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
     pub fn get_history(&self, user: &str, limit: u32) -> Result<Vec<HistoryEntry>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
-            "SELECT id, command, timestamp, status, decided_by FROM requests
+            "SELECT id, command, timestamp, status, decided_by, run_as FROM requests
              WHERE user = ?1
              ORDER BY timestamp DESC
              LIMIT ?2",
@@ -1052,6 +1079,7 @@ impl Database {
                 timestamp: row.get(2)?,
                 status: row.get(3)?,
                 decided_by: row.get(4)?,
+                run_as: row.get(5)?,
             })
         })?;
         let mut result = Vec::new();
@@ -1246,6 +1274,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1270,6 +1299,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1300,6 +1330,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let record = aisudo_common::SudoRequestRecord::new(req, 60);
         let id = record.id.clone();
@@ -1360,6 +1391,7 @@ mod tests {
                 timeout_seconds: None,
                 dry_run: false,
                 wants_status: false,
+                run_as: None,
             },
             60,
         );
@@ -1459,6 +1491,7 @@ mod tests {
                     timeout_seconds: None,
                     dry_run: false,
                     wants_status: false,
+                    run_as: None,
                 };
                 let record = aisudo_common::SudoRequestRecord::new(req, 60);
                 barrier.wait();
@@ -1530,6 +1563,7 @@ mod tests {
                         timeout_seconds: None,
                         dry_run: false,
                         wants_status: false,
+                        run_as: None,
                     };
                     let record = aisudo_common::SudoRequestRecord::new(req, 60);
                     db.insert_request(&record).unwrap();
@@ -1566,6 +1600,7 @@ mod tests {
                 timeout_seconds: None,
                 dry_run: false,
                 wants_status: false,
+                run_as: None,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1592,6 +1627,7 @@ mod tests {
                 timeout_seconds: None,
                 dry_run: false,
                 wants_status: false,
+                run_as: None,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1610,6 +1646,7 @@ mod tests {
                 timeout_seconds: None,
                 dry_run: false,
                 wants_status: false,
+                run_as: None,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1635,6 +1672,7 @@ mod tests {
                 timeout_seconds: None,
                 dry_run: false,
                 wants_status: false,
+                run_as: None,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -1668,6 +1706,7 @@ mod tests {
                 timeout_seconds: None,
                 dry_run: false,
                 wants_status: false,
+                run_as: None,
             };
             let record = aisudo_common::SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();

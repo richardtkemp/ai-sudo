@@ -61,6 +61,15 @@
 # [allowlist_per_user]
 # alice = ["docker ps", "kubectl get"]
 
+# Commands that auto-approve when run as a named user (sudo -u <user>). Keys are
+# the TARGET users, values are command patterns (same matching rules). This is
+# the only rule that auto-approves -u. The allowlists above, temp rules and
+# sudoers NOPASSWD all mean "as root" and never match a -u request. An entry here
+# never matches a request to run as root or as another user, so anything else
+# goes to the approver. A drop-in that names the same user replaces its list.
+# [allowlist_run_as]
+# rich = ["some-tool list"]
+
 # Argument policies for allowlist entries, keyed by the entry's exact pattern.
 # An entry with a policy auto-approves only when EVERY argument after the
 # pattern is a listed flag or a permitted operand; anything else is sent for

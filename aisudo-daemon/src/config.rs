@@ -33,10 +33,20 @@ pub struct Config {
     /// pattern string (e.g. `[allowlist_args."apt install"]`). An entry with a
     /// policy auto-approves only when EVERY argument after the pattern passes
     /// it; otherwise the command goes to a human, it is not denied (#2699).
-    /// Applies to the global and the per-user allowlists. Temp rules are not
+    /// Applies to the global, the per-user and the run-as allowlists. Temp rules are not
     /// affected.
     #[serde(default)]
     pub allowlist_args: AllowlistArgs,
+
+    /// Commands that auto-approve when run as a named user (`sudo -u <user>`, #2799).
+    /// Keys are target users, values are command patterns (same matching as `allowlist`).
+    ///
+    /// This is the only rule that auto-approves `-u`. `allowlist`, `allowlist_per_user`,
+    /// temp rules and sudoers NOPASSWD all mean "as root" and never match a `-u` request,
+    /// and an entry here never matches a request to run as root or as another user.
+    /// Not to be confused with `allowlist_per_user`, whose keys are the REQUESTING user.
+    #[serde(default)]
+    pub allowlist_run_as: std::collections::HashMap<String, Vec<String>>,
 
     pub telegram: Option<TelegramConfig>,
 
@@ -903,6 +913,24 @@ operand_deny_suffixes = ["-", ".deb"]
         assert_eq!(rule.operand_chars.as_deref(), Some("a-z0-9+.:=~-"));
         assert_eq!(rule.operand_deny_prefixes, vec!["."]);
         assert_eq!(rule.operand_deny_suffixes, vec!["-", ".deb"]);
+    }
+
+    #[test]
+    fn allowlist_run_as_loads_from_a_dropin_and_defaults_to_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_main_config(dir.path(), "");
+        assert!(Config::load(&path).unwrap().allowlist_run_as.is_empty());
+
+        let conf_d = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        std::fs::write(
+            conf_d.join("a.toml"),
+            "[allowlist_run_as]\nrich = [\"some-tool list\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.allowlist_run_as["rich"], vec!["some-tool list"]);
+        assert!(config.allowlist.is_empty(), "must not widen the root list");
     }
 
     #[test]

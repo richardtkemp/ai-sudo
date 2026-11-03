@@ -72,6 +72,19 @@ denied. The NUC's `apt install` has one: package names and a few flags (`-y`,
 (remove) asks. So `sudo -l` showing `apt install` does not mean every `apt install` form
 auto-approves: check with `sudo -n`. Keys and rules: `aisudo.toml.example`.
 
+**Rules for another user (`[allowlist_run_as]`).** A rule says which user it runs as. A normal
+entry means root, so `sudo -u rich <cmd>` still asks even when `<cmd>` is allowlisted. The reverse
+also holds: an entry for `rich` does not cover root or any other user.
+
+```toml
+[allowlist_run_as]
+rich = ["some-tool list"]
+```
+
+The key is the target user, not the requester (that is `allowlist_per_user`). Matching and
+`allowlist_args` work as for a normal entry. Two drop-ins that name the same user do not merge:
+the later file replaces the list. `sudo -l` prints these rules in their own section.
+
 ## Temporary rules
 
 A time-limited rule. The approver approves it like any other request:
@@ -83,3 +96,4 @@ sudo --request-rule --duration 86400 -r "network debugging" tcpdump
 
 If approved, the pattern auto-approves for that many seconds (the daemon caps it with
 `max_temp_rule_duration_seconds`). No file and no restart. `sudo -l` shows active temp rules.
+A temp rule means "as root": it does not auto-approve `-u`, and it cannot be requested for another user.

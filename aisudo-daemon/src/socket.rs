@@ -27,6 +27,7 @@ use crate::notification::{
     BwConfirmRecord, BwRequestRecord, CompletionInfo, NotificationBackend, RunOutcome,
     TempRuleRecord,
 };
+use crate::run_as::RunAsTarget;
 use crate::sudoers::SudoersCache;
 
 /// Records the instant the daemon started accepting connections.
@@ -682,6 +683,7 @@ pub async fn run_socket_listener(
                 let denylist = config.denylist.clone();
                 let allowlist_per_user = config.allowlist_per_user.clone();
                 let allowlist_args = config.allowlist_args.clone();
+                let allowlist_run_as = config.allowlist_run_as.clone();
                 let limits = config.limits.clone();
 
                 let bw_ctx = bw_session.as_ref().and_then(|session| {
@@ -709,6 +711,7 @@ pub async fn run_socket_listener(
                         &denylist,
                         &allowlist_per_user,
                         &allowlist_args,
+                        &allowlist_run_as,
                         limits,
                         bw_ctx,
                     )
@@ -746,6 +749,7 @@ async fn handle_connection(
     denylist: &[String],
     allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
     allowlist_args: &AllowlistArgs,
+    allowlist_run_as: &std::collections::HashMap<String, Vec<String>>,
     limits: LimitsConfig,
     bw_ctx: Option<Arc<BwHandlerContext>>,
 ) -> Result<()> {
@@ -797,6 +801,7 @@ async fn handle_connection(
                     denylist,
                     allowlist_per_user,
                     allowlist_args,
+                    allowlist_run_as,
                     &limits,
                 )
                 .await
@@ -815,7 +820,15 @@ async fn handle_connection(
             }
             SocketMessage::ListRules(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
-                handle_list_rules(request, &mut writer, db, sudoers, allowlist).await
+                handle_list_rules(
+                    request,
+                    &mut writer,
+                    db,
+                    sudoers,
+                    allowlist,
+                    allowlist_run_as,
+                )
+                .await
             }
             SocketMessage::Status(mut request) => {
                 override_user_from_peer(&mut request.user, peer_uid);
@@ -898,6 +911,7 @@ async fn handle_connection(
                     denylist,
                     allowlist_per_user,
                     allowlist_args,
+                    allowlist_run_as,
                     &limits,
                 )
                 .await
@@ -993,7 +1007,7 @@ async fn send_status(
 // hiding it in shared state. Bundling it into a struct is a real refactor, not a lint fix.
 #[allow(clippy::too_many_arguments)]
 async fn handle_sudo_request(
-    request: SudoRequest,
+    mut request: SudoRequest,
     reader: &mut BufReader<OwnedReadHalf>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     db: Arc<Database>,
@@ -1004,6 +1018,7 @@ async fn handle_sudo_request(
     denylist: &[String],
     allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
     allowlist_args: &AllowlistArgs,
+    allowlist_run_as: &std::collections::HashMap<String, Vec<String>>,
     limits: &LimitsConfig,
 ) -> Result<()> {
     let mode = request.mode;
@@ -1011,9 +1026,28 @@ async fn handle_sudo_request(
     // and the status frames are sent on both sides of that point.
     let wants_status = request.wants_status;
     info!(
-        "Received sudo request: user={} command={} mode={:?}",
-        request.user, request.command, mode
+        "Received sudo request: user={} run_as={:?} command={} mode={:?}",
+        request.user, request.run_as, request.command, mode
     );
+
+    // Resolve `-u` once, before anything is decided, so that the rules, the approver and
+    // the exec all see one account (#2799). None from here on means root. An unknown
+    // user is refused without asking anyone: nothing could run.
+    let run_as = match resolve_request_target(mode, request.run_as.as_deref()) {
+        Ok(target) => target,
+        Err(reason) => {
+            warn!("Rejected run-as request (user={}): {reason}", request.user);
+            send_status(writer, wants_status, RequestStatus::AutoDenied).await?;
+            let response = SudoResponse {
+                request_id: String::new(),
+                decision: Decision::Denied,
+                error: Some(reason),
+            };
+            let resp_json = serde_json::to_string(&response)?;
+            return write_line(writer, &resp_json).await;
+        }
+    };
+    request.run_as = run_as.as_ref().map(|t| t.name.clone());
 
     // Decode stdin if present
     let stdin_bytes = if let Some(ref stdin_b64) = request.stdin {
@@ -1123,15 +1157,13 @@ async fn handle_sudo_request(
         return Ok(());
     }
 
-    // Build effective allowlist: global + per-user (if any)
-    let effective_allowlist: Vec<String> =
-        if let Some(user_allowlist) = allowlist_per_user.get(&user) {
-            let mut combined = allowlist.to_vec();
-            combined.extend(user_allowlist.clone());
-            combined
-        } else {
-            allowlist.to_vec()
-        };
+    let effective_allowlist = effective_allowlist(
+        allowlist,
+        allowlist_per_user,
+        allowlist_run_as,
+        &user,
+        run_as.as_ref().map(|t| t.name.as_str()),
+    );
 
     // Check allowlist - auto-approved commands are never BLOCKED by the rate limit
     // (this branch returns before the check). Whether they still CONSUME the budget a
@@ -1184,8 +1216,16 @@ async fn handle_sudo_request(
         writer.write_all(resp_json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
 
-        if mode == RequestMode::Exec {
-            exec_command_chain(&parsed_segments, &cwd, stdin_bytes, writer, &user).await?;
+        if mode.daemon_runs() {
+            exec_command_chain(
+                &parsed_segments,
+                &cwd,
+                stdin_bytes,
+                writer,
+                &user,
+                run_as.as_ref(),
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -1193,7 +1233,9 @@ async fn handle_sudo_request(
     // Check active temp rules - same rate-limit treatment as the allowlist above.
     // As with the allowlist, a temp-rule match that fails the ownership gate
     // falls through to human approval rather than being denied outright.
-    if is_temp_rule_allowed_with_strip(&db, &request.user, &command, limits.strip_shell_prefix)?
+    // A temp rule means "as root": it never matches a `-u` request (#2799).
+    if run_as.is_none()
+        && is_temp_rule_allowed_with_strip(&db, &request.user, &command, limits.strip_shell_prefix)?
         && ownership_ok_or_log(&command, &match_command, limits, "Temp-rule")
     {
         info!("Command auto-approved via temp rule: {}", command);
@@ -1230,14 +1272,24 @@ async fn handle_sudo_request(
         writer.write_all(resp_json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
 
-        if mode == RequestMode::Exec {
-            exec_command_chain(&parsed_segments, &cwd, stdin_bytes, writer, &user).await?;
+        if mode.daemon_runs() {
+            exec_command_chain(
+                &parsed_segments,
+                &cwd,
+                stdin_bytes,
+                writer,
+                &user,
+                run_as.as_ref(),
+            )
+            .await?;
         }
         return Ok(());
     }
 
-    // Check NOPASSWD rules (unless skip_nopasswd is set, i.e. retry after sudo -n failed)
-    if !request.skip_nopasswd {
+    // Check NOPASSWD rules (unless skip_nopasswd is set, i.e. retry after sudo -n failed).
+    // Not for a `-u` request: the parser keeps no runas spec, and the CLI's fallback runs
+    // `sudo -n sh -c <command>`, which is root (#2799).
+    if !request.skip_nopasswd && run_as.is_none() {
         let user = request.user.clone();
         let cmd = command.clone();
         let sudoers_ref = Arc::clone(&sudoers);
@@ -1416,7 +1468,7 @@ async fn handle_sudo_request(
         }
         // PAM mode: the client runs the command itself, so the daemon cannot see whether
         // it ran. The decision did reach the client.
-        Ok(()) if mode != RequestMode::Exec => return Ok(()),
+        Ok(()) if !mode.daemon_runs() => return Ok(()),
         Ok(()) => {
             run_approved(
                 &command,
@@ -1425,6 +1477,7 @@ async fn handle_sudo_request(
                 stdin_bytes,
                 writer,
                 &user,
+                run_as.as_ref(),
                 &request_id,
                 limits,
             )
@@ -1450,6 +1503,7 @@ async fn run_approved(
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     user: &str,
+    run_as: Option<&RunAsTarget>,
     request_id: &str,
     limits: &LimitsConfig,
 ) -> (RunOutcome, Result<()>) {
@@ -1468,7 +1522,7 @@ async fn run_approved(
             return (outcome, result);
         }
     }
-    match exec_command(command, cwd, stdin_bytes, writer, true, user).await {
+    match exec_command(command, cwd, stdin_bytes, writer, true, user, run_as).await {
         Ok(r) => (
             RunOutcome::Exited {
                 exit_code: r.exit_code,
@@ -1488,6 +1542,44 @@ async fn run_approved(
             },
             Err(e),
         ),
+    }
+}
+
+/// The `-u` target of a request, resolved to an account. `Ok(None)` means root.
+fn resolve_request_target(
+    mode: RequestMode,
+    run_as: Option<&str>,
+) -> std::result::Result<Option<RunAsTarget>, String> {
+    match run_as {
+        Some(name) => RunAsTarget::resolve(name),
+        None if mode == RequestMode::ExecAs => {
+            Err("malformed request: exec-as without a target user".to_string())
+        }
+        None => Ok(None),
+    }
+}
+
+/// The allowlist entries that can auto-approve this request (#2799).
+///
+/// `target` is None for a root request. The two sets are disjoint on purpose: a rule
+/// says which user it runs as, and a rule for one user never covers another. The global
+/// and per-user lists mean "as root", so they stop at a `-u` request.
+fn effective_allowlist(
+    allowlist: &[String],
+    allowlist_per_user: &std::collections::HashMap<String, Vec<String>>,
+    allowlist_run_as: &std::collections::HashMap<String, Vec<String>>,
+    requester: &str,
+    target: Option<&str>,
+) -> Vec<String> {
+    match target {
+        Some(target) => allowlist_run_as.get(target).cloned().unwrap_or_default(),
+        None => {
+            let mut combined = allowlist.to_vec();
+            if let Some(user_allowlist) = allowlist_per_user.get(requester) {
+                combined.extend(user_allowlist.iter().cloned());
+            }
+            combined
+        }
     }
 }
 
@@ -1650,6 +1742,7 @@ async fn handle_list_rules(
     db: Arc<Database>,
     sudoers: Arc<SudoersCache>,
     allowlist: &[String],
+    allowlist_run_as: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<()> {
     info!("Received list-rules request for user={}", request.user);
 
@@ -1678,6 +1771,10 @@ async fn handle_list_rules(
         allowlist: allowlist.to_vec(),
         temp_rules,
         nopasswd_rules,
+        allowlist_run_as: allowlist_run_as
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     };
 
     let resp_json = serde_json::to_string(&response)?;
@@ -2196,6 +2293,54 @@ fn reset_child_umask(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Set where a child runs and as whom. Root keeps the daemon's environment and enters
+/// `cwd` directly, as it always has. A `-u` target is set up by [`RunAsTarget::apply`].
+fn set_child_user_and_cwd(
+    cmd: &mut tokio::process::Command,
+    cwd: &str,
+    run_as: Option<&RunAsTarget>,
+) -> Result<()> {
+    match run_as {
+        Some(target) => target.apply(cmd, cwd),
+        None => {
+            cmd.current_dir(cwd);
+            Ok(())
+        }
+    }
+}
+
+/// Spawn a child. If a `-u` child cannot start, tell the client why before failing: the
+/// handler's closing frame is a SudoResponse, which the CLI skips while it streams, so
+/// the user would otherwise see only exit 1. A root request keeps its behaviour.
+async fn spawn_child(
+    cmd: &mut tokio::process::Command,
+    cwd: &str,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    run_as: Option<&RunAsTarget>,
+) -> Result<tokio::process::Child> {
+    let err = match cmd.spawn() {
+        Ok(child) => return Ok(child),
+        Err(e) => e,
+    };
+    if let Some(target) = run_as {
+        let hint = if err.kind() == std::io::ErrorKind::PermissionDenied {
+            " (the user must be able to enter that directory)"
+        } else {
+            ""
+        };
+        let output = ExecOutput {
+            stream: "stderr".to_string(),
+            data: format!(
+                "aisudo: could not start the command as {} in {cwd}: {err}{hint}\n",
+                target.name
+            ),
+            exit_code: None,
+        };
+        let _ = write_line(writer, &serde_json::to_string(&output)?).await;
+    }
+    Err(err.into())
+}
+
 /// Execute a command and stream stdout/stderr back over the socket.
 ///
 /// When `use_shell` is true, the command is passed to `sh -c` (for human-approved commands).
@@ -2209,6 +2354,7 @@ async fn exec_command(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     use_shell: bool,
     sudo_user: &str,
+    run_as: Option<&RunAsTarget>,
 ) -> Result<ExecResult> {
     use std::collections::VecDeque;
     use tokio::process::Command;
@@ -2232,18 +2378,17 @@ async fn exec_command(
         c
     };
     reset_child_umask(&mut cmd);
+    set_child_user_and_cwd(&mut cmd, cwd, run_as)?;
 
-    let mut child = cmd
-        .current_dir(cwd)
-        .env("SUDO_USER", sudo_user)
+    cmd.env("SUDO_USER", sudo_user)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(if stdin_bytes.is_some() {
             std::process::Stdio::piped()
         } else {
             std::process::Stdio::null()
-        })
-        .spawn()?;
+        });
+    let mut child = spawn_child(&mut cmd, cwd, writer, run_as).await?;
 
     // Write stdin to child process if present
     if let Some(data) = stdin_bytes {
@@ -2452,6 +2597,7 @@ async fn exec_command_chain(
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     sudo_user: &str,
+    run_as: Option<&RunAsTarget>,
 ) -> Result<()> {
     info!("Executing command chain ({} segments)", segments.len());
 
@@ -2495,6 +2641,7 @@ async fn exec_command_chain(
                 if i == 0 { stdin_bytes.clone() } else { None },
                 writer,
                 sudo_user,
+                run_as,
             )
             .await?;
         } else {
@@ -2505,6 +2652,7 @@ async fn exec_command_chain(
                 if i == 0 { stdin_bytes.clone() } else { None },
                 writer,
                 sudo_user,
+                run_as,
             )
             .await?;
         }
@@ -2544,6 +2692,7 @@ async fn exec_single_command(
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     sudo_user: &str,
+    run_as: Option<&RunAsTarget>,
 ) -> Result<i32> {
     use tokio::process::Command;
 
@@ -2553,18 +2702,17 @@ async fn exec_single_command(
         cmd.args(&argv[1..]);
     }
     reset_child_umask(&mut cmd);
+    set_child_user_and_cwd(&mut cmd, cwd, run_as)?;
 
-    let mut child = cmd
-        .current_dir(cwd)
-        .env("SUDO_USER", sudo_user)
+    cmd.env("SUDO_USER", sudo_user)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(if stdin_bytes.is_some() {
             std::process::Stdio::piped()
         } else {
             std::process::Stdio::null()
-        })
-        .spawn()?;
+        });
+    let mut child = spawn_child(&mut cmd, cwd, writer, run_as).await?;
 
     if let Some(data) = stdin_bytes {
         if let Some(mut stdin_pipe) = child.stdin.take() {
@@ -2586,6 +2734,7 @@ async fn exec_pipeline(
     stdin_bytes: Option<Vec<u8>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     sudo_user: &str,
+    run_as: Option<&RunAsTarget>,
 ) -> Result<i32> {
     use std::os::unix::io::FromRawFd;
     use tokio::process::Command;
@@ -2601,6 +2750,7 @@ async fn exec_pipeline(
             cmd.args(&argv[1..]);
         }
         reset_child_umask(&mut cmd);
+        set_child_user_and_cwd(&mut cmd, cwd, run_as)?;
 
         let is_last = idx == segments.len() - 1;
 
@@ -2624,13 +2774,11 @@ async fn exec_pipeline(
             unsafe { std::process::Stdio::from_raw_fd(write_fd.into_raw_fd()) }
         };
 
-        let mut child = cmd
-            .current_dir(cwd)
-            .env("SUDO_USER", sudo_user)
+        cmd.env("SUDO_USER", sudo_user)
             .stdin(stdin_cfg)
             .stdout(stdout_cfg)
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .stderr(std::process::Stdio::piped());
+        let mut child = spawn_child(&mut cmd, cwd, writer, run_as).await?;
 
         // Feed stdin_bytes to the first process
         if idx == 0 {
@@ -3166,6 +3314,7 @@ mod tests {
                 timeout_seconds: None,
                 dry_run: false,
                 wants_status: false,
+                run_as: None,
             };
             let record = SudoRequestRecord::new(req, 60);
             db.insert_request(&record).unwrap();
@@ -3202,6 +3351,7 @@ mod tests {
                 &[],
                 &std::collections::HashMap::new(),
                 &AllowlistArgs::new(),
+                &std::collections::HashMap::new(),
                 limits,
                 None,
             )
@@ -3222,6 +3372,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         writer.write_all(json.as_bytes()).await.unwrap();
@@ -3543,6 +3694,7 @@ mod tests {
                 &denylist,
                 &allowlist_per_user,
                 &allowlist_args,
+                &std::collections::HashMap::new(),
                 limits,
                 None,
             )
@@ -3589,6 +3741,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3641,6 +3794,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3679,6 +3833,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         serde_json::to_string(&request).unwrap()
     }
@@ -3818,6 +3973,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3854,6 +4010,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3890,6 +4047,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3935,6 +4093,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -3986,6 +4145,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -4065,6 +4225,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -4291,6 +4452,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -4612,6 +4774,7 @@ mod tests {
                 timeout_seconds: None,
                 dry_run: true,
                 wants_status: false,
+                run_as: None,
             };
             let json = serde_json::to_string(&request).unwrap();
             let resp_line = send_and_receive_with_args(
@@ -5381,6 +5544,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -5429,6 +5593,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -5460,6 +5625,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: false,
+            run_as: None,
         };
         let json2 = serde_json::to_string(&request2).unwrap();
 
@@ -5971,6 +6137,7 @@ mod tests {
                 &denylist,
                 &std::collections::HashMap::new(),
                 &AllowlistArgs::new(),
+                &std::collections::HashMap::new(),
                 test_limits(),
                 None,
             )
@@ -6021,6 +6188,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status,
+            run_as: None,
         };
         serde_json::to_string(&request).unwrap()
     }
@@ -6192,6 +6360,7 @@ mod tests {
                 &[],
                 &std::collections::HashMap::new(),
                 &AllowlistArgs::new(),
+                &std::collections::HashMap::new(),
                 test_limits(),
                 None,
             )
@@ -6304,7 +6473,7 @@ mod tests {
 
         // Human-approved path: `sh -c`.
         let shell = stdout_of(|mut w| async move {
-            exec_command("umask", "/", None, &mut w, true, "tester")
+            exec_command("umask", "/", None, &mut w, true, "tester", None)
                 .await
                 .unwrap();
         })
@@ -6313,7 +6482,7 @@ mod tests {
 
         // Human-approved, direct-exec path.
         let direct = stdout_of(|mut w| async move {
-            exec_command("sh -c umask", "/", None, &mut w, false, "tester")
+            exec_command("sh -c umask", "/", None, &mut w, false, "tester", None)
                 .await
                 .unwrap();
         })
@@ -6328,7 +6497,7 @@ mod tests {
         ] {
             let segments = parse_command_chain(chain).unwrap();
             let out = stdout_of(|mut w| async move {
-                exec_command_chain(&segments, "/", None, &mut w, "tester")
+                exec_command_chain(&segments, "/", None, &mut w, "tester", None)
                     .await
                     .unwrap();
             })
@@ -6426,6 +6595,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: true,
+            run_as: None,
         };
         let json = serde_json::to_string(&request).unwrap();
 
@@ -6443,6 +6613,7 @@ mod tests {
                 &[],
                 &std::collections::HashMap::new(),
                 &AllowlistArgs::new(),
+                &std::collections::HashMap::new(),
                 test_limits(),
                 None,
             )
@@ -6512,6 +6683,7 @@ mod tests {
                 &[],
                 &std::collections::HashMap::new(),
                 &AllowlistArgs::new(),
+                &std::collections::HashMap::new(),
                 test_limits(),
                 bw_ctx,
             )
@@ -6687,6 +6859,7 @@ mod tests {
             timeout_seconds: None,
             dry_run: false,
             wants_status: true,
+            run_as: None,
         })
         .unwrap()
     }
@@ -6768,3 +6941,7 @@ mod tests {
         drop(writer);
     }
 }
+
+#[cfg(test)]
+#[path = "socket_run_as_tests.rs"]
+mod run_as_tests;

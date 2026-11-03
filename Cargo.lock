@@ -41,6 +41,7 @@ dependencies = [
  "libc",
  "serde_json",
  "shell-escape",
+ "tempfile",
 ]
 
 [[package]]

@@ -23,7 +23,7 @@ AI runs `aisudo whoami`
 2. Daemon checks the allowlist — auto-approves safe commands (e.g. `df`, `journalctl`)
 3. For other commands, sends a Telegram notification with command details
 4. You tap **Approve** or **Deny** on your phone
-5. If approved, the daemon executes the command as root and streams output back
+5. If approved, the daemon executes the command as root (or as the `-u <user>` target) and streams output back
 
 ## Features
 

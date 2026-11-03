@@ -37,6 +37,7 @@ fn main() -> ExitCode {
     let mut reason: Option<String> = None;
     let mut timeout: Option<u32> = None;
     let mut dry_run = false;
+    let mut run_as: Option<String> = None;
     let mut cmd_start = 1;
     let mut i = 1;
 
@@ -91,6 +92,16 @@ fn main() -> ExitCode {
                 i += 1;
                 cmd_start = i;
             }
+            "-u" | "--user" => {
+                i += 1;
+                if i >= args.len() || args[i].is_empty() {
+                    eprintln!("{}: -u/--user requires a user name", BINARY_NAME);
+                    return ExitCode::from(1);
+                }
+                run_as = Some(args[i].clone());
+                i += 1;
+                cmd_start = i;
+            }
             "--" => {
                 // Explicit end of flags
                 cmd_start = i + 1;
@@ -140,7 +151,11 @@ fn main() -> ExitCode {
         command: command.clone(),
         cwd,
         pid,
-        mode: if dry_run {
+        // ExecAs even for a dry run: only that mode is refused by a daemon too old to know
+        // run_as, which would otherwise run the command as root (see RequestMode::ExecAs).
+        mode: if run_as.is_some() {
+            RequestMode::ExecAs
+        } else if dry_run {
             RequestMode::Pam
         } else {
             RequestMode::Exec
@@ -151,11 +166,16 @@ fn main() -> ExitCode {
         timeout_seconds: timeout,
         dry_run,
         wants_status: true,
+        run_as: run_as.clone(),
     };
 
     if dry_run {
+        let as_user = run_as
+            .as_ref()
+            .map(|u| format!(" as {u}"))
+            .unwrap_or_default();
         eprintln!(
-            "{}: checking if command would be approved: {command}",
+            "{}: checking if command would be approved{as_user}: {command}",
             BINARY_NAME
         );
     }
@@ -245,6 +265,15 @@ fn main() -> ExitCode {
             }
             // In exec mode, the daemon will now stream output lines
         }
+        // The fallback below runs `sudo -n sh -c`, which is root. A daemon never sends this
+        // for a -u request; if one ever does, nothing runs.
+        Decision::UseSudo if run_as.is_some() => {
+            eprintln!(
+                "{}: daemon answered with a NOPASSWD rule for a -u request; refusing to run it as root",
+                BINARY_NAME
+            );
+            return ExitCode::from(1);
+        }
         Decision::UseSudo => {
             if dry_run {
                 eprintln!("\x1b[32msudo: command would be approved via NOPASSWD rule\x1b[0m");
@@ -257,6 +286,12 @@ fn main() -> ExitCode {
             return run_via_sudo(&command, &stdin_data);
         }
         Decision::Denied => {
+            if run_as.is_some() && response.error.as_deref() == Some("request failed") {
+                eprintln!(
+                    "{}: a daemon that predates -u refuses every -u request; check that it is up to date",
+                    BINARY_NAME
+                );
+            }
             if dry_run {
                 if let Some(ref err) = response.error {
                     if err.contains("rate limit") {
@@ -313,6 +348,7 @@ fn print_usage() {
     eprintln!("  -r, --reason <text>      Reason for the command (shown in approval request)");
     eprintln!("  -t, --timeout <seconds>  Override approval timeout for this request");
     eprintln!("  -n, --dry-run            Check if command would be approved without executing");
+    eprintln!("  -u, --user <user>        Run the command as this user instead of root");
     eprintln!("  -l, --list-rules         Show active rules for current user");
     eprintln!("  --status                 Show daemon status");
     eprintln!("  --history [N]            Show last N requests (default 20)");
@@ -579,6 +615,16 @@ fn handle_list_rules() -> ExitCode {
     }
     println!();
 
+    if !response.allowlist_run_as.is_empty() {
+        println!("=== Permanent Allowlist, run as another user (-u) ===");
+        for (target, entries) in &response.allowlist_run_as {
+            for entry in entries {
+                println!("  as {target}: {entry}");
+            }
+        }
+        println!();
+    }
+
     println!("=== Active Temp Rules ===");
     if response.temp_rules.is_empty() {
         println!("  (none)");
@@ -817,9 +863,14 @@ fn handle_history(args: &[String], history_idx: usize) -> ExitCode {
             } else {
                 "\x1b[0m"
             };
+            let as_user = entry
+                .run_as
+                .as_ref()
+                .map(|u| format!("(as {u}) "))
+                .unwrap_or_default();
             println!(
-                "  {}[{:8}]{}\t{} — {}",
-                status_color, entry.status, reset, entry.timestamp, entry.command
+                "  {}[{:8}]{}\t{} — {}{}",
+                status_color, entry.status, reset, entry.timestamp, as_user, entry.command
             );
         }
     }
@@ -966,6 +1017,8 @@ fn retry_with_approval(command: &str, stdin_data: &Option<String>) -> ExitCode {
         timeout_seconds: None,
         dry_run: false,
         wants_status: true,
+        // Only reached after a NOPASSWD answer, which a -u request never takes.
+        run_as: None,
     };
 
     let msg = SocketMessage::SudoRequest(request);
@@ -1624,6 +1677,8 @@ fn is_aisudo_flag(arg: &str) -> bool {
             | "--timeout"
             | "-n"
             | "--dry-run"
+            | "-u"
+            | "--user"
             | "--"
     ) || arg.starts_with('-')
 }
@@ -1636,7 +1691,7 @@ fn find_command_start(args: &[String]) -> usize {
             "-r" | "--reason" => {
                 i += 2;
             }
-            "-t" | "--timeout" => {
+            "-t" | "--timeout" | "-u" | "--user" => {
                 i += 2;
             }
             "-n" | "--dry-run" | "-l" | "--list-rules" | "--status" | "--history"

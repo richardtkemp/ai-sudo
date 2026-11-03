@@ -2,6 +2,7 @@ mod bw_session;
 mod config;
 mod db;
 mod notification;
+mod run_as;
 mod scrub;
 mod socket;
 mod sudoers;

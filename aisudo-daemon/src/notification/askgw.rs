@@ -1014,6 +1014,7 @@ mod tests {
     async fn test_completion_notify_names_the_sudo_ask() {
         let (backend, mut rx) = backend_with_outbox();
         let record = SudoRequestRecord {
+            run_as: None,
             id: "req-42".to_string(),
             user: "rich".to_string(),
             command: "ls".to_string(),

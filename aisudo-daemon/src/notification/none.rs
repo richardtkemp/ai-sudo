@@ -103,6 +103,7 @@ mod tests {
                 timeout_seconds: None,
                 dry_run: false,
                 wants_status: false,
+                run_as: None,
             },
             60,
         )

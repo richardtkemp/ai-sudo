@@ -1,7 +1,10 @@
 pub mod askgw;
 pub mod askgw_http;
+mod display;
 pub mod none;
 pub mod telegram;
+
+pub(crate) use display::display_command;
 
 use aisudo_common::{Decision, SudoRequestRecord};
 use anyhow::Result;
@@ -157,12 +160,13 @@ pub(crate) fn askgw_completion_fields(
 
 /// Question text for a sudo request on the askgw backends (socket and HTTP).
 /// The command sits in its own code block so a long command does not wrap
-/// into the verb (#2738) and reads as code (#2740).
+/// into the verb (#2738) and reads as code (#2740), with each command of a
+/// compound request on its own line (#2874).
 pub(crate) fn askgw_sudo_question(record: &SudoRequestRecord) -> String {
     format!(
         "Run as {}?\n{}\n\nUser: {}\nCWD: {}{}",
         record.run_as.as_deref().unwrap_or("root"),
-        code_fence(&record.command),
+        code_fence(&display_command(&record.command)),
         record.user,
         record.cwd,
         askgw_reason_line(record.reason.as_deref())
@@ -310,6 +314,30 @@ mod tests {
         let q = askgw_sudo_question(&r);
         assert!(q.starts_with("Run as root?\n`````\necho a\n"), "{q}");
         assert!(q.contains("echo `id`\n`````\n\nUser: rich"), "{q}");
+    }
+
+    #[test]
+    fn sudo_question_shows_each_command_of_a_compound_on_its_own_line() {
+        let mut r = sudo_record(None);
+        r.command = "ls / ; rm -rf /".to_string();
+        let q = askgw_sudo_question(&r);
+        assert!(
+            q.starts_with("Run as root?\n```\nls / ; \nrm -rf /\n```\n"),
+            "{q}"
+        );
+        // Showing it must not touch what runs.
+        assert_eq!(r.command, "ls / ; rm -rf /");
+    }
+
+    #[test]
+    fn sudo_question_fence_holds_when_a_line_break_lands_before_backticks() {
+        let mut r = sudo_record(None);
+        r.command = "a; ```` b".to_string();
+        let q = askgw_sudo_question(&r);
+        assert!(
+            q.starts_with("Run as root?\n`````\na; \n```` b\n`````\n"),
+            "{q}"
+        );
     }
 
     #[test]

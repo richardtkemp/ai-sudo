@@ -367,6 +367,25 @@ async fn the_approver_and_the_audit_db_see_the_target() {
     assert!(d.db.audit_details_for_test(&asked[0].id)[0].contains(" run_as=nobody "));
 }
 
+// ---- #2874: the line breaks are for the approver's eyes only ---------------------------
+
+#[tokio::test]
+async fn line_breaks_reach_the_approver_but_not_the_record_or_the_audit_db() {
+    let command = "ls / ; touch /x";
+    let d = Daemon::new(Rules::default(), Decision::Denied);
+    d.send(&request(command, None, false)).await;
+
+    let asked = d.asked();
+    assert_eq!(asked[0].command, command);
+    let question = crate::notification::askgw_sudo_question(&asked[0]);
+    assert!(question.contains("ls / ; \ntouch /x"), "{question}");
+
+    let row = d.db.get_request(&asked[0].id).unwrap().unwrap();
+    assert_eq!(row.command, command);
+    let details = d.db.audit_details_for_test(&asked[0].id);
+    assert!(details[0].contains(command), "{details:?}");
+}
+
 #[tokio::test]
 async fn the_audit_db_sees_the_target_on_the_auto_approved_path_too() {
     let d = Daemon::new(

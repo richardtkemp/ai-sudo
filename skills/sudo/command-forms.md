@@ -56,6 +56,13 @@ The daemon rejects these characters even inside the quoted argument: unquoted `$
 `(`, `)`, `<`, `>`, a bare `&`, newline. If you need one as a literal, use the multi-argument
 form (`sudo echo '$HOME'`).
 
+The approver sees each command of a compound on its own line: the daemon adds a line break
+after `;`, `&&`, `||`, `|` and `&`, and not inside quotes, a command substitution or a heredoc.
+The exception is a script passed as an argument (`sh`, `bash`, `zsh`, `su` ... `-c`, `python -c`,
+`perl`/`ruby`/`node -e`): it splits at its own statements, and a compound script also starts on its
+own line after the opening quote. This is only for the display. The command that runs and the
+audit record stay exactly as you sent them.
+
 ## Never prepend `bash` / `sh`
 
 The allowlist uses prefix matching on whole words (`"systemctl status"` matches

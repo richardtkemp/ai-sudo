@@ -1233,7 +1233,7 @@ fn render_template(
     let lookup = |key: &str| -> Option<String> {
         Some(match key {
             "user" => escape_html(&record.user),
-            "command" => escape_html(&record.command),
+            "command" => escape_html(&super::display_command(&record.command)),
             "directory" => escape_html(&record.cwd),
             "hostname" => escape_html(&hostname),
             "timestamp" => escape_html(&timestamp),
@@ -1746,6 +1746,17 @@ chat_id = 1
         record.command = "echo <hello>".to_string();
         let result = render_template(DEFAULT_TEMPLATE, &record, 2048);
         assert!(result.contains("echo &lt;hello&gt;"));
+    }
+
+    #[test]
+    fn test_render_template_shows_each_command_of_a_compound_on_its_own_line() {
+        let mut record = make_test_record();
+        record.command = "a && b > c".to_string();
+        let result = render_template(DEFAULT_TEMPLATE, &record, 2048);
+        assert!(
+            result.contains("<code>a &amp;&amp; \nb &gt; c</code>"),
+            "{result}"
+        );
     }
 
     #[test]

@@ -1632,22 +1632,20 @@ impl std::fmt::Display for ClientGoneMidRun {
 
 impl std::error::Error for ClientGoneMidRun {}
 
-fn is_temp_rule_allowed(db: &Database, user: &str, command: &str) -> Result<bool> {
-    // Try parsing as a command chain. If parsing fails, deny.
-    let segments = match parse_command_chain(command) {
-        Ok(s) => s,
-        Err(_) => return Ok(false),
-    };
+/// The active temp-rule patterns for `user`, one list per rule.
+fn active_temp_rule_patterns(db: &Database, user: &str) -> Result<Vec<Vec<String>>> {
     let rules_json = db.get_active_temp_rules(user)?;
     let mut all_rules: Vec<Vec<String>> = Vec::new();
     for patterns_json in &rules_json {
         let patterns: Vec<String> = serde_json::from_str(patterns_json)?;
         all_rules.push(patterns);
     }
-    // Every sub-command must match at least one temp rule pattern.
-    Ok(segments
-        .iter()
-        .all(|seg| is_single_command_temp_rule_allowed(&seg.command, &all_rules)))
+    Ok(all_rules)
+}
+
+#[cfg(test)]
+fn is_temp_rule_allowed(db: &Database, user: &str, command: &str) -> Result<bool> {
+    is_temp_rule_allowed_with_strip(db, user, command, false)
 }
 
 async fn handle_temp_rule_request(
@@ -3025,37 +3023,59 @@ fn contains_non_embedded_operator(command: &str) -> bool {
 
 #[cfg(test)]
 fn is_allowed(command: &str, allowlist: &[String]) -> bool {
-    is_allowed_guarded(command, allowlist, &AllowlistArgs::new(), false)
+    is_allowed_with_strip(command, allowlist, false)
 }
 
-/// Allowlist check. `via_shell` is true when the text will be interpreted by a
-/// shell (the inner command of a stripped `bash -c` wrapper): then any quoted
-/// operator char blocks auto-approve (#1484). When false, the command is exec'd
-/// as argv with no shell, and an operator char embedded inside one argument is
-/// allowed (#2562).
-fn is_allowed_guarded(
-    command: &str,
-    allowlist: &[String],
-    args: &AllowlistArgs,
-    via_shell: bool,
-) -> bool {
+/// The auto-approve check that the allowlist and temp rules share. `matches` says
+/// whether one sub-command is covered by the rules. `via_shell` is true when the
+/// text will be interpreted by a shell (the inner command of a stripped `bash -c`
+/// wrapper): then any quoted operator char blocks auto-approve (#1484). When false,
+/// the command is exec'd as argv with no shell, and an operator char embedded inside
+/// one argument is allowed (#2562).
+fn all_segments_match(command: &str, via_shell: bool, matches: &dyn Fn(&str) -> bool) -> bool {
     // Try parsing as a command chain. If parsing fails (rejected metacharacters,
     // unterminated quotes, etc.), deny the command.
     let segments = match parse_command_chain(command) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    // Every sub-command must match the allowlist, AND must not contain a
-    // quoted operator/metacharacter smuggling extra command-like content past
-    // the leading-binary prefix match (#1484).
+    // Every sub-command must match, AND must not contain a quoted
+    // operator/metacharacter smuggling extra command-like content past the
+    // leading-binary prefix match (#1484).
     segments.iter().all(|seg| {
         let hidden = if via_shell {
             contains_hidden_operator(&seg.command)
         } else {
             contains_non_embedded_operator(&seg.command)
         };
-        !hidden && is_single_command_allowed(&seg.command, allowlist, args)
+        !hidden && matches(&seg.command)
     })
+}
+
+/// `all_segments_match` with per-segment shell-wrapper stripping when `strip` is
+/// on. EVERY top-level segment, after stripping its own wrapper, must itself pass
+/// (each stripped part is re-parsed as a chain, so operators inside `bash -c '...'`
+/// are caught too). A part that was unwrapped from `bash -c '...'` is run by that
+/// shell, so it keeps the full quoted-operator guard; an unwrapped part is
+/// argv-exec'd.
+fn all_segments_match_with_strip(
+    command: &str,
+    strip: bool,
+    matches: &dyn Fn(&str) -> bool,
+) -> bool {
+    if !strip {
+        return all_segments_match(command, false, matches);
+    }
+    let segments = match parse_command_chain(command) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    !segments.is_empty()
+        && segments.iter().all(|seg| {
+            let inner = strip_shell_wrapper(&seg.command);
+            let via_shell = inner != seg.command;
+            all_segments_match(&inner, via_shell, matches)
+        })
 }
 
 /// Shell names (bare and absolute paths) recognized as wrappers.
@@ -3193,10 +3213,7 @@ fn normalize_for_match(command: &str, strip: bool) -> Option<Vec<String>> {
 }
 
 /// Allowlist check with per-segment shell-wrapper stripping. When `strip` is off
-/// this is identical to `is_allowed`. When on, EVERY top-level segment — after
-/// stripping its own wrapper — must itself be fully allowlisted (each normalized
-/// part is re-parsed as a chain, so quoted operators inside `bash -c '...'` are
-/// caught too).
+/// this is identical to `is_allowed`.
 #[cfg(test)]
 fn is_allowed_with_strip(command: &str, allowlist: &[String], strip: bool) -> bool {
     is_allowed_with_strip_args(command, allowlist, &AllowlistArgs::new(), strip)
@@ -3209,21 +3226,9 @@ fn is_allowed_with_strip_args(
     args: &AllowlistArgs,
     strip: bool,
 ) -> bool {
-    if !strip {
-        return is_allowed_guarded(command, allowlist, args, false);
-    }
-    // A part that was unwrapped from `bash -c '...'` is run by that shell, so
-    // it keeps the full quoted-operator guard; an unwrapped part is argv-exec'd.
-    let segments = match parse_command_chain(command) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    !segments.is_empty()
-        && segments.iter().all(|seg| {
-            let inner = strip_shell_wrapper(&seg.command);
-            let via_shell = inner != seg.command;
-            is_allowed_guarded(&inner, allowlist, args, via_shell)
-        })
+    all_segments_match_with_strip(command, strip, &|c| {
+        is_single_command_allowed(c, allowlist, args)
+    })
 }
 
 /// Denylist check with per-segment shell-wrapper stripping. Mirrors
@@ -3238,27 +3243,18 @@ fn is_denied_with_strip(command: &str, denylist: &[String], strip: bool) -> bool
     }
 }
 
-/// Temp-rule check with per-segment shell-wrapper stripping. When `strip` is off
-/// this is identical to `is_temp_rule_allowed`.
+/// Temp-rule check. It makes the same decision as the allowlist check, including
+/// the hidden-operator guard (#2886); only the patterns differ.
 fn is_temp_rule_allowed_with_strip(
     db: &Database,
     user: &str,
     command: &str,
     strip: bool,
 ) -> Result<bool> {
-    if !strip {
-        return is_temp_rule_allowed(db, user, command);
-    }
-    let parts = match normalize_for_match(command, true) {
-        Some(p) if !p.is_empty() => p,
-        _ => return Ok(false),
-    };
-    for part in &parts {
-        if !is_temp_rule_allowed(db, user, part)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    let rules = active_temp_rule_patterns(db, user)?;
+    Ok(all_segments_match_with_strip(command, strip, &|c| {
+        is_single_command_temp_rule_allowed(c, &rules)
+    }))
 }
 
 fn set_socket_permissions(path: &Path) -> Result<()> {
@@ -5633,6 +5629,176 @@ mod tests {
             .unwrap();
 
         assert!(is_temp_rule_allowed(&db, "alice", "apt list ; dpkg -l").unwrap());
+    }
+
+    // ===== temp rules apply the allowlist's hidden-operator guard (#2886) =====
+
+    /// A database holding one active temp rule for `user`.
+    fn db_with_temp_rule(
+        dir: &tempfile::TempDir,
+        user: &str,
+        patterns: &[&str],
+    ) -> crate::db::Database {
+        let db = crate::db::Database::open(&dir.path().join("test.db")).unwrap();
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+        let patterns = serde_json::to_string(patterns).unwrap();
+        db.insert_temp_rule(
+            "r1",
+            user,
+            &patterns,
+            3600,
+            &now.to_rfc3339(),
+            &future,
+            "n1",
+            None,
+        )
+        .unwrap();
+        db.update_temp_rule_decision("r1", Decision::Approved, "test")
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn temp_rule_with_strip_rejects_operator_hidden_in_wrapper() {
+        // Each of these reaches exec as `bash -c "ls x<op>touch /tmp/pwn"`, so the shell
+        // runs `touch`, while the parser sees one segment that starts with `ls`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = db_with_temp_rule(&dir, "alice", &["ls"]);
+        for cmd in [
+            r#"bash -c 'ls x'";"'touch /tmp/pwn'"#,
+            r#"bash -c 'ls x'\;'touch /tmp/pwn'"#,
+            r#"bash -c 'ls x'"|"'touch /tmp/pwn'"#,
+            r#"bash -c 'ls x'"&&"'touch /tmp/pwn'"#,
+            "bash -c 'ls x'\"\n\"'touch /tmp/pwn'",
+            r#"bash -c 'ls x'"$("'touch /tmp/pwn'")"#,
+            r#"sh -c 'bash -c "ls x"'";"'touch /tmp/pwn'"#,
+        ] {
+            assert!(
+                !is_temp_rule_allowed_with_strip(&db, "alice", cmd, true).unwrap(),
+                "must go to a human: {cmd}"
+            );
+        }
+        // A wrapper that hides nothing still matches: the guard must not eat this.
+        assert!(is_temp_rule_allowed_with_strip(&db, "alice", "bash -c 'ls x'", true).unwrap());
+    }
+
+    #[test]
+    fn temp_rule_without_strip_rejects_hidden_operator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = db_with_temp_rule(&dir, "alice", &["ls", "bash"]);
+        for cmd in ["ls ';' touch /tmp/pwn", "bash -c 'ls ; touch /tmp/pwn'"] {
+            assert!(
+                !is_temp_rule_allowed_with_strip(&db, "alice", cmd, false).unwrap(),
+                "must go to a human: {cmd}"
+            );
+        }
+        // #2562 applies here too: no shell runs this, so `|` is one argument's text.
+        let docker = r#"ls --format "{{.Names}}|{{.Status}}""#;
+        assert!(is_temp_rule_allowed_with_strip(&db, "alice", docker, false).unwrap());
+    }
+
+    /// The same pattern must give the same verdict on either path. A temp rule is not
+    /// a weaker check than an allowlist entry for the same text.
+    #[test]
+    fn temp_rule_and_allowlist_agree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let patterns = ["ls", "apt list", "grep", "bash"];
+        let db = db_with_temp_rule(&dir, "alice", &patterns);
+        let allow: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+        let cases = [
+            "ls",
+            "ls x",
+            "lsblk",
+            "rm x",
+            "ls ; rm x",
+            "ls ';' rm x",
+            r#"ls ";" rm x"#,
+            r"ls \; rm x",
+            r#"ls a"|"b"#,
+            r#"ls "a|b""#,
+            "ls '|'",
+            "ls 'a||b'",
+            "ls '$(id)'",
+            "ls '`id`'",
+            "ls 'a > b'",
+            "ls 'a\nb'",
+            "apt list | grep vim",
+            "apt list | rm x",
+            "apt list && ls",
+            "bash",
+            "bash -c 'ls x'",
+            "bash -c 'ls x ; rm y'",
+            "bash -c 'ls \"a|b\"'",
+            r#"bash -c 'ls x'";"'rm y'"#,
+            r#"bash -c 'ls x'\;'rm y'"#,
+            r#"bash -c 'ls x'"|"'rm y'"#,
+            "bash -c ls ; rm x",
+            "bash -c 'rm x'",
+            "sh -c 'ls x'",
+            r#"sh -c 'ls x'";"'rm y'"#,
+            "/bin/sh -c 'bash -c \"ls x\"'",
+            "env bash -c 'ls x'",
+            r#"env bash -c 'ls x'";"'rm y'"#,
+            "env ls ';' rm",
+            "ls 'unterminated",
+        ];
+        for strip in [false, true] {
+            for cmd in cases {
+                assert_eq!(
+                    is_temp_rule_allowed_with_strip(&db, "alice", cmd, strip).unwrap(),
+                    is_allowed_with_strip(cmd, &allow, strip),
+                    "strip={strip}: {cmd}"
+                );
+            }
+        }
+    }
+
+    /// Through the real handler and real exec: the smuggled command must reach a human.
+    /// The approver denies here, so the marker exists only if the temp rule ran it.
+    #[tokio::test]
+    async fn temp_rule_smuggled_command_reaches_a_human_and_does_not_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let user = real_test_user();
+        let db = Arc::new(db_with_temp_rule(&dir, &user, &["ls"]));
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockDenyBackend);
+        let marker = dir.path().join("pwn");
+
+        let request = SudoRequest {
+            user: user.clone(),
+            command: format!(
+                r#"bash -c 'ls /nonexistent-2886'";"'touch {}'"#,
+                marker.display()
+            ),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            mode: RequestMode::Exec,
+            reason: None,
+            stdin: None,
+            skip_nopasswd: true,
+            timeout_seconds: None,
+            dry_run: false,
+            wants_status: false,
+            run_as: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let mut limits = test_limits();
+        limits.strip_shell_prefix = true;
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            limits,
+        )
+        .await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert!(!marker.exists(), "the smuggled command ran");
+        assert_eq!(response.decision, Decision::Denied, "{resp_line}");
     }
 
     // ===== split_command_argv tests =====

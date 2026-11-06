@@ -97,3 +97,4 @@ sudo --request-rule --duration 86400 -r "network debugging" tcpdump
 If approved, the pattern auto-approves for that many seconds (the daemon caps it with
 `max_temp_rule_duration_seconds`). No file and no restart. `sudo -l` shows active temp rules.
 A temp rule means "as root": it does not auto-approve `-u`, and it cannot be requested for another user.
+A temp rule has the allowlist's quoted-operator guard: `ls ';' touch x` still goes to a human.

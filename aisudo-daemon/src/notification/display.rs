@@ -11,9 +11,7 @@
 //! only: what runs and what the audit log stores is `record.command`.
 //!
 //! A human-approved command runs under a real `sh -c` (`exec_command`), so the
-//! lexing follows the shell and not `parse_command_chain`. The two differ on
-//! an unquoted backslash: for `ls \' ; rm x ; \'` the chain parser sees one
-//! quoted word and the shell sees three commands.
+//! lexing follows the shell and not `parse_command_chain`.
 
 /// Shells whose `-c` argument is a script, so its separators count too.
 const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash"];
@@ -723,7 +721,7 @@ mod tests {
 
     #[test]
     fn a_backslash_quote_outside_quotes_cannot_disguise_a_command() {
-        // parse_command_chain sees one quoted word; `sh -c` runs three commands.
+        // `sh -c` runs three commands.
         check(
             "ls \\' ; rm -rf / ; echo \\'",
             "ls \\' ; \nrm -rf / ; \necho \\'",

@@ -334,7 +334,10 @@ struct BwHandlerContext {
 /// Rejects (unquoted): `$`, `` ` ``, `(`, `)`, `>`, `<`, `\n`, bare `&`
 ///
 /// Single and double quotes suppress operator/metacharacter detection.
-/// Backslash escapes inside double quotes.
+/// Backslash escapes inside double quotes. Outside quotes it makes the next
+/// character literal, as in `sh`, so `ls \' ; rm x ; \'` is three commands and
+/// `ls \; x` is one (#2875). The exception is `\<newline>`: `sh` joins the lines,
+/// and this parser rejects it, the same as any unquoted newline.
 fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
@@ -381,6 +384,20 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
             continue;
         }
 
+        // An unquoted backslash makes the next character literal. A backslash at
+        // the end of the input has nothing to escape and stays literal.
+        if c == '\\' {
+            if let Some(&next) = chars.get(i + 1) {
+                if next == '\n' {
+                    return Err("rejected: unquoted newline".to_string());
+                }
+                current.push(c);
+                current.push(next);
+                i += 2;
+                continue;
+            }
+        }
+
         // --- Outside quotes: check for rejected metacharacters ---
         match c {
             '$' => {
@@ -401,7 +418,7 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
         if c == '&' {
             if i + 1 < len && chars[i + 1] == '&' {
                 // && operator
-                let cmd = current.trim().to_string();
+                let cmd = trim_segment(&current);
                 if cmd.is_empty() {
                     return Err("empty command before '&&'".to_string());
                 }
@@ -422,7 +439,7 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
         if c == '|' {
             if i + 1 < len && chars[i + 1] == '|' {
                 // || operator
-                let cmd = current.trim().to_string();
+                let cmd = trim_segment(&current);
                 if cmd.is_empty() {
                     return Err("empty command before '||'".to_string());
                 }
@@ -436,7 +453,7 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
                 continue;
             } else {
                 // | pipe operator
-                let cmd = current.trim().to_string();
+                let cmd = trim_segment(&current);
                 if cmd.is_empty() {
                     return Err("empty command before '|'".to_string());
                 }
@@ -452,7 +469,7 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
         }
 
         if c == ';' {
-            let cmd = current.trim().to_string();
+            let cmd = trim_segment(&current);
             if cmd.is_empty() {
                 return Err("empty command before ';'".to_string());
             }
@@ -479,7 +496,7 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
     }
 
     // Push the last segment
-    let cmd = current.trim().to_string();
+    let cmd = trim_segment(&current);
     if cmd.is_empty() {
         if segments.is_empty() {
             return Err("empty command".to_string());
@@ -501,6 +518,18 @@ fn parse_command_chain(input: &str) -> Result<Vec<ChainSegment>, String> {
     });
 
     Ok(segments)
+}
+
+/// Trim the blanks around a segment, but keep a trailing blank that a backslash
+/// escapes: it is part of the last argument.
+fn trim_segment(raw: &str) -> String {
+    let start = raw.trim_start();
+    let trimmed = start.trim_end();
+    let backslashes = trimmed.chars().rev().take_while(|c| *c == '\\').count();
+    match start[trimmed.len()..].chars().next() {
+        Some(blank) if backslashes % 2 == 1 => format!("{trimmed}{blank}"),
+        _ => trimmed.to_string(),
+    }
 }
 
 /// Check if a single (non-chained) command is allowed by the allowlist.
@@ -2512,7 +2541,8 @@ async fn exec_command(
     })
 }
 
-/// Split a single command string into argv, respecting single and double quotes.
+/// Split a single command string into argv, respecting single and double quotes
+/// and an unquoted backslash, the same way as `parse_command_chain` (#2875).
 /// This is used for direct exec (no shell) of individual commands in a chain.
 fn split_command_argv(command: &str) -> Result<Vec<String>> {
     let mut args: Vec<String> = Vec::new();
@@ -2564,6 +2594,11 @@ fn split_command_argv(command: &str) -> Result<Vec<String>> {
         match c {
             '\'' => in_single_quote = true,
             '"' => in_double_quote = true,
+            '\\' if i + 1 < len => {
+                current.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
             ' ' | '\t' => {
                 if !current.is_empty() {
                     args.push(current.clone());
@@ -2920,8 +2955,8 @@ async fn stream_child_output(
 /// Characters that `parse_command_chain` treats as chain operators, or rejects
 /// outright, whenever they appear *unquoted*. If one of these characters is
 /// still present in a parsed segment's command text, it can only have gotten
-/// there by being quoted (single/double quotes suppress operator detection by
-/// design, so a literal `;` can be passed as a real argument to a command that
+/// there by being quoted or escaped (both suppress operator detection by design,
+/// so a literal `;` can be passed as a real argument to a command that
 /// legitimately expects one).
 ///
 /// A quoted operator/metacharacter is exactly the shape of the #1484 allowlist
@@ -5389,6 +5424,143 @@ mod tests {
         assert!(!is_denied("ls ';' rm -rf /x", &deny));
     }
 
+    // ===== unquoted backslash: the parser must agree with sh (#2875) =====
+
+    /// What `sh -c` runs for `input`, one line per command, where every command
+    /// in `input` is the function `c`.
+    fn commands_sh_runs(input: &str) -> Vec<String> {
+        let script =
+            format!("c() {{ printf CMD; for a; do printf ' [%s]' \"$a\"; done; echo; }}\n{input}");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "sh refused {input:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The same list, from the parser and the no-shell splitter.
+    fn commands_parser_runs(input: &str) -> Vec<String> {
+        parse_command_chain(input)
+            .unwrap_or_else(|e| panic!("parser refused {input:?}: {e}"))
+            .iter()
+            .map(|seg| {
+                let argv = split_command_argv(&seg.command).unwrap();
+                let args: Vec<String> = argv[1..].iter().map(|a| format!(" [{a}]")).collect();
+                format!("CMD{}", args.concat())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parser_and_splitter_agree_with_real_sh_on_unquoted_backslashes() {
+        for input in [
+            r#"c \' ; c x ; c \'"#,
+            r#"c \" ; c x ; c \""#,
+            r#"c \\' ; c '"#,
+            r#"c \\\' ; c x"#,
+            r#"c a\;b"#,
+            r#"c a\ b"#,
+            r#"c a\ ;c b"#,
+            r#"c a\  ;c b"#,
+            r#"c a\\ ;c b"#,
+            r#"c \; ; c x"#,
+            r#"c \&\& d"#,
+            r#"c a\|b"#,
+            r#"c \$x \`y \(z\) \>w \<v"#,
+            r#"c '\' ; c x"#,
+            r#"c "a\"b" \" && c \""#,
+            r#"c \# x"#,
+            r#"c x\"#,
+            r#"c \a\b"#,
+            r#"c \\\\"#,
+        ] {
+            assert_eq!(
+                commands_parser_runs(input),
+                commands_sh_runs(input),
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_denied_catches_a_command_after_a_backslash_quote() {
+        let deny = vec!["rm -rf".to_string()];
+        assert!(is_denied(r#"ls \' ; rm -rf / ; \'"#, &deny));
+        assert!(is_denied(r#"ls \" ; rm -rf / ; \""#, &deny));
+        assert!(is_denied(r#"ls \\\' ; rm -rf /"#, &deny));
+        // Control: the same shape without the entry stays clear.
+        assert!(!is_denied(r#"ls \' ; echo ok ; \'"#, &deny));
+    }
+
+    #[test]
+    fn is_denied_does_not_match_an_escaped_separator_sh_would_not_split_on() {
+        // sh runs one `ls`, with the arguments `;`, `rm`, `-rf`, `/`.
+        let deny = vec!["rm -rf".to_string()];
+        assert!(!is_denied(r#"ls \; rm -rf /"#, &deny));
+    }
+
+    #[test]
+    fn is_denied_with_strip_sees_inside_a_wrapper_with_a_backslash_quote() {
+        let deny = vec!["rm -rf".to_string()];
+        assert!(is_denied_with_strip(
+            r#"sh -c "ls \' ; rm -rf / ; \'""#,
+            &deny,
+            true
+        ));
+    }
+
+    #[test]
+    fn is_allowed_requires_every_command_after_a_backslash_quote() {
+        let ls_only = vec!["ls".to_string()];
+        assert!(!is_allowed(r#"ls \' ; rm -rf / ; ls \'"#, &ls_only));
+        let both = vec!["ls".to_string(), "rm".to_string()];
+        assert!(is_allowed(r#"ls \' ; rm x ; ls \'"#, &both));
+    }
+
+    #[test]
+    fn is_allowed_sends_an_escaped_operator_to_a_human() {
+        // These reach the allowlist now that the parser does not refuse them.
+        // Each one still holds a character that a person should look at.
+        let allow = vec!["find".to_string(), "ls".to_string()];
+        assert!(!is_allowed(r#"find . -exec rm {} \;"#, &allow));
+        assert!(!is_allowed(r#"ls \$x"#, &allow));
+        assert!(!is_allowed(r#"ls \> x"#, &allow));
+        assert!(!is_allowed(r#"ls \& x"#, &allow));
+        // Control: an escape with no operator in it needs no human.
+        assert!(is_allowed(r#"ls a\ b"#, &allow));
+    }
+
+    #[test]
+    fn parse_still_rejects_what_an_escape_does_not_cover() {
+        // `\\` is one literal backslash, so what follows is live.
+        assert!(parse_command_chain(r#"ls \\$(rm x)"#).is_err());
+        assert!(parse_command_chain(r#"ls \\> x"#).is_err());
+        // Only the next character is escaped.
+        assert!(parse_command_chain(r#"ls \a$(rm x)"#).is_err());
+        // An escaped `$` leaves `(` live, and sh refuses it too.
+        assert!(parse_command_chain(r#"ls \$(rm x)"#).is_err());
+        // The backslash does not open a word: this quote is unterminated.
+        assert!(parse_command_chain(r#"ls \\' x"#).is_err());
+    }
+
+    #[test]
+    fn parse_still_rejects_a_backslash_newline() {
+        // sh joins the lines. The parser refuses them, as it did before #2875,
+        // so `rm \<newline>-rf /` cannot reach a person past a denylist entry.
+        let err = parse_command_chain("rm \\\n-rf /").unwrap_err();
+        assert!(err.contains("newline"), "got: {err}");
+    }
+
     // ===== is_temp_rule_allowed with chains =====
 
     #[test]
@@ -5557,6 +5729,43 @@ mod tests {
             &json,
             &allowlist,
             &denylist,
+            &std::collections::HashMap::new(),
+            test_limits(),
+        )
+        .await;
+
+        let response: SudoResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(response.decision, Decision::Denied);
+        assert!(response.error.unwrap().contains("denylist"));
+    }
+
+    #[tokio::test]
+    async fn daemon_denies_a_denylisted_command_after_a_backslash_quote() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let backend: Arc<dyn crate::notification::NotificationBackend> = Arc::new(MockBackend);
+        let request = SudoRequest {
+            user: "testuser".to_string(),
+            command: r#"ls \' ; rm -rf / ; \'"#.to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1234,
+            reason: None,
+            mode: RequestMode::Exec,
+            stdin: None,
+            skip_nopasswd: false,
+            timeout_seconds: None,
+            dry_run: false,
+            wants_status: false,
+            run_as: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        let resp_line = send_and_receive(
+            db,
+            backend,
+            &json,
+            &[],
+            &["rm -rf".to_string()],
             &std::collections::HashMap::new(),
             test_limits(),
         )
